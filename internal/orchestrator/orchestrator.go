@@ -10,6 +10,7 @@ import (
 
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
+	"github.com/cubetiqlabs/runway/internal/eventstore"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -22,6 +23,7 @@ type ProvisionRequest struct {
 	EncodedJITConfig string
 	GitHubJobID      int64
 	RepoFullName     string
+	IsForkPR         bool
 }
 
 type ProvisionResult struct {
@@ -55,6 +57,7 @@ type Orchestrator struct {
 	jobRepo      domain.JobRepository
 	auditRepo    domain.AuditRepository
 	agentRepo    domain.AgentRepository
+	eventStore   eventstore.Store
 	provisioners map[string]Provisioner
 
 	queue           chan dispatchTask
@@ -86,6 +89,8 @@ func NewOrchestrator(
 			SandboxRuntime:    cfg.SandboxRuntime,
 			IsolatedDinD:      cfg.RunnerIsolatedDinD,
 			DinDImage:         cfg.DinDImage,
+			CacheEnabled:      cfg.CacheEnabled,
+			CacheMaxGB:        cfg.CacheMaxGB,
 		}),
 	}
 	if agentRepo != nil {
@@ -133,6 +138,31 @@ func (o *Orchestrator) Wait() {
 
 func (o *Orchestrator) HealthCheck(ctx context.Context) error {
 	return o.selectProvisioner(o.cfg.Provider).Ping(ctx)
+}
+
+func (o *Orchestrator) SetEventStore(es eventstore.Store) {
+	o.hookMu.Lock()
+	o.eventStore = es
+	o.hookMu.Unlock()
+}
+
+func (o *Orchestrator) emitEvent(ev domain.Event) {
+	o.hookMu.RLock()
+	es := o.eventStore
+	o.hookMu.RUnlock()
+	if es != nil {
+		es.Publish(ev)
+	}
+}
+
+func (o *Orchestrator) FetchRunnerLogs(ctx context.Context, runner *domain.Runner, tail int) ([]domain.RunnerLogEntry, error) {
+	if runner == nil || runner.Provider != "docker" || runner.ProviderRef == "" {
+		return nil, nil
+	}
+	if dp, ok := o.selectProvisioner("docker").(*DockerProvisioner); ok {
+		return dp.FetchLogs(ctx, runner.ProviderRef, tail)
+	}
+	return nil, nil
 }
 
 func (o *Orchestrator) SetSlotFreedHook(fn func()) {
@@ -206,6 +236,10 @@ func (o *Orchestrator) enqueueTask(task dispatchTask) bool {
 }
 
 func (o *Orchestrator) TerminateRunner(ctx context.Context, runner *domain.Runner) error {
+	if runner == nil {
+		return nil
+	}
+	o.captureDockerLogs(ctx, runner)
 	prov := o.selectProvisioner(runner.Provider)
 	if runner.ProviderRef != "" {
 		if err := prov.Terminate(ctx, runner.ProviderRef); err != nil {
@@ -215,6 +249,16 @@ func (o *Orchestrator) TerminateRunner(ctx context.Context, runner *domain.Runne
 	if err := o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil); err != nil {
 		return err
 	}
+	o.emitEvent(domain.Event{
+		Category:     domain.EventCategoryRunnerLifecycle,
+		EventType:    "runner.terminated",
+		Severity:     "info",
+		Source:       "orchestrator",
+		ResourceType: "runner",
+		ResourceID:   runner.ID.String(),
+		Status:       string(domain.RunnerTerminated),
+		Message:      fmt.Sprintf("Runner %s terminated", runner.Name),
+	})
 	o.notifySlotFreed()
 	return nil
 }
@@ -226,6 +270,16 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 	if err := o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil); err != nil {
 		return err
 	}
+	o.emitEvent(domain.Event{
+		Category:     domain.EventCategoryRunnerLifecycle,
+		EventType:    "runner.released",
+		Severity:     "info",
+		Source:       "orchestrator",
+		ResourceType: "runner",
+		ResourceID:   runner.ID.String(),
+		Status:       string(domain.RunnerTerminated),
+		Message:      fmt.Sprintf("Runner %s released (cancelled=%v)", runner.Name, cancelled),
+	})
 	defer o.notifySlotFreed()
 	if runner.ProviderRef == "" {
 		return nil
@@ -248,6 +302,7 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 
 	ref := runner.ProviderRef
 	name := runner.Name
+	runnerCopy := *runner
 	baseCtx := o.lifecycleCtx()
 	o.wg.Add(1)
 	go func() {
@@ -257,6 +312,10 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 			return
 		case <-time.After(4 * time.Second):
 		}
+
+		capCtx, capCancel := context.WithTimeout(baseCtx, 5*time.Second)
+		o.captureDockerLogs(capCtx, &runnerCopy)
+		capCancel()
 
 		checkCtx, cancelCheck := context.WithTimeout(baseCtx, 5*time.Second)
 		healthy, healthErr := prov.Healthy(checkCtx, ref)
@@ -272,6 +331,33 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 		}
 	}()
 	return nil
+}
+
+func (o *Orchestrator) captureDockerLogs(ctx context.Context, runner *domain.Runner) {
+	if runner == nil || runner.Provider != "docker" || runner.ProviderRef == "" {
+		return
+	}
+	dp, ok := o.selectProvisioner("docker").(*DockerProvisioner)
+	if !ok {
+		return
+	}
+	entries, err := dp.FetchLogs(ctx, runner.ProviderRef, 500)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	for _, entry := range entries {
+		o.emitEvent(domain.Event{
+			OccurredAt:   entry.Timestamp,
+			Category:     domain.EventCategoryRunnerLog,
+			EventType:    "runner.log." + entry.Stream,
+			Severity:     entry.Level,
+			Source:       "docker-provisioner",
+			ResourceType: "runner",
+			ResourceID:   runner.ID.String(),
+			Status:       string(runner.Status),
+			Message:      entry.Line,
+		})
+	}
 }
 
 func (o *Orchestrator) worker(ctx context.Context, workerID int) {
@@ -339,6 +425,7 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 		EncodedJITConfig: task.encodedJITConfig,
 		GitHubJobID:      task.job.GitHubJobID,
 		RepoFullName:     task.job.RepoFullName,
+		IsForkPR:         task.job.IsForkPR,
 	})
 	if err != nil {
 		o.log.Error("runner provisioning failed", zap.String("runner", runnerName), zap.Error(err))
@@ -348,6 +435,18 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 		}
 		o.cleanupGitHubRunner(provCtx, rn)
 		o.notifySlotFreed()
+		o.emitEvent(domain.Event{
+			Category:      domain.EventCategoryRunnerLifecycle,
+			EventType:     "runner.provision_failed",
+			Severity:      "error",
+			Source:        "orchestrator",
+			ResourceType:  "runner",
+			ResourceID:    rn.ID.String(),
+			CorrelationID: task.job.ID.String(),
+			RepoFullName:  task.job.RepoFullName,
+			Status:        string(domain.RunnerOffline),
+			Message:       err.Error(),
+		})
 		if o.auditRepo != nil {
 			meta, _ := json.Marshal(map[string]any{
 				"runner":        runnerName,
@@ -371,6 +470,19 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 		initialStatus = domain.RunnerOnline
 	}
 	_ = o.runnerRepo.SetProvisioned(provCtx, rn.ID, initialStatus, task.githubRunnerID, res.ProviderRef, &task.job.GitHubJobID)
+	o.emitEvent(domain.Event{
+		Category:      domain.EventCategoryRunnerLifecycle,
+		EventType:     "runner.provisioned",
+		Severity:      "info",
+		Source:        "orchestrator",
+		ResourceType:  "runner",
+		ResourceID:    rn.ID.String(),
+		CorrelationID: task.job.ID.String(),
+		RepoFullName:  task.job.RepoFullName,
+		Status:        string(initialStatus),
+		Message:       fmt.Sprintf("Provisioned runner %s via %s", runnerName, prov.Name()),
+		Payload:       res.HostInfo,
+	})
 	if o.auditRepo != nil {
 		_ = o.auditRepo.AppendAuditLog(provCtx, &domain.AuditLog{
 			ActorLabel:   "orchestrator",
@@ -413,6 +525,35 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	seen := make(map[uuid.UUID]struct{})
 
 	if o.runnerRepo != nil {
+		// Reconcile draining runners: terminate immediately once no active job is running on them.
+		if draining, err := o.runnerRepo.ListByStatus(ctx, domain.RunnerDraining); err == nil {
+			for i := range draining {
+				rn := draining[i]
+				seen[rn.ID] = struct{}{}
+				hasActiveJob := false
+				if rn.CurrentJobID != nil && o.jobRepo != nil {
+					if job, jobErr := o.jobRepo.GetByGitHubJobID(ctx, *rn.CurrentJobID); jobErr == nil && job != nil {
+						if job.Status == domain.JobInProgress {
+							hasActiveJob = true
+						}
+					}
+				}
+				prov := o.selectProvisioner(rn.Provider)
+				healthy := false
+				if rn.ProviderRef != "" {
+					if h, hErr := prov.Healthy(ctx, rn.ProviderRef); hErr == nil {
+						healthy = h
+					}
+				}
+				if !hasActiveJob || !healthy {
+					o.requeueLostRunnerJob(ctx, &rn, fmt.Sprintf("Runner %s drained before job started; requeued", rn.Name))
+					_ = o.TerminateRunner(ctx, &rn)
+					o.cleanupGitHubRunner(ctx, &rn)
+					o.log.Info("completed draining runner termination", zap.String("runner", rn.Name))
+				}
+			}
+		}
+
 		stale, err := o.runnerRepo.FindStaleRunners(
 			ctx,
 			now.Add(-o.cfg.ProvisionTimeout),
@@ -467,6 +608,24 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	}
 
 	if o.agentRepo != nil {
+		if drainingAgents, err := o.agentRepo.ListByStatus(ctx, domain.AgentDraining); err == nil {
+			for _, ag := range drainingAgents {
+				if transitioned, trErr := o.agentRepo.MarkDrainingCompleteIfIdle(ctx, ag.ID); trErr == nil && transitioned {
+					o.emitEvent(domain.Event{
+						Category:     domain.EventCategoryAgentLifecycle,
+						EventType:    "agent.drained",
+						Severity:     "info",
+						Source:       "orchestrator",
+						ResourceType: "agent",
+						ResourceID:   ag.ID.String(),
+						Status:       string(domain.AgentDrained),
+						Message:      fmt.Sprintf("Agent %s finished active jobs and is now drained", ag.Name),
+					})
+					o.log.Info("agent finished draining and transitioned to drained", zap.String("agent", ag.Name))
+				}
+			}
+		}
+
 		if marked, err := o.agentRepo.MarkStaleOffline(ctx, now.Add(-2*time.Minute)); err != nil {
 			o.log.Warn("reconcile mark stale agents failed", zap.Error(err))
 		} else if marked > 0 {

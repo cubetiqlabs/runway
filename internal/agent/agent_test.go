@@ -86,10 +86,12 @@ func TestAgentHeartbeatClaimAndCompleteLoop(t *testing.T) {
 		client:          NewClient(cfg.ServerURL, cfg.Token, cfg.Version),
 		executor:        exec,
 		updater:         NewUpdater(cfg.UpdateRepo),
+		metrics:         NewMetricsCollector(t.TempDir()),
 		runtime:         "native",
 		hostname:        "test-host",
 		sem:             make(chan struct{}, 2),
 		cancels:         make(map[uuid.UUID]context.CancelFunc),
+		pollNowCh:       make(chan struct{}, 1),
 		updateRestartCh: make(chan string, 1),
 	}
 
@@ -175,5 +177,61 @@ func TestResolveDockerOptionsAndLogFile(t *testing.T) {
 	raw, err := os.ReadFile(logPath)
 	if err != nil || !strings.Contains(string(raw), "agent-file-log-check") {
 		t.Fatalf("expected agent.log to contain test message, got %q err=%v", string(raw), err)
+	}
+}
+
+func TestAgentDrainAndResumeViaHeartbeat(t *testing.T) {
+	var serverStatus atomic.Value
+	serverStatus.Store("draining")
+	var gotMetrics atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/agent/heartbeat" {
+			var req HeartbeatRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Metrics != nil && !req.Metrics.CollectedAt.IsZero() {
+				gotMetrics.Store(true)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(HeartbeatResponse{
+				Status:        serverStatus.Load().(string),
+				CancelTaskIDs: []uuid.UUID{},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	cfg := DefaultConfig("1.0.0")
+	cfg.ServerURL = ts.URL
+	cfg.Token = "rwa_test"
+
+	ag := &Agent{
+		cfg:             cfg,
+		log:             zap.NewNop(),
+		client:          NewClient(cfg.ServerURL, cfg.Token, cfg.Version),
+		executor:        &stubExecutor{},
+		metrics:         NewMetricsCollector(t.TempDir()),
+		runtime:         "native",
+		hostname:        "test-host",
+		sem:             make(chan struct{}, 1),
+		cancels:         make(map[uuid.UUID]context.CancelFunc),
+		pollNowCh:       make(chan struct{}, 1),
+		updateRestartCh: make(chan string, 1),
+	}
+
+	ag.sendHeartbeat(context.Background())
+	if !ag.draining.Load() {
+		t.Fatal("expected agent draining=true when server returns draining")
+	}
+	if !gotMetrics.Load() {
+		t.Fatal("expected heartbeat to include collected metrics snapshot")
+	}
+
+	serverStatus.Store("online")
+	ag.sendHeartbeat(context.Background())
+	if ag.draining.Load() {
+		t.Fatal("expected agent draining=false when server returns online")
 	}
 }

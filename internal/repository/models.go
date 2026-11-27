@@ -165,6 +165,11 @@ type RunnerPoolModel struct {
 	RunnerGroupID  int64              `gorm:"type:bigint;not null;default:1"`
 	Provider       string             `gorm:"type:text;not null;default:'simulated'"`
 	ContainerImage string             `gorm:"type:text;not null;default:'ghcr.io/cubetiqlabs/runway-runner:latest'"`
+	BuildProfile   string             `gorm:"type:text;not null;default:'standard'"`
+	CacheEnabled   bool               `gorm:"not null;default:true"`
+	CacheScope     string             `gorm:"type:text;not null;default:'repo'"`
+	CacheMaxGB     int                `gorm:"column:cache_max_gb;not null;default:20"`
+	SandboxMode    string             `gorm:"type:text;not null;default:'auto'"`
 	Enabled        bool               `gorm:"index;not null;default:true"`
 	CreatedAt      time.Time          `gorm:"not null;default:now()"`
 	UpdatedAt      time.Time          `gorm:"not null;default:now()"`
@@ -191,6 +196,11 @@ func (m RunnerPoolModel) toDomain() domain.RunnerPool {
 		RunnerGroupID:  m.RunnerGroupID,
 		Provider:       m.Provider,
 		ContainerImage: m.ContainerImage,
+		BuildProfile:   m.BuildProfile,
+		CacheEnabled:   m.CacheEnabled,
+		CacheScope:     m.CacheScope,
+		CacheMaxGB:     m.CacheMaxGB,
+		SandboxMode:    m.SandboxMode,
 		Enabled:        m.Enabled,
 		CreatedAt:      m.CreatedAt,
 		UpdatedAt:      m.UpdatedAt,
@@ -423,6 +433,7 @@ type AgentModel struct {
 	OS              string           `gorm:"column:os;type:text;not null;default:'linux'"`
 	Arch            string           `gorm:"column:arch;type:text;not null;default:'x64'"`
 	Runtime         string           `gorm:"type:text;not null;default:'native'"`
+	SandboxRuntime  string           `gorm:"type:text;not null;default:''"`
 	Labels          pq.StringArray   `gorm:"type:text[];not null;default:'{}'"`
 	PoolID          *uuid.UUID       `gorm:"type:uuid;index"`
 	Pool            *RunnerPoolModel `gorm:"foreignKey:PoolID;references:ID;constraint:OnDelete:SET NULL"`
@@ -434,6 +445,7 @@ type AgentModel struct {
 	MaxConcurrency  int              `gorm:"not null;default:2"`
 	ActiveJobs      int              `gorm:"not null;default:0"`
 	Status          string           `gorm:"type:text;index;not null;default:'offline'"`
+	Metrics         json.RawMessage  `gorm:"type:jsonb;not null;default:'{}'"`
 	LastHeartbeatAt *time.Time
 	CreatedAt       time.Time `gorm:"not null;default:now()"`
 	UpdatedAt       time.Time `gorm:"not null;default:now()"`
@@ -450,6 +462,7 @@ func (m AgentModel) toDomain() domain.Agent {
 		OS:              m.OS,
 		Arch:            m.Arch,
 		Runtime:         m.Runtime,
+		SandboxRuntime:  m.SandboxRuntime,
 		Labels:          nonNilSlice([]string(m.Labels)),
 		PoolID:          m.PoolID,
 		PoolName:        m.PoolName,
@@ -460,6 +473,7 @@ func (m AgentModel) toDomain() domain.Agent {
 		MaxConcurrency:  m.MaxConcurrency,
 		ActiveJobs:      m.ActiveJobs,
 		Status:          domain.AgentStatus(m.Status),
+		Metrics:         nonEmptyJSON(m.Metrics),
 		LastHeartbeatAt: m.LastHeartbeatAt,
 		CreatedAt:       m.CreatedAt,
 		UpdatedAt:       m.UpdatedAt,
@@ -483,6 +497,11 @@ type AgentTaskModel struct {
 	ContainerImage            string            `gorm:"type:text;not null;default:''"`
 	VCPU                      int               `gorm:"column:vcpu;not null;default:4"`
 	MemoryMB                  int               `gorm:"column:memory_mb;not null;default:8192"`
+	IsForkPR                  bool              `gorm:"column:is_fork_pr;not null;default:false"`
+	BuildProfile              string            `gorm:"type:text;not null;default:'standard'"`
+	CacheEnabled              bool              `gorm:"not null;default:true"`
+	CacheScope                string            `gorm:"type:text;not null;default:'repo'"`
+	SandboxMode               string            `gorm:"type:text;not null;default:'auto'"`
 	EncodedJITConfigEncrypted []byte            `gorm:"column:encoded_jit_config_encrypted;type:bytea"`
 	Status                    string            `gorm:"type:text;index;not null;default:'pending'"`
 	ErrorMessage              string            `gorm:"type:text;not null;default:''"`
@@ -511,6 +530,11 @@ func (m AgentTaskModel) toDomain() domain.AgentTask {
 		ContainerImage:            m.ContainerImage,
 		VCPU:                      m.VCPU,
 		MemoryMB:                  m.MemoryMB,
+		IsForkPR:                  m.IsForkPR,
+		BuildProfile:              m.BuildProfile,
+		CacheEnabled:              m.CacheEnabled,
+		CacheScope:                m.CacheScope,
+		SandboxMode:               m.SandboxMode,
 		EncodedJITConfigEncrypted: m.EncodedJITConfigEncrypted,
 		Status:                    domain.AgentTaskStatus(m.Status),
 		ErrorMessage:              m.ErrorMessage,

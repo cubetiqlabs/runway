@@ -63,6 +63,8 @@ func runnerStatusUpdates(status domain.RunnerStatus, githubRunnerID *int64, prov
 	}
 	if currentJobID != nil {
 		updates["current_job_id"] = *currentJobID
+	} else if status == domain.RunnerTerminated || status == domain.RunnerOffline {
+		updates["current_job_id"] = nil
 	}
 	if status == domain.RunnerOnline || status == domain.RunnerBusy {
 		updates["last_heartbeat_at"] = now
@@ -130,6 +132,9 @@ func (r *RunnerRepo) List(ctx context.Context, filter domain.RunnerFilter) ([]do
 	if filter.Status != "" {
 		q = q.Where("r.status = ?", filter.Status)
 	}
+	if filter.Provider != "" {
+		q = q.Where("r.provider = ?", filter.Provider)
+	}
 	if filter.PoolID != nil {
 		q = q.Where("r.pool_id = ?", *filter.PoolID)
 	}
@@ -142,13 +147,22 @@ func (r *RunnerRepo) List(ctx context.Context, filter domain.RunnerFilter) ([]do
 		return nil, 0, mapGormError(err)
 	}
 
+	sortCols := map[string]string{
+		"name":              "r.name",
+		"pool_name":         "p.name",
+		"provider":          "r.provider",
+		"status":            "r.status",
+		"current_job_id":    "r.current_job_id",
+		"last_heartbeat_at": "r.last_heartbeat_at",
+		"created_at":        "r.created_at",
+	}
+
 	var models []RunnerModel
 	err := q.Select(`r.id, r.pool_id, COALESCE(p.name, '') AS pool_name, r.installation_id, r.github_runner_id,
 			r.name, r.provider, r.provider_ref, r.labels, r.status, r.ephemeral,
 			r.current_job_id, r.host_info, r.last_heartbeat_at, r.created_at, r.updated_at`).
 		Joins("LEFT JOIN runner_pools p ON p.id = r.pool_id").
-		Order("r.created_at DESC").
-		Scopes(paginate(filter.PageParams)).
+		Scopes(applySort(filter.PageParams, sortCols, "r.created_at DESC"), paginate(filter.PageParams)).
 		Scan(&models).Error
 	if err != nil {
 		return nil, 0, mapGormError(err)
@@ -159,6 +173,19 @@ func (r *RunnerRepo) List(ctx context.Context, filter domain.RunnerFilter) ([]do
 		items = append(items, m.toDomain())
 	}
 	return items, int(total), nil
+}
+
+func (r *RunnerRepo) ListByStatus(ctx context.Context, status domain.RunnerStatus) ([]domain.Runner, error) {
+	var models []RunnerModel
+	err := r.runnerQuery(ctx).Where("r.status = ?", string(status)).Scan(&models).Error
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+	items := make([]domain.Runner, 0, len(models))
+	for _, m := range models {
+		items = append(items, m.toDomain())
+	}
+	return items, nil
 }
 
 func (r *RunnerRepo) ListActiveByProvider(ctx context.Context, provider string) ([]domain.Runner, error) {

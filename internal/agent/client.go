@@ -10,20 +10,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/google/uuid"
 )
 
 type HeartbeatRequest struct {
-	OS             string   `json:"os"`
-	Arch           string   `json:"arch"`
-	Runtime        string   `json:"runtime"`
-	Version        string   `json:"version"`
-	Hostname       string   `json:"hostname"`
-	CPUCount       int      `json:"cpu_count"`
-	MemoryMB       int      `json:"memory_mb"`
-	MaxConcurrency int      `json:"max_concurrency"`
-	ActiveJobs     int      `json:"active_jobs"`
-	Labels         []string `json:"labels,omitempty"`
+	OS             string                       `json:"os"`
+	Arch           string                       `json:"arch"`
+	Runtime        string                       `json:"runtime"`
+	SandboxRuntime string                       `json:"sandbox_runtime,omitempty"`
+	Version        string                       `json:"version"`
+	Hostname       string                       `json:"hostname"`
+	CPUCount       int                          `json:"cpu_count"`
+	MemoryMB       int                          `json:"memory_mb"`
+	MaxConcurrency int                          `json:"max_concurrency"`
+	ActiveJobs     int                          `json:"active_jobs"`
+	Labels         []string                     `json:"labels,omitempty"`
+	Metrics        *domain.AgentMetricsSnapshot `json:"metrics,omitempty"`
 }
 
 type HeartbeatResponse struct {
@@ -44,6 +47,11 @@ type TaskPayload struct {
 	ContainerImage   string    `json:"container_image"`
 	VCPU             int       `json:"vcpu"`
 	MemoryMB         int       `json:"memory_mb"`
+	IsForkPR         bool      `json:"is_fork_pr"`
+	BuildProfile     string    `json:"build_profile"`
+	CacheEnabled     bool      `json:"cache_enabled"`
+	CacheScope       string    `json:"cache_scope"`
+	SandboxMode      string    `json:"sandbox_mode"`
 	EncodedJITConfig string    `json:"encoded_jit_config"`
 }
 
@@ -89,6 +97,17 @@ func (c *Client) CompleteTask(ctx context.Context, taskID uuid.UUID, status, err
 		"error_message": errMsg,
 	}
 	_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/agent/tasks/"+taskID.String()+"/complete", body, nil)
+	return err
+}
+
+func (c *Client) ShipTaskLogs(ctx context.Context, taskID uuid.UUID, entries []domain.RunnerLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	body := map[string]any{
+		"entries": entries,
+	}
+	_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/agent/tasks/"+taskID.String()+"/logs", body, nil)
 	return err
 }
 

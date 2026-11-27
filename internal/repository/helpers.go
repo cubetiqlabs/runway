@@ -31,6 +31,22 @@ func paginate(p domain.PageParams) func(db *gorm.DB) *gorm.DB {
 	}
 }
 
+func applySort(p domain.PageParams, allowed map[string]string, defaultOrder string) func(db *gorm.DB) *gorm.DB {
+	col, ok := allowed[strings.ToLower(strings.TrimSpace(p.SortBy))]
+	if !ok {
+		return func(db *gorm.DB) *gorm.DB {
+			return db.Order(defaultOrder)
+		}
+	}
+	dir := "DESC"
+	if strings.EqualFold(strings.TrimSpace(p.SortDir), "asc") {
+		dir = "ASC"
+	}
+	return func(db *gorm.DB) *gorm.DB {
+		return db.Order(col + " " + dir)
+	}
+}
+
 func mapGormError(err error) error {
 	if err == nil {
 		return nil

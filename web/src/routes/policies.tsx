@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { createFileRoute } from "@tanstack/react-router"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { Add01Icon, Edit02Icon, Delete02Icon, PlayIcon } from "@hugeicons/core-free-icons"
@@ -25,7 +25,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { ResponsiveTable } from "@/components/responsive-table"
+import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
 import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
 import { api } from "@/lib/api"
@@ -74,11 +74,21 @@ function splitPatterns(raw: string): string[] {
 
 function PoliciesPage() {
   const [policies, setPolicies] = useState<ModerationPolicy[]>([])
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(true)
+
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
+  const [search, setSearch] = useState("")
+  const [actionFilter, setActionFilter] = useState("all")
+  const [enabledFilter, setEnabledFilter] = useState("all")
+  const [sortBy, setSortBy] = useState("priority")
+  const [sortDir, setSortDir] = useState<SortDirection>("asc")
+
   const [dialogOpen, setDialogOpen] = useState(false)
   const [form, setForm] = useState<PolicyFormState>(EMPTY_POLICY)
   const [deleteTarget, setDeleteTarget] = useState<ModerationPolicy | null>(null)
 
-  // Simulator state
   const [simOpen, setSimOpen] = useState(false)
   const [simRepo, setSimRepo] = useState("cubetiq/api")
   const [simBranch, setSimBranch] = useState("main")
@@ -91,13 +101,25 @@ function PoliciesPage() {
   } | null>(null)
 
   const load = useCallback(async () => {
+    setLoading(true)
     try {
-      const res = await api.listPolicies()
+      const res = await api.listPolicies({
+        limit: pageSize,
+        page,
+        search: search.trim() || undefined,
+        action: actionFilter,
+        enabled: enabledFilter,
+        sort_by: sortBy,
+        sort_dir: sortDir,
+      })
       setPolicies(res.items)
+      setTotal(res.total)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load policies")
+    } finally {
+      setLoading(false)
     }
-  }, [])
+  }, [page, pageSize, search, actionFilter, enabledFilter, sortBy, sortDir])
 
   useEffect(() => {
     void load()
@@ -191,6 +213,105 @@ function PoliciesPage() {
     }
   }
 
+  const columns: DataTableColumn<ModerationPolicy>[] = useMemo(
+    () => [
+      {
+        id: "priority",
+        header: "Priority",
+        sortable: true,
+        cell: (p) => <span className="font-mono font-semibold">{p.priority}</span>,
+      },
+      {
+        id: "name",
+        header: "Policy",
+        sortable: true,
+        isRowHeader: true,
+        hideable: false,
+        cell: (p) => (
+          <div>
+            <div className="font-medium">{p.name}</div>
+            {p.description && (
+              <div className="text-[11px] text-muted-foreground max-w-60 truncate">
+                {p.description}
+              </div>
+            )}
+          </div>
+        ),
+      },
+      {
+        id: "action",
+        header: "Action",
+        sortable: true,
+        cell: (p) => <StatusBadge status={p.action} />,
+      },
+      {
+        id: "scope",
+        header: "Repo / Branch Scope",
+        cell: (p) => (
+          <div className="font-mono text-[11px] text-muted-foreground">
+            <div>repos: {p.repo_patterns.join(", ") || "*"}</div>
+            <div>branches: {p.branch_patterns.join(", ") || "*"}</div>
+          </div>
+        ),
+      },
+      {
+        id: "guards",
+        header: "Guards",
+        cell: (p) => (
+          <div className="flex flex-wrap gap-1">
+            {p.block_fork_prs && (
+              <Badge variant="destructive" className="text-[10px]">
+                Block Fork PRs
+              </Badge>
+            )}
+            {p.max_concurrent_per_repo && (
+              <Badge variant="outline" className="text-[10px]">
+                Max {p.max_concurrent_per_repo}/repo
+              </Badge>
+            )}
+          </div>
+        ),
+      },
+      {
+        id: "enabled",
+        header: "Enabled",
+        sortable: true,
+        cell: (p) => (
+          <Switch
+            checked={p.enabled}
+            onCheckedChange={(checked) =>
+              void api.updatePolicy(p.id, { ...p, enabled: checked }).then(() => load())
+            }
+            aria-label={`Toggle ${p.name}`}
+          />
+        ),
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        hideable: false,
+        cell: (p) => (
+          <div className="flex items-center gap-1.5">
+            <Button type="button" size="xs" variant="outline" onClick={() => openEdit(p)}>
+              <HugeiconsIcon icon={Edit02Icon} strokeWidth={2} />
+              <span>Edit</span>
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="destructive"
+              onClick={() => setDeleteTarget(p)}
+            >
+              <HugeiconsIcon icon={Delete02Icon} strokeWidth={2} />
+              <span>Delete</span>
+            </Button>
+          </div>
+        ),
+      },
+    ],
+    [load]
+  )
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -213,76 +334,75 @@ function PoliciesPage() {
         </div>
       </div>
 
-      <ResponsiveTable
+      <DataTable
         id="policies-table"
         caption="Runner moderation policies ordered by priority"
-        headers={["Priority", "Policy", "Action", "Repo / Branch Scope", "Guards", "Enabled", "Actions"]}
-        empty={policies.length === 0}
-        emptyMessage="No moderation policies defined."
-      >
-        {policies.map((p) => (
-          <tr key={p.id}>
-            <td data-label="Priority" className="font-mono font-semibold">
-              {p.priority}
-            </td>
-            <th scope="row">
-              <div className="font-medium">{p.name}</div>
-              {p.description && (
-                <div className="text-[11px] text-muted-foreground max-w-60 truncate">
-                  {p.description}
-                </div>
-              )}
-            </th>
-            <td data-label="Action">
-              <StatusBadge status={p.action} />
-            </td>
-            <td data-label="Scope" className="font-mono text-[11px] text-muted-foreground">
-              <div>repos: {p.repo_patterns.join(", ") || "*"}</div>
-              <div>branches: {p.branch_patterns.join(", ") || "*"}</div>
-            </td>
-            <td data-label="Guards">
-              <div className="flex flex-wrap gap-1">
-                {p.block_fork_prs && (
-                  <Badge variant="destructive" className="text-[10px]">
-                    Block Fork PRs
-                  </Badge>
-                )}
-                {p.max_concurrent_per_repo && (
-                  <Badge variant="outline" className="text-[10px]">
-                    Max {p.max_concurrent_per_repo}/repo
-                  </Badge>
-                )}
-              </div>
-            </td>
-            <td data-label="Enabled">
-              <Switch
-                checked={p.enabled}
-                onCheckedChange={(checked) =>
-                  void api.updatePolicy(p.id, { ...p, enabled: checked }).then(() => load())
-                }
-                aria-label={`Toggle ${p.name}`}
-              />
-            </td>
-            <td data-label="Actions">
-              <div className="flex items-center gap-1.5">
-                <Button type="button" size="xs" variant="outline" onClick={() => openEdit(p)}>
-                  <HugeiconsIcon icon={Edit02Icon} strokeWidth={2} />
-                  <span>Edit</span>
-                </Button>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="destructive"
-                  onClick={() => setDeleteTarget(p)}
-                >
-                  <HugeiconsIcon icon={Delete02Icon} strokeWidth={2} />
-                  <span>Delete</span>
-                </Button>
-              </div>
-            </td>
-          </tr>
-        ))}
-      </ResponsiveTable>
+        data={policies}
+        columns={columns}
+        getRowId={(p) => p.id}
+        loading={loading}
+        emptyMessage="No moderation policies match this filter."
+        searchValue={search}
+        onSearchChange={(val) => {
+          setPage(1)
+          setSearch(val)
+        }}
+        searchPlaceholder="Search policy name or description..."
+        filters={[
+          {
+            id: "action",
+            label: "Action",
+            value: actionFilter,
+            onChange: (v) => {
+              setPage(1)
+              setActionFilter(v)
+            },
+            options: [
+              { label: "All actions", value: "all" },
+              { label: "Allow", value: "allow" },
+              { label: "Require Approval", value: "require_approval" },
+              { label: "Deny", value: "deny" },
+            ],
+          },
+          {
+            id: "enabled",
+            label: "State",
+            value: enabledFilter,
+            onChange: (v) => {
+              setPage(1)
+              setEnabledFilter(v)
+            },
+            options: [
+              { label: "All states", value: "all" },
+              { label: "Enabled", value: "true" },
+              { label: "Disabled", value: "false" },
+            ],
+          },
+        ]}
+        onResetFilters={() => {
+          setPage(1)
+          setSearch("")
+          setActionFilter("all")
+          setEnabledFilter("all")
+        }}
+        sortBy={sortBy}
+        sortDir={sortDir}
+        onSortChange={(col, dir) => {
+          setPage(1)
+          setSortBy(col)
+          setSortDir(dir)
+        }}
+        pagination={{
+          page,
+          pageSize,
+          total,
+          onPageChange: setPage,
+          onPageSizeChange: (n) => {
+            setPage(1)
+            setPageSize(n)
+          },
+        }}
+      />
 
       {/* Policy Editor Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>

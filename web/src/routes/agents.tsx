@@ -1,13 +1,15 @@
-import React, { useCallback, useEffect, useState } from "react"
-import { createFileRoute } from "@tanstack/react-router"
+import React, { useCallback, useEffect, useMemo, useState } from "react"
+import { createFileRoute, Link } from "@tanstack/react-router"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   Add01Icon,
   RefreshIcon,
   PauseCircleIcon,
+  PlayIcon,
   Delete02Icon,
   Copy01Icon,
   Key01Icon,
+  ViewIcon,
 } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -32,7 +34,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { ResponsiveTable } from "@/components/responsive-table"
+import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
 import { StatusBadge } from "@/components/status-badge"
 import { api } from "@/lib/api"
 import type { Agent, RegisterAgentResponse, RunnerPool } from "@/lib/types"
@@ -64,8 +66,19 @@ const INITIAL_FORM: AgentFormState = {
 
 function AgentsPage() {
   const [agents, setAgents] = useState<Agent[]>([])
+  const [total, setTotal] = useState(0)
   const [pools, setPools] = useState<RunnerPool[]>([])
   const [loading, setLoading] = useState(true)
+
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
+  const [search, setSearch] = useState("")
+  const [statusFilter, setStatusFilter] = useState("all")
+  const [osFilter, setOsFilter] = useState("all")
+  const [runtimeFilter, setRuntimeFilter] = useState("all")
+  const [sortBy, setSortBy] = useState("created_at")
+  const [sortDir, setSortDir] = useState<SortDirection>("desc")
+
   const [createOpen, setCreateOpen] = useState(false)
   const [form, setForm] = useState<AgentFormState>(INITIAL_FORM)
   const [saving, setSaving] = useState(false)
@@ -75,19 +88,38 @@ function AgentsPage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [agRes, poolRes] = await Promise.all([api.listAgents(), api.listPools()])
+      const [agRes, poolRes] = await Promise.all([
+        api.listAgents({
+          limit: pageSize,
+          page,
+          search: search.trim() || undefined,
+          status: statusFilter,
+          os: osFilter,
+          runtime: runtimeFilter,
+          sort_by: sortBy,
+          sort_dir: sortDir,
+        }),
+        api.listPools({ limit: 100 }),
+      ])
       setAgents(agRes.items)
+      setTotal(agRes.total)
       setPools(poolRes.items)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load agents")
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [page, pageSize, search, statusFilter, osFilter, runtimeFilter, sortBy, sortDir])
 
   useEffect(() => {
     void load()
   }, [load])
+
+  const hasDraining = agents.some((a) => a.status === "draining")
+  useEffect(() => {
+    const interval = window.setInterval(() => void load(), hasDraining ? 4000 : 15000)
+    return () => window.clearInterval(interval)
+  }, [load, hasDraining])
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -122,11 +154,25 @@ function AgentsPage() {
 
   const handleDrain = async (a: Agent) => {
     try {
-      await api.drainAgent(a.id)
-      toast.success(`Agent ${a.name} set to draining`)
+      const updated = await api.drainAgent(a.id)
+      toast.success(
+        updated.status === "drained"
+          ? `Agent ${a.name} drained (idle)`
+          : `Agent ${a.name} draining active jobs`
+      )
       void load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to drain agent")
+    }
+  }
+
+  const handleResume = async (a: Agent) => {
+    try {
+      const updated = await api.resumeAgent(a.id)
+      toast.success(`Agent ${a.name} resumed (${updated.status})`)
+      void load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to resume agent")
     }
   }
 
@@ -162,6 +208,164 @@ function AgentsPage() {
     }
   }
 
+  const columns: DataTableColumn<Agent>[] = useMemo(
+    () => [
+      {
+        id: "name",
+        header: "Agent",
+        sortable: true,
+        isRowHeader: true,
+        hideable: false,
+        cell: (a) => (
+          <div>
+            <Link
+              to="/agents/$agentId"
+              params={{ agentId: a.id }}
+              className="font-medium text-primary hover:underline"
+            >
+              {a.name}
+            </Link>
+            <div className="font-mono text-[10px] text-muted-foreground">
+              {a.hostname || a.token_prefix}
+              {a.pool_name ? ` · ${a.pool_name}` : ""}
+            </div>
+          </div>
+        ),
+      },
+      {
+        id: "os",
+        header: "Platform",
+        sortable: true,
+        cell: (a) => (
+          <span className="text-xs whitespace-nowrap">
+            <span className="capitalize">{a.os}</span> / <span className="font-mono">{a.arch}</span>
+          </span>
+        ),
+      },
+      {
+        id: "runtime",
+        header: "Runtime",
+        sortable: true,
+        cell: (a) => (
+          <div className="flex flex-wrap items-center gap-1">
+            <Badge variant="secondary" className="capitalize text-[10px]">
+              {a.runtime}
+            </Badge>
+            {a.sandbox_runtime && a.sandbox_runtime !== "auto" && (
+              <Badge variant="outline" className="font-mono text-[10px]">
+                {a.sandbox_runtime}
+              </Badge>
+            )}
+          </div>
+        ),
+      },
+      {
+        id: "metrics",
+        header: "Resources",
+        cell: (a) => {
+          const m = a.metrics
+          if (!m || m.collected_at === undefined) {
+            return <span className="text-[11px] text-muted-foreground">—</span>
+          }
+          return (
+            <div className="font-mono text-[11px] whitespace-nowrap space-y-0.5">
+              <div>
+                CPU {Number(m.cpu_usage_percent ?? 0).toFixed(0)}% · RAM{" "}
+                {Number(m.memory_usage_percent ?? 0).toFixed(0)}%
+              </div>
+              <div className="text-[10px] text-muted-foreground">
+                Disk {Number(m.disk_usage_percent ?? 0).toFixed(0)}%
+                {m.cache_hit_count || m.cache_miss_count
+                  ? ` · Cache ${m.cache_hit_count ?? 0}/${(m.cache_hit_count ?? 0) + (m.cache_miss_count ?? 0)}`
+                  : ""}
+              </div>
+            </div>
+          )
+        },
+      },
+      {
+        id: "active_jobs",
+        header: "Capacity",
+        sortable: true,
+        cell: (a) => (
+          <span className="font-mono text-[11px] whitespace-nowrap">
+            {a.active_jobs} / {a.max_concurrency}
+          </span>
+        ),
+      },
+      {
+        id: "version",
+        header: "Version",
+        defaultVisible: true,
+        cell: (a) => <span className="font-mono text-[11px]">{a.version || "—"}</span>,
+      },
+      {
+        id: "status",
+        header: "Status",
+        sortable: true,
+        cell: (a) => <StatusBadge status={a.status} />,
+      },
+      {
+        id: "last_heartbeat_at",
+        header: "Last Heartbeat",
+        sortable: true,
+        cell: (a) => (
+          <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+            {a.last_heartbeat_at ? new Date(a.last_heartbeat_at).toLocaleString() : "Never"}
+          </span>
+        ),
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        hideable: false,
+        cell: (a) => (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Link
+              to="/agents/$agentId"
+              params={{ agentId: a.id }}
+              className="inline-flex h-6 items-center gap-1 border border-border bg-background px-2 text-[11px] font-medium hover:bg-muted"
+            >
+              <HugeiconsIcon icon={ViewIcon} strokeWidth={2} className="size-3" />
+              <span>Details</span>
+            </Link>
+            {a.status === "draining" || a.status === "drained" ? (
+              <Button type="button" size="xs" variant="outline" onClick={() => void handleResume(a)}>
+                <HugeiconsIcon icon={PlayIcon} strokeWidth={2} />
+                <span>Resume</span>
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                disabled={a.status === "offline"}
+                onClick={() => void handleDrain(a)}
+              >
+                <HugeiconsIcon icon={PauseCircleIcon} strokeWidth={2} />
+                <span>Drain</span>
+              </Button>
+            )}
+            <Button type="button" size="xs" variant="outline" onClick={() => void handleRotate(a)}>
+              <HugeiconsIcon icon={Key01Icon} strokeWidth={2} />
+              <span>Rotate</span>
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="destructive"
+              onClick={() => setDeleteTarget(a)}
+            >
+              <HugeiconsIcon icon={Delete02Icon} strokeWidth={2} />
+              <span>Delete</span>
+            </Button>
+          </div>
+        ),
+      },
+    ],
+    []
+  )
+
   const origin = typeof window !== "undefined" ? window.location.origin : "https://runway.example.com"
   const unixInstallCmd = issued
     ? `curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.sh | sudo sh -s -- --server ${origin} --token ${issued.token}`
@@ -180,7 +384,7 @@ function AgentsPage() {
           <h1 className="font-heading text-xl font-semibold">Distributed Runner Agents</h1>
           <p className="text-xs text-muted-foreground">
             Deploy lightweight <code className="font-mono">runway-agent</code> workers across Linux,
-            macOS, and Windows hosts with auto-updates enabled.
+            macOS, and Windows hosts with real-time resource telemetry.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -195,72 +399,93 @@ function AgentsPage() {
         </div>
       </div>
 
-      <ResponsiveTable
+      <DataTable
         id="agents-table"
         caption="Registered Runway distributed worker agents"
-        headers={["Agent", "Platform", "Runtime", "Capacity", "Version", "Status", "Last Heartbeat", "Actions"]}
-        empty={!loading && agents.length === 0}
-        emptyMessage="No distributed agents registered yet. Click Register Agent to connect a Linux, macOS, or Windows host."
-      >
-        {agents.map((a) => (
-          <tr key={a.id}>
-            <th scope="row">
-              <div className="font-medium">{a.name}</div>
-              <div className="font-mono text-[10px] text-muted-foreground">
-                {a.hostname || a.token_prefix}
-                {a.pool_name ? ` · ${a.pool_name}` : ""}
-              </div>
-            </th>
-            <td data-label="Platform" className="text-xs">
-              <span className="capitalize">{a.os}</span> / <span className="font-mono">{a.arch}</span>
-            </td>
-            <td data-label="Runtime">
-              <Badge variant="secondary" className="capitalize text-[10px]">
-                {a.runtime}
-              </Badge>
-            </td>
-            <td data-label="Capacity" className="font-mono text-[11px]">
-              {a.active_jobs} / {a.max_concurrency}
-            </td>
-            <td data-label="Version" className="font-mono text-[11px]">
-              {a.version || "—"}
-            </td>
-            <td data-label="Status">
-              <StatusBadge status={a.status} />
-            </td>
-            <td data-label="Last Heartbeat" className="text-[11px] text-muted-foreground whitespace-nowrap">
-              {a.last_heartbeat_at ? new Date(a.last_heartbeat_at).toLocaleString() : "Never"}
-            </td>
-            <td data-label="Actions">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="outline"
-                  disabled={a.status === "draining"}
-                  onClick={() => void handleDrain(a)}
-                >
-                  <HugeiconsIcon icon={PauseCircleIcon} strokeWidth={2} />
-                  <span>Drain</span>
-                </Button>
-                <Button type="button" size="xs" variant="outline" onClick={() => void handleRotate(a)}>
-                  <HugeiconsIcon icon={Key01Icon} strokeWidth={2} />
-                  <span>Rotate</span>
-                </Button>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="destructive"
-                  onClick={() => setDeleteTarget(a)}
-                >
-                  <HugeiconsIcon icon={Delete02Icon} strokeWidth={2} />
-                  <span>Delete</span>
-                </Button>
-              </div>
-            </td>
-          </tr>
-        ))}
-      </ResponsiveTable>
+        data={agents}
+        columns={columns}
+        getRowId={(a) => a.id}
+        loading={loading}
+        emptyMessage="No distributed agents match the current filters."
+        searchValue={search}
+        onSearchChange={(val) => {
+          setPage(1)
+          setSearch(val)
+        }}
+        searchPlaceholder="Search agent or hostname..."
+        filters={[
+          {
+            id: "status",
+            label: "Status",
+            value: statusFilter,
+            onChange: (v) => {
+              setPage(1)
+              setStatusFilter(v)
+            },
+            options: [
+              { label: "All statuses", value: "all" },
+              { label: "Online", value: "online" },
+              { label: "Draining", value: "draining" },
+              { label: "Drained", value: "drained" },
+              { label: "Offline", value: "offline" },
+            ],
+          },
+          {
+            id: "os",
+            label: "OS",
+            value: osFilter,
+            onChange: (v) => {
+              setPage(1)
+              setOsFilter(v)
+            },
+            options: [
+              { label: "All OS", value: "all" },
+              { label: "Linux", value: "linux" },
+              { label: "macOS", value: "macos" },
+              { label: "Windows", value: "windows" },
+            ],
+          },
+          {
+            id: "runtime",
+            label: "Runtime",
+            value: runtimeFilter,
+            onChange: (v) => {
+              setPage(1)
+              setRuntimeFilter(v)
+            },
+            options: [
+              { label: "All runtimes", value: "all" },
+              { label: "Docker", value: "docker" },
+              { label: "Native", value: "native" },
+              { label: "Auto", value: "auto" },
+            ],
+          },
+        ]}
+        onResetFilters={() => {
+          setPage(1)
+          setSearch("")
+          setStatusFilter("all")
+          setOsFilter("all")
+          setRuntimeFilter("all")
+        }}
+        sortBy={sortBy}
+        sortDir={sortDir}
+        onSortChange={(col, dir) => {
+          setPage(1)
+          setSortBy(col)
+          setSortDir(dir)
+        }}
+        pagination={{
+          page,
+          pageSize,
+          total,
+          onPageChange: setPage,
+          onPageSizeChange: (n) => {
+            setPage(1)
+            setPageSize(n)
+          },
+        }}
+      />
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">

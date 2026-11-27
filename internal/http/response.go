@@ -3,6 +3,8 @@ package http
 import (
 	"errors"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/gofiber/fiber/v3"
@@ -47,8 +49,15 @@ func mapDomainError(err error) (int, string, string) {
 
 func parsePage(c fiber.Ctx) domain.PageParams {
 	limit := 25
-	if raw := c.Query("limit"); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+	rawLimit := c.Query("limit")
+	if rawLimit == "" {
+		rawLimit = c.Query("page_size")
+	}
+	if rawLimit != "" {
+		if v, err := strconv.Atoi(rawLimit); err == nil && v > 0 {
+			if v > 200 {
+				v = 200
+			}
 			limit = v
 		}
 	}
@@ -57,8 +66,64 @@ func parsePage(c fiber.Ctx) domain.PageParams {
 		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
 			offset = v
 		}
+	} else if rawPage := c.Query("page"); rawPage != "" {
+		if p, err := strconv.Atoi(rawPage); err == nil && p > 1 {
+			offset = (p - 1) * limit
+		}
 	}
-	return domain.PageParams{Limit: limit, Offset: offset}
+	sortDir := strings.ToLower(strings.TrimSpace(c.Query("sort_dir")))
+	if sortDir != "asc" && sortDir != "desc" {
+		sortDir = ""
+	}
+	return domain.PageParams{
+		Limit:   limit,
+		Offset:  offset,
+		SortBy:  strings.TrimSpace(c.Query("sort_by")),
+		SortDir: sortDir,
+	}
+}
+
+func sendPage[T any](c fiber.Ctx, items []T, total int, page domain.PageParams) error {
+	if items == nil {
+		items = []T{}
+	}
+	limit := page.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	offset := page.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	currentPage := (offset / limit) + 1
+	totalPages := 1
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+	hasMore := offset+len(items) < total
+	return c.JSON(fiber.Map{
+		"items":       items,
+		"total":       total,
+		"limit":       limit,
+		"offset":      offset,
+		"page":        currentPage,
+		"total_pages": totalPages,
+		"has_more":    hasMore,
+	})
+}
+
+func parseWindowDuration(raw string, fallback time.Duration) time.Duration {
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	if d > 7*24*time.Hour {
+		return 7 * 24 * time.Hour
+	}
+	return d
 }
 
 func parseUUIDParam(c fiber.Ctx, name string) (uuid.UUID, error) {

@@ -37,6 +37,9 @@ type Config struct {
 	UpdateRepo           string
 	RunnerVersion        string
 	Version              string
+	CacheEnabled         bool
+	CacheMaxGB           int
+	PrewarmImages        bool
 }
 
 func DefaultConfig(version string) Config {
@@ -49,12 +52,15 @@ func DefaultConfig(version string) Config {
 		WorkDir:           wd,
 		LogDir:            DefaultLogDir(wd),
 		Concurrency:       2,
-		PollInterval:      3 * time.Second,
+		PollInterval:      2 * time.Second,
 		HeartbeatInterval: 15 * time.Second,
 		AutoUpdate:        true,
 		UpdateInterval:    15 * time.Minute,
 		UpdateRepo:        "cubetiqlabs/runway",
 		Version:           version,
+		CacheEnabled:      true,
+		CacheMaxGB:        20,
+		PrewarmImages:     true,
 	}
 }
 
@@ -135,6 +141,12 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_VERSION")); v != "" {
 		c.RunnerVersion = strings.TrimPrefix(v, "v")
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_CACHE_ENABLED")); v != "" {
+		c.CacheEnabled = !strings.EqualFold(v, "false") && v != "0"
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_PREWARM_IMAGES")); v != "" {
+		c.PrewarmImages = !strings.EqualFold(v, "false") && v != "0"
 	}
 	return nil
 }
@@ -296,6 +308,8 @@ func ResolveDockerOptions(cfg Config) orchestrator.DockerOptions {
 		SandboxRuntime:    sandboxRT,
 		IsolatedDinD:      isolatedDinD,
 		DinDImage:         dindImg,
+		CacheEnabled:      cfg.CacheEnabled,
+		CacheMaxGB:        cfg.CacheMaxGB,
 	}
 }
 

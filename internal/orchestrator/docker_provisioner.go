@@ -12,9 +12,12 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cubetiqlabs/runway/internal/domain"
 )
 
 const (
@@ -23,7 +26,7 @@ const (
 	latestRefreshInterval = 30 * time.Minute
 )
 
-const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if { [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ ! -w "${RUNNER_TOOL_CACHE}" ]; } || { [ -n "${AGENT_TOOLSDIRECTORY:-}" ] && [ ! -w "${AGENT_TOOLSDIRECTORY}" ]; }; then FALLBACK_TOOL_CACHE=/home/runner/_work/_tool; [ -d /home/runner ] || FALLBACK_TOOL_CACHE="$(pwd)/_work/_tool"; export RUNNER_TOOL_CACHE="$FALLBACK_TOOL_CACHE" AGENT_TOOLSDIRECTORY="$FALLBACK_TOOL_CACHE"; mkdir -p "$RUNNER_TOOL_CACHE" 2>/dev/null || true; fi; if [ -n "${DOCKER_HOST:-}" ] && command -v docker >/dev/null 2>&1; then i=0; while [ "$i" -lt 120 ]; do if docker info >/dev/null 2>&1; then break; fi; i=$((i+1)); sleep 0.25 2>/dev/null || sleep 1; done; fi; if [ -d /home/runner ]; then touch /home/runner/.env 2>/dev/null || true; if [ -n "${DOCKER_HOST:-}" ] && ! grep -q '^DOCKER_HOST=' /home/runner/.env 2>/dev/null; then printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> /home/runner/.env 2>/dev/null || true; fi; if [ -n "${RUNNER_TOOL_CACHE:-}" ] && ! grep -q '^RUNNER_TOOL_CACHE=' /home/runner/.env 2>/dev/null; then printf 'RUNNER_TOOL_CACHE=%s\nAGENT_TOOLSDIRECTORY=%s\n' "$RUNNER_TOOL_CACHE" "${AGENT_TOOLSDIRECTORY:-$RUNNER_TOOL_CACHE}" >> /home/runner/.env 2>/dev/null || true; fi; fi; if [ "${RUNWAY_DIND_PORT_PROXY:-}" = "1" ] && [ -x /usr/local/bin/runway-portfwd ]; then /usr/local/bin/runway-portfwd >/tmp/runway-portfwd.log 2>&1 & fi; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
+const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -n "${RUNWAY_CACHE_DIR:-}" ] && [ -w "${RUNWAY_CACHE_DIR}" ]; then mkdir -p "${RUNWAY_CACHE_DIR}/gomod" "${RUNWAY_CACHE_DIR}/gocache" "${RUNWAY_CACHE_DIR}/npm" "${RUNWAY_CACHE_DIR}/bun" "${RUNWAY_CACHE_DIR}/pip" "${RUNWAY_CACHE_DIR}/cargo" "${RUNWAY_CACHE_DIR}/ccache" "${RUNWAY_CACHE_DIR}/sccache" "${RUNWAY_CACHE_DIR}/toolcache" 2>/dev/null || true; fi; if { [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ ! -w "${RUNNER_TOOL_CACHE}" ]; } || { [ -n "${AGENT_TOOLSDIRECTORY:-}" ] && [ ! -w "${AGENT_TOOLSDIRECTORY}" ]; }; then FALLBACK_TOOL_CACHE=/home/runner/_work/_tool; [ -d /home/runner ] || FALLBACK_TOOL_CACHE="$(pwd)/_work/_tool"; export RUNNER_TOOL_CACHE="$FALLBACK_TOOL_CACHE" AGENT_TOOLSDIRECTORY="$FALLBACK_TOOL_CACHE"; mkdir -p "$RUNNER_TOOL_CACHE" 2>/dev/null || true; fi; if [ -n "${DOCKER_HOST:-}" ] && command -v docker >/dev/null 2>&1; then i=0; while [ "$i" -lt 240 ]; do if docker info >/dev/null 2>&1; then break; fi; i=$((i+1)); sleep 0.1 2>/dev/null || sleep 1; done; fi; if [ -d /home/runner ]; then touch /home/runner/.env 2>/dev/null || true; for k in DOCKER_HOST RUNNER_TOOL_CACHE AGENT_TOOLSDIRECTORY GOMODCACHE GOCACHE NPM_CONFIG_CACHE BUN_INSTALL_CACHE_DIR PIP_CACHE_DIR CARGO_HOME CCACHE_DIR SCCACHE_DIR DOCKER_BUILDKIT COMPOSE_DOCKER_CLI_BUILD BUILDX_NO_DEFAULT_ATTESTATIONS MAKEFLAGS GOMAXPROCS CARGO_BUILD_JOBS; do eval "val=\${$k:-}"; if [ -n "$val" ] && ! grep -q "^${k}=" /home/runner/.env 2>/dev/null; then printf '%s=%s\n' "$k" "$val" >> /home/runner/.env 2>/dev/null || true; fi; done; fi; if [ "${RUNWAY_DIND_PORT_PROXY:-}" = "1" ] && [ -x /usr/local/bin/runway-portfwd ]; then /usr/local/bin/runway-portfwd >/tmp/runway-portfwd.log 2>&1 & fi; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
 
 // DockerOptions configures runner sandboxing and how spawned runner containers access Docker.
 type DockerOptions struct {
@@ -32,9 +35,11 @@ type DockerOptions struct {
 	MountDockerSocket bool
 	RunnerDockerGID   string
 	RunnerDNS         []string
-	SandboxRuntime    string // auto | gvisor | runsc | runc | none | <custom>
+	SandboxRuntime    string // auto | gvisor | runsc | kata | runc | none | <custom>
 	IsolatedDinD      bool   // spin up an isolated per-job docker:dind sidecar to eliminate port collisions
 	DinDImage         string
+	CacheEnabled      bool
+	CacheMaxGB        int
 }
 
 type dockerHostInfo struct {
@@ -48,6 +53,7 @@ type dockerPodRef struct {
 	sidecarID   string
 	networkID   string
 	volumeName  string
+	dindSlotVol string
 }
 
 // DockerProvisioner speaks directly to the Docker Engine socket or TCP/HTTP API with zero heavy SDK deps.
@@ -57,6 +63,7 @@ type DockerProvisioner struct {
 	opts       DockerOptions
 	client     *http.Client
 	pullClient *http.Client
+	cache      *CacheManager
 
 	pullMu     sync.Mutex
 	lastPulled map[string]time.Time
@@ -105,12 +112,20 @@ func NewDockerProvisionerWithOptions(dockerHost string, opts DockerOptions) *Doc
 		opts:       opts,
 		client:     &http.Client{Transport: transport, Timeout: 30 * time.Second},
 		pullClient: &http.Client{Transport: transport, Timeout: 5 * time.Minute},
+		cache:      NewCacheManager(),
 		lastPulled: make(map[string]time.Time),
 		pulling:    make(map[string]bool),
 	}
 }
 
 func (d *DockerProvisioner) Name() string { return "docker" }
+
+func (d *DockerProvisioner) CacheStats() (hits, misses int64) {
+	if d.cache == nil {
+		return 0, 0
+	}
+	return d.cache.Stats()
+}
 
 // Ping checks connectivity to the configured Docker Engine endpoint.
 func (d *DockerProvisioner) Ping(ctx context.Context) error {
@@ -162,8 +177,11 @@ func (d *DockerProvisioner) hostInfo(ctx context.Context) (dockerHostInfo, error
 	}, nil
 }
 
-func (d *DockerProvisioner) resolveSandboxRuntime(info dockerHostInfo) (string, error) {
-	mode := strings.TrimSpace(d.opts.SandboxRuntime)
+func (d *DockerProvisioner) resolveSandboxRuntime(info dockerHostInfo, poolMode string) (string, error) {
+	mode := strings.TrimSpace(poolMode)
+	if mode == "" || strings.EqualFold(mode, "auto") {
+		mode = strings.TrimSpace(d.opts.SandboxRuntime)
+	}
 	lower := strings.ToLower(mode)
 
 	switch lower {
@@ -182,6 +200,16 @@ func (d *DockerProvisioner) resolveSandboxRuntime(info dockerHostInfo) (string, 
 			return "", fmt.Errorf("gvisor runtime (runsc) requested but not configured in Docker daemon (available: %s)", formatRuntimes(info.runtimes))
 		}
 		return "runsc", nil
+	case "kata", "kata-runtime":
+		if len(info.runtimes) > 0 {
+			for _, candidate := range []string{"kata", "kata-runtime"} {
+				if exact, ok := info.runtimes[candidate]; ok {
+					return exact, nil
+				}
+			}
+			return "", fmt.Errorf("kata runtime requested but not configured in Docker daemon (available: %s)", formatRuntimes(info.runtimes))
+		}
+		return "kata", nil
 	default:
 		if len(info.runtimes) > 0 {
 			if exact, ok := info.runtimes[lower]; ok {
@@ -244,14 +272,22 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		return nil, fmt.Errorf("verify gvisor runtime via docker info: %w", infoErr)
 	}
 
-	sandboxRuntime, rtErr := d.resolveSandboxRuntime(info)
+	sandboxRuntime, rtErr := d.resolveSandboxRuntime(info, req.Pool.SandboxMode)
 	if rtErr != nil {
 		return nil, rtErr
 	}
 
+	buildProfile := strings.ToLower(strings.TrimSpace(req.Pool.BuildProfile))
+	if buildProfile == "" {
+		buildProfile = "standard"
+	}
+
 	shmSize := memBytes / 2
 	const minShm = int64(64) * 1024 * 1024
-	const maxShm = int64(2) * 1024 * 1024 * 1024
+	maxShm := int64(2) * 1024 * 1024 * 1024
+	if buildProfile == "ultra" {
+		maxShm = int64(4) * 1024 * 1024 * 1024
+	}
 	if shmSize < minShm {
 		shmSize = minShm
 	} else if shmSize > maxShm {
@@ -259,6 +295,9 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 	}
 
 	pidsLimit := int64(4096)
+	if buildProfile == "ultra" {
+		pidsLimit = 8192
+	}
 	managedLabels := map[string]string{
 		"runway.managed":   "true",
 		"runway.runner_id": req.RunnerID.String(),
@@ -281,6 +320,39 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		"MemorySwap":  memBytes,
 		"ShmSize":     shmSize,
 	}
+	if buildProfile == "fast" || buildProfile == "ultra" {
+		hostConfig["Ulimits"] = []map[string]any{
+			{"Name": "nofile", "Soft": 65536, "Hard": 65536},
+		}
+		if buildProfile == "ultra" {
+			hostConfig["CpuShares"] = 2048
+			tmpSize := memBytes / 5
+			if tmpSize > 4*1024*1024*1024 {
+				tmpSize = 4 * 1024 * 1024 * 1024
+			}
+			workTmpSize := memBytes / 6
+			if workTmpSize > 2*1024*1024*1024 {
+				workTmpSize = 2 * 1024 * 1024 * 1024
+			}
+			if tmpSize >= 128*1024*1024 {
+				hostConfig["Tmpfs"] = map[string]string{
+					"/tmp":                     fmt.Sprintf("rw,nosuid,nodev,size=%d", tmpSize),
+					"/home/runner/_work/_temp": fmt.Sprintf("rw,nosuid,nodev,size=%d", workTmpSize),
+				}
+			}
+		} else {
+			hostConfig["CpuShares"] = 1536
+			tmpSize := memBytes / 6
+			if tmpSize > 2*1024*1024*1024 {
+				tmpSize = 2 * 1024 * 1024 * 1024
+			}
+			if tmpSize >= 128*1024*1024 {
+				hostConfig["Tmpfs"] = map[string]string{
+					"/tmp": fmt.Sprintf("rw,nosuid,nodev,size=%d", tmpSize),
+				}
+			}
+		}
+	}
 	if sandboxRuntime != "" {
 		hostConfig["Runtime"] = sandboxRuntime
 	}
@@ -290,6 +362,44 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 
 	var pod dockerPodRef
 	var binds []string
+
+	cacheScope := strings.ToLower(strings.TrimSpace(req.Pool.CacheScope))
+	if cacheScope == "" {
+		cacheScope = "repo"
+	}
+	var cacheScopeKey string
+	var cacheVolume string
+	if req.Pool.CacheEnabled && cacheScope != "none" && d.cache != nil {
+		cacheScopeKey = d.cache.ScopeKey(req.Pool.Slug, req.RepoFullName, cacheScope)
+		if cacheScopeKey != "" {
+			volCandidate := d.cache.BuildCacheVolumeName(cacheScopeKey)
+			existed := d.volumeExists(ctx, volCandidate)
+			if createdCacheVol, volErr := d.createVolume(ctx, volCandidate, map[string]string{
+				"runway.managed":    "true",
+				"runway.cache":      "true",
+				"runway.pool_slug":  req.Pool.Slug,
+				"runway.cache_key":  cacheScopeKey,
+			}); volErr == nil && createdCacheVol != "" {
+				cacheVolume = createdCacheVol
+				d.cache.TrackVolumeHitMiss(cacheVolume, existed)
+				if req.IsForkPR {
+					binds = append(binds, cacheVolume+":/runway-cache:ro")
+				} else {
+					binds = append(binds, cacheVolume+":/runway-cache")
+				}
+				env = append(env, CacheEnvVars("/runway-cache", buildProfile, vcpu)...)
+			}
+		}
+	} else if buildProfile == "fast" || buildProfile == "ultra" {
+		env = append(env,
+			"DOCKER_BUILDKIT=1",
+			"COMPOSE_DOCKER_CLI_BUILD=1",
+			"BUILDX_NO_DEFAULT_ATTESTATIONS=1",
+			fmt.Sprintf("MAKEFLAGS=-j%d", vcpu),
+			fmt.Sprintf("GOMAXPROCS=%d", vcpu),
+			fmt.Sprintf("CARGO_BUILD_JOBS=%d", vcpu),
+		)
+	}
 
 	if d.opts.IsolatedDinD && strings.TrimSpace(d.opts.RunnerDockerHost) == "" {
 		shortID := strings.ReplaceAll(req.RunnerID.String(), "-", "")
@@ -311,6 +421,24 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 			dindImage = defaultDinDImage
 		}
 		sidecarName := "runway-dind-" + shortID
+		sidecarBinds := []string{}
+		if pod.volumeName != "" {
+			sidecarBinds = append(sidecarBinds, pod.volumeName+":/home/runner/_work")
+		}
+		if buildProfile == "ultra" && req.Pool.CacheEnabled && !req.IsForkPR && cacheScopeKey != "" && d.cache != nil {
+			dindVolCandidate, _ := d.cache.AcquireDinDCacheSlot(cacheScopeKey)
+			if createdDinDVol, dindVolErr := d.createVolume(ctx, dindVolCandidate, map[string]string{
+				"runway.managed":   "true",
+				"runway.cache":     "dind",
+				"runway.cache_key": cacheScopeKey,
+			}); dindVolErr == nil && createdDinDVol != "" {
+				pod.dindSlotVol = dindVolCandidate
+				sidecarBinds = append(sidecarBinds, createdDinDVol+":/var/lib/docker")
+			} else {
+				d.cache.ReleaseDinDCacheSlot(dindVolCandidate)
+			}
+		}
+
 		sidecarHostConfig := map[string]any{
 			"AutoRemove": true,
 			"Init":       true,
@@ -323,8 +451,8 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		if len(dnsServers) > 0 {
 			sidecarHostConfig["Dns"] = dnsServers
 		}
-		if pod.volumeName != "" {
-			sidecarHostConfig["Binds"] = []string{pod.volumeName + ":/home/runner/_work"}
+		if len(sidecarBinds) > 0 {
+			sidecarHostConfig["Binds"] = sidecarBinds
 		}
 
 		sidecarCmd := []string{"--host=tcp://127.0.0.1:2375", "--tls=false"}
@@ -421,6 +549,9 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		"memory_mb":       memBytes / (1024 * 1024),
 		"sandbox_runtime": effectiveRuntime,
 		"isolated_dind":   pod.sidecarID != "",
+		"build_profile":   buildProfile,
+		"cache_volume":    cacheVolume,
+		"cache_readonly":  req.IsForkPR && cacheVolume != "",
 	}
 	if len(dnsServers) > 0 {
 		hostInfoMap["runner_dns"] = dnsServers
@@ -734,10 +865,10 @@ func splitImageRepoTag(image string) (repo, tag string) {
 }
 
 func formatProviderRef(pod dockerPodRef) string {
-	if pod.sidecarID == "" && pod.networkID == "" && pod.volumeName == "" {
+	if pod.sidecarID == "" && pod.networkID == "" && pod.volumeName == "" && pod.dindSlotVol == "" {
 		return pod.containerID
 	}
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, 5)
 	if pod.containerID != "" {
 		parts = append(parts, "c="+pod.containerID)
 	}
@@ -749,6 +880,9 @@ func formatProviderRef(pod dockerPodRef) string {
 	}
 	if pod.volumeName != "" {
 		parts = append(parts, "v="+pod.volumeName)
+	}
+	if pod.dindSlotVol != "" {
+		parts = append(parts, "d="+pod.dindSlotVol)
 	}
 	return "pod:" + strings.Join(parts, ",")
 }
@@ -773,6 +907,8 @@ func parseProviderRef(raw string) dockerPodRef {
 			pod.networkID = v
 		case "v":
 			pod.volumeName = v
+		case "d":
+			pod.dindSlotVol = v
 		}
 	}
 	return pod
@@ -845,8 +981,28 @@ func (d *DockerProvisioner) removeVolume(ctx context.Context, volumeName string)
 	}
 }
 
+func (d *DockerProvisioner) volumeExists(ctx context.Context, volumeName string) bool {
+	if strings.TrimSpace(volumeName) == "" {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/volumes/%s", d.baseURL, url.PathEscape(volumeName)), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return false
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 func (d *DockerProvisioner) Terminate(ctx context.Context, providerRef string) error {
 	pod := parseProviderRef(providerRef)
+	if pod.dindSlotVol != "" && d.cache != nil {
+		d.cache.ReleaseDinDCacheSlot(pod.dindSlotVol)
+	}
 	var errs []error
 	if pod.containerID != "" {
 		if err := d.removeContainer(ctx, pod.containerID); err != nil {
@@ -869,6 +1025,124 @@ func (d *DockerProvisioner) Terminate(ctx context.Context, providerRef string) e
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// FetchLogs retrieves trailing stdout/stderr logs from a runner container and demuxes Docker frames.
+func (d *DockerProvisioner) FetchLogs(ctx context.Context, providerRef string, tail int) ([]domain.RunnerLogEntry, error) {
+	pod := parseProviderRef(providerRef)
+	if pod.containerID == "" {
+		return nil, nil
+	}
+	if tail <= 0 || tail > 2000 {
+		tail = 500
+	}
+	u := fmt.Sprintf("%s/containers/%s/logs?stdout=1&stderr=1&timestamps=1&tail=%s",
+		d.baseURL, url.PathEscape(pod.containerID), strconv.Itoa(tail))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("docker logs failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	return decodeDockerLogStream(raw), nil
+}
+
+// PrewarmImages pulls missing container images in the background to eliminate cold-start pull latency.
+func (d *DockerProvisioner) PrewarmImages(ctx context.Context, images []string) {
+	seen := make(map[string]struct{}, len(images))
+	for _, img := range images {
+		img = strings.TrimSpace(img)
+		if img == "" {
+			continue
+		}
+		if _, ok := seen[img]; ok {
+			continue
+		}
+		seen[img] = struct{}{}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/images/%s/json", d.baseURL, url.PathEscape(img)), nil)
+		if err != nil {
+			continue
+		}
+		resp, err := d.client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				continue
+			}
+		}
+		_ = d.pullImage(ctx, img)
+	}
+}
+
+func decodeDockerLogStream(raw []byte) []domain.RunnerLogEntry {
+	var out []domain.RunnerLogEntry
+	appendLines := func(stream string, chunk []byte) {
+		for _, line := range strings.Split(string(chunk), "\n") {
+			line = strings.TrimRight(line, "\r")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			ts := time.Now().UTC()
+			text := line
+			if idx := strings.IndexByte(line, ' '); idx > 0 {
+				if parsed, err := time.Parse(time.RFC3339Nano, line[:idx]); err == nil {
+					ts = parsed.UTC()
+					text = line[idx+1:]
+				}
+			}
+			lvl := "info"
+			if stream == "stderr" {
+				lvl = "error"
+			}
+			out = append(out, domain.RunnerLogEntry{
+				Timestamp: ts,
+				Stream:    stream,
+				Level:     lvl,
+				Line:      text,
+			})
+		}
+	}
+
+	// Attempt Docker 8-byte multiplexed frame decoding ([stream,0,0,0,size_be_u32]).
+	i := 0
+	framed := false
+	for i+8 <= len(raw) {
+		streamType := raw[i]
+		if (streamType == 1 || streamType == 2) && raw[i+1] == 0 && raw[i+2] == 0 && raw[i+3] == 0 {
+			size := int(raw[i+4])<<24 | int(raw[i+5])<<16 | int(raw[i+6])<<8 | int(raw[i+7])
+			if size >= 0 && i+8+size <= len(raw) {
+				framed = true
+				stream := "stdout"
+				if streamType == 2 {
+					stream = "stderr"
+				}
+				appendLines(stream, raw[i+8:i+8+size])
+				i += 8 + size
+				continue
+			}
+		}
+		break
+	}
+	if !framed {
+		appendLines("stdout", raw)
+	}
+	return out
 }
 
 func (d *DockerProvisioner) Healthy(ctx context.Context, providerRef string) (bool, error) {

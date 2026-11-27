@@ -23,9 +23,9 @@ func NewAgentRepo(db *gorm.DB) *AgentRepo {
 func (r *AgentRepo) agentQuery(ctx context.Context) *gorm.DB {
 	return r.db.WithContext(ctx).
 		Table("agents a").
-		Select(`a.id, a.name, a.token_prefix, a.token_hash, a.os, a.arch, a.runtime, a.labels,
+		Select(`a.id, a.name, a.token_prefix, a.token_hash, a.os, a.arch, a.runtime, a.sandbox_runtime, a.labels,
 			a.pool_id, COALESCE(p.name, '') AS pool_name, a.version, a.hostname, a.cpu_count,
-			a.memory_mb, a.max_concurrency, a.active_jobs, a.status, a.last_heartbeat_at,
+			a.memory_mb, a.max_concurrency, a.active_jobs, a.status, a.metrics, a.last_heartbeat_at,
 			a.created_at, a.updated_at`).
 		Joins("LEFT JOIN runner_pools p ON p.id = a.pool_id")
 }
@@ -38,6 +38,7 @@ func (r *AgentRepo) Create(ctx context.Context, agent *domain.Agent) error {
 		OS:              defaultStr(agent.OS, "linux"),
 		Arch:            defaultStr(agent.Arch, "x64"),
 		Runtime:         defaultStr(agent.Runtime, "native"),
+		SandboxRuntime:  agent.SandboxRuntime,
 		Labels:          pq.StringArray(nonNilSlice(agent.Labels)),
 		PoolID:          agent.PoolID,
 		Version:         defaultStr(agent.Version, "dev"),
@@ -47,6 +48,7 @@ func (r *AgentRepo) Create(ctx context.Context, agent *domain.Agent) error {
 		MaxConcurrency:  maxInt(agent.MaxConcurrency, 2),
 		ActiveJobs:      agent.ActiveJobs,
 		Status:          defaultStr(string(agent.Status), string(domain.AgentOffline)),
+		Metrics:         nonEmptyJSON(agent.Metrics),
 		LastHeartbeatAt: agent.LastHeartbeatAt,
 	}
 	if err := r.db.WithContext(ctx).Create(&m).Error; err != nil {
@@ -74,15 +76,47 @@ func (r *AgentRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*doma
 	return &out, nil
 }
 
-func (r *AgentRepo) List(ctx context.Context, page domain.PageParams) ([]domain.Agent, int, error) {
+func (r *AgentRepo) List(ctx context.Context, filter domain.AgentFilter) ([]domain.Agent, int, error) {
+	q := r.db.WithContext(ctx).Table("agents a")
+	if filter.Status != "" {
+		q = q.Where("a.status = ?", filter.Status)
+	}
+	if filter.OS != "" {
+		q = q.Where("a.os = ?", filter.OS)
+	}
+	if filter.Runtime != "" {
+		q = q.Where("a.runtime = ?", filter.Runtime)
+	}
+	if filter.PoolID != nil {
+		q = q.Where("a.pool_id = ?", *filter.PoolID)
+	}
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(a.name ILIKE ? ESCAPE '\' OR a.hostname ILIKE ? ESCAPE '\')`, like, like)
+	}
+
 	var total int64
-	if err := r.db.WithContext(ctx).Table("agents").Count(&total).Error; err != nil {
+	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
+
+	sortCols := map[string]string{
+		"name":              "a.name",
+		"status":            "a.status",
+		"os":                "a.os",
+		"runtime":           "a.runtime",
+		"active_jobs":       "a.active_jobs",
+		"max_concurrency":   "a.max_concurrency",
+		"last_heartbeat_at": "a.last_heartbeat_at",
+		"created_at":        "a.created_at",
+	}
+
 	var models []AgentModel
-	err := r.agentQuery(ctx).
-		Order("a.created_at DESC").
-		Scopes(paginate(page)).
+	err := q.Select(`a.id, a.name, a.token_prefix, a.token_hash, a.os, a.arch, a.runtime, a.sandbox_runtime, a.labels,
+			a.pool_id, COALESCE(p.name, '') AS pool_name, a.version, a.hostname, a.cpu_count,
+			a.memory_mb, a.max_concurrency, a.active_jobs, a.status, a.metrics, a.last_heartbeat_at,
+			a.created_at, a.updated_at`).
+		Joins("LEFT JOIN runner_pools p ON p.id = a.pool_id").
+		Scopes(applySort(filter.PageParams, sortCols, "a.created_at DESC"), paginate(filter.PageParams)).
 		Scan(&models).Error
 	if err != nil {
 		return nil, 0, mapGormError(err)
@@ -94,10 +128,23 @@ func (r *AgentRepo) List(ctx context.Context, page domain.PageParams) ([]domain.
 	return items, int(total), nil
 }
 
+func (r *AgentRepo) ListByStatus(ctx context.Context, status domain.AgentStatus) ([]domain.Agent, error) {
+	var models []AgentModel
+	err := r.agentQuery(ctx).Where("a.status = ?", string(status)).Scan(&models).Error
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+	items := make([]domain.Agent, 0, len(models))
+	for _, m := range models {
+		items = append(items, m.toDomain())
+	}
+	return items, nil
+}
+
 func (r *AgentRepo) CountOnline(ctx context.Context) (int, error) {
 	var count int64
 	err := r.db.WithContext(ctx).Model(&AgentModel{}).
-		Where("status IN ?", []string{string(domain.AgentOnline), string(domain.AgentDraining)}).
+		Where("status = ?", string(domain.AgentOnline)).
 		Count(&count).Error
 	return int(count), mapGormError(err)
 }
@@ -118,6 +165,9 @@ func (r *AgentRepo) UpdateHeartbeat(ctx context.Context, agent *domain.Agent) er
 	if agent.Runtime != "" {
 		updates["runtime"] = agent.Runtime
 	}
+	if agent.SandboxRuntime != "" {
+		updates["sandbox_runtime"] = agent.SandboxRuntime
+	}
 	if agent.Version != "" {
 		updates["version"] = agent.Version
 	}
@@ -136,7 +186,10 @@ func (r *AgentRepo) UpdateHeartbeat(ctx context.Context, agent *domain.Agent) er
 	if len(agent.Labels) > 0 {
 		updates["labels"] = pq.StringArray(agent.Labels)
 	}
-	// Preserve draining status until an operator explicitly drains or deletes; offline wakes back to online.
+	if len(agent.Metrics) > 0 {
+		updates["metrics"] = nonEmptyJSON(agent.Metrics)
+	}
+	// Preserve draining/drained status until resumed or drained complete; offline wakes back to online.
 	res := r.db.WithContext(ctx).Model(&AgentModel{}).
 		Where("id = ?", agent.ID).
 		UpdateColumns(updates)
@@ -204,6 +257,134 @@ func (r *AgentRepo) MarkStaleOffline(ctx context.Context, before time.Time) (int
 	return res.RowsAffected, mapGormError(res.Error)
 }
 
+func (r *AgentRepo) CountActiveTasksByAgent(ctx context.Context, agentID uuid.UUID) (int, error) {
+	var cnt int64
+	err := r.db.WithContext(ctx).Model(&AgentTaskModel{}).
+		Where("agent_id = ? AND status IN ?", agentID, []string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)}).
+		Count(&cnt).Error
+	return int(cnt), mapGormError(err)
+}
+
+func (r *AgentRepo) MarkDrainingCompleteIfIdle(ctx context.Context, agentID uuid.UUID) (bool, error) {
+	var transitioned bool
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var ag AgentModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", agentID).Take(&ag).Error; err != nil {
+			return err
+		}
+		if ag.Status != string(domain.AgentDraining) {
+			return nil
+		}
+		var activeCnt int64
+		if err := tx.Model(&AgentTaskModel{}).
+			Where("agent_id = ? AND status IN ?", agentID, []string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)}).
+			Count(&activeCnt).Error; err != nil {
+			return err
+		}
+		if activeCnt > 0 {
+			return nil
+		}
+		now := time.Now().UTC()
+		res := tx.Model(&AgentModel{}).
+			Where("id = ? AND status = ?", agentID, string(domain.AgentDraining)).
+			Updates(map[string]any{
+				"status":      string(domain.AgentDrained),
+				"active_jobs": 0,
+				"updated_at":  now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		transitioned = res.RowsAffected > 0
+		return nil
+	})
+	if err != nil {
+		return false, mapGormError(err)
+	}
+	return transitioned, nil
+}
+
+func (r *AgentRepo) ListTasksByAgent(ctx context.Context, agentID uuid.UUID, filter domain.AgentTaskFilter) ([]domain.AgentTask, int, error) {
+	q := r.db.WithContext(ctx).Model(&AgentTaskModel{}).Where("agent_id = ?", agentID)
+	if filter.Status != "" {
+		q = q.Where("status = ?", filter.Status)
+	}
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(repo_full_name ILIKE ? ESCAPE '\' OR runner_name ILIKE ? ESCAPE '\' OR pool_slug ILIKE ? ESCAPE '\')`, like, like, like)
+	}
+
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, mapGormError(err)
+	}
+
+	sortCols := map[string]string{
+		"created_at":     "created_at",
+		"claimed_at":     "claimed_at",
+		"completed_at":   "completed_at",
+		"status":         "status",
+		"repo_full_name": "repo_full_name",
+		"runner_name":    "runner_name",
+	}
+
+	var models []AgentTaskModel
+	if err := q.Scopes(applySort(filter.PageParams, sortCols, "created_at DESC"), paginate(filter.PageParams)).Find(&models).Error; err != nil {
+		return nil, 0, mapGormError(err)
+	}
+	items := make([]domain.AgentTask, 0, len(models))
+	for _, m := range models {
+		items = append(items, m.toDomain())
+	}
+	return items, int(total), nil
+}
+
+func (r *AgentRepo) GetAgentTaskStats(ctx context.Context, agentID uuid.UUID) (*domain.AgentTaskStats, error) {
+	type statsRow struct {
+		TotalTasks     int64   `gorm:"column:total_tasks"`
+		CompletedTasks int64   `gorm:"column:completed_tasks"`
+		FailedTasks    int64   `gorm:"column:failed_tasks"`
+		CancelledTasks int64   `gorm:"column:cancelled_tasks"`
+		ActiveTasks    int64   `gorm:"column:active_tasks"`
+		Tasks24h       int64   `gorm:"column:tasks_24h"`
+		AvgDurationMS  float64 `gorm:"column:avg_duration_ms"`
+		P95DurationMS  float64 `gorm:"column:p95_duration_ms"`
+	}
+	var row statsRow
+	err := r.db.WithContext(ctx).Raw(`
+		SELECT
+			COUNT(*)::BIGINT AS total_tasks,
+			COUNT(*) FILTER (WHERE status = 'completed')::BIGINT AS completed_tasks,
+			COUNT(*) FILTER (WHERE status = 'failed')::BIGINT AS failed_tasks,
+			COUNT(*) FILTER (WHERE status = 'cancelled')::BIGINT AS cancelled_tasks,
+			COUNT(*) FILTER (WHERE status IN ('claimed', 'running'))::BIGINT AS active_tasks,
+			COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::BIGINT AS tasks_24h,
+			COALESCE(AVG(EXTRACT(EPOCH FROM (completed_at - COALESCE(claimed_at, created_at))) * 1000) FILTER (WHERE completed_at IS NOT NULL), 0) AS avg_duration_ms,
+			COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - COALESCE(claimed_at, created_at))) * 1000) FILTER (WHERE completed_at IS NOT NULL), 0) AS p95_duration_ms
+		FROM agent_tasks
+		WHERE agent_id = ?`, agentID,
+	).Scan(&row).Error
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+
+	finished := row.CompletedTasks + row.FailedTasks
+	successRate := 0.0
+	if finished > 0 {
+		successRate = float64(row.CompletedTasks) * 100.0 / float64(finished)
+	}
+	return &domain.AgentTaskStats{
+		TotalTasks:     row.TotalTasks,
+		CompletedTasks: row.CompletedTasks,
+		FailedTasks:    row.FailedTasks,
+		CancelledTasks: row.CancelledTasks,
+		ActiveTasks:    row.ActiveTasks,
+		Tasks24h:       row.Tasks24h,
+		SuccessRate:    successRate,
+		AvgDurationMS:  int64(row.AvgDurationMS),
+		P95DurationMS:  int64(row.P95DurationMS),
+	}, nil
+}
+
 func (r *AgentRepo) CreateTask(ctx context.Context, task *domain.AgentTask) error {
 	m := AgentTaskModel{
 		AgentID:                   task.AgentID,
@@ -220,6 +401,11 @@ func (r *AgentRepo) CreateTask(ctx context.Context, task *domain.AgentTask) erro
 		ContainerImage:            task.ContainerImage,
 		VCPU:                      maxInt(task.VCPU, 1),
 		MemoryMB:                  maxInt(task.MemoryMB, 512),
+		IsForkPR:                  task.IsForkPR,
+		BuildProfile:              defaultStr(task.BuildProfile, "standard"),
+		CacheEnabled:              task.CacheEnabled,
+		CacheScope:                defaultStr(task.CacheScope, "repo"),
+		SandboxMode:               defaultStr(task.SandboxMode, "auto"),
 		EncodedJITConfigEncrypted: task.EncodedJITConfigEncrypted,
 		Status:                    defaultStr(string(task.Status), string(domain.AgentTaskPending)),
 	}

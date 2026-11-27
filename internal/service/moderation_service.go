@@ -71,8 +71,8 @@ func (s *ModerationService) SeedDefaultPolicies(ctx context.Context) error {
 	return s.policyRepo.Create(ctx, starter)
 }
 
-func (s *ModerationService) ListPolicies(ctx context.Context, page domain.PageParams) ([]domain.ModerationPolicy, int, error) {
-	return s.policyRepo.List(ctx, page)
+func (s *ModerationService) ListPolicies(ctx context.Context, filter domain.PolicyFilter) ([]domain.ModerationPolicy, int, error) {
+	return s.policyRepo.List(ctx, filter)
 }
 
 func (s *ModerationService) CreatePolicy(ctx context.Context, p *domain.ModerationPolicy, actor *domain.User, ip string) error {

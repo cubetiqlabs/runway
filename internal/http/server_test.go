@@ -29,11 +29,11 @@ func (s *stubAuditRepo) InsertDeliveryIfAbsent(context.Context, *domain.WebhookD
 func (s *stubAuditRepo) UpdateDeliveryStatus(context.Context, string, string, string, int) error {
 	return nil
 }
-func (s *stubAuditRepo) ListDeliveries(context.Context, domain.PageParams) ([]domain.WebhookDelivery, int, error) {
+func (s *stubAuditRepo) ListDeliveries(context.Context, domain.DeliveryFilter) ([]domain.WebhookDelivery, int, error) {
 	return nil, 0, nil
 }
 func (s *stubAuditRepo) AppendAuditLog(context.Context, *domain.AuditLog) error { return nil }
-func (s *stubAuditRepo) ListAuditLogs(context.Context, domain.PageParams) ([]domain.AuditLog, int, error) {
+func (s *stubAuditRepo) ListAuditLogs(context.Context, domain.AuditFilter) ([]domain.AuditLog, int, error) {
 	return nil, 0, nil
 }
 func (s *stubAuditRepo) GetDashboardOverview(context.Context) (*domain.DashboardOverview, error) {
