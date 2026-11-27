@@ -1,4 +1,4 @@
-import React, { useState } from "react"
+import React, { useEffect, useState } from "react"
 import { Link, useLocation, useNavigate } from "@tanstack/react-router"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
@@ -44,6 +44,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate()
   const [mobileOpen, setMobileOpen] = useState(false)
 
+  useEffect(() => {
+    if (!mobileOpen) return
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false)
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => {
+      document.body.style.overflow = prevOverflow
+      window.removeEventListener("keydown", onKeyDown)
+    }
+  }, [mobileOpen])
+
   const handleLogout = async () => {
     await logout()
     await navigate({ to: "/login" })
@@ -52,7 +66,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const themeIcon = mode === "dark" ? Moon02Icon : mode === "light" ? Sun03Icon : ComputerIcon
 
   const navContent = (
-    <nav aria-label="Primary navigation" className="flex flex-1 flex-col gap-1 p-3">
+    <nav aria-label="Primary navigation" className="flex flex-1 flex-col gap-1 overflow-y-auto p-3">
       {NAV_ITEMS.map((item) => {
         const active =
           item.to === "/"
@@ -80,8 +94,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="min-h-dvh flex bg-background text-foreground">
-      {/* Desktop Sidebar */}
-      <aside className="hidden md:flex w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar">
+      {/* Desktop Sticky Sidebar */}
+      <aside className="hidden md:flex sticky top-0 h-dvh w-60 shrink-0 flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
         <div className="flex h-14 items-center gap-2.5 border-b border-sidebar-border px-4">
           <div className="flex size-7 items-center justify-center bg-primary text-primary-foreground font-heading text-sm font-bold">
             R
@@ -114,7 +128,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             onClick={() => setMobileOpen(false)}
             aria-hidden="true"
           />
-          <aside className="relative z-10 flex w-64 flex-col border-r border-sidebar-border bg-sidebar">
+          <aside className="relative z-10 flex h-dvh w-64 flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
             <div className="flex h-14 items-center justify-between border-b border-sidebar-border px-4">
               <span className="font-heading text-sm font-semibold">Runway</span>
               <Button
@@ -191,7 +205,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
 
-        <main className="flex-1 p-4 md:p-6 max-w-7xl w-full mx-auto space-y-6">
+        <main className="flex-1 min-w-0 p-4 md:p-6 max-w-7xl w-full mx-auto space-y-6">
           {children}
         </main>
       </div>

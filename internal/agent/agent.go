@@ -18,13 +18,14 @@ type Executor interface {
 }
 
 type Agent struct {
-	cfg      Config
-	log      *zap.Logger
-	client   *Client
-	executor Executor
-	updater  *Updater
-	runtime  string
-	hostname string
+	cfg        Config
+	log        *zap.Logger
+	client     *Client
+	executor   Executor
+	updater    *Updater
+	runtime    string
+	hostname   string
+	dockerOpts orchestrator.DockerOptions
 
 	activeCount atomic.Int32
 	draining    atomic.Bool
@@ -42,14 +43,10 @@ func New(cfg Config, log *zap.Logger) *Agent {
 	client := NewClient(cfg.ServerURL, cfg.Token, cfg.Version)
 
 	rt := cfg.Runtime
+	dockerOpts := ResolveDockerOptions(cfg)
 	var dockerExec *DockerExecutor
 	if rt == "docker" || (rt == "auto" && runtime.GOOS == "linux") {
-		dockerExec = NewDockerExecutor(cfg.DockerSocket, orchestrator.DockerOptions{
-			RunnerDockerHost:  cfg.RunnerDockerHost,
-			RunnerNetwork:     cfg.RunnerNetwork,
-			MountDockerSocket: cfg.MountDockerSocket,
-			RunnerDockerGID:   cfg.RunnerDockerGID,
-		})
+		dockerExec = NewDockerExecutor(cfg.DockerSocket, dockerOpts)
 		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := dockerExec.Ping(pingCtx)
 		cancel()
@@ -80,6 +77,7 @@ func New(cfg Config, log *zap.Logger) *Agent {
 		updater:         NewUpdater(cfg.UpdateRepo),
 		runtime:         effectiveRT,
 		hostname:        hostname,
+		dockerOpts:      dockerOpts,
 		sem:             make(chan struct{}, cfg.Concurrency),
 		cancels:         make(map[uuid.UUID]context.CancelFunc),
 		updateRestartCh: make(chan string, 1),
@@ -93,6 +91,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		zap.String("arch", NormalizeArch()),
 		zap.String("runtime", a.runtime),
 		zap.Int("concurrency", a.cfg.Concurrency),
+		zap.String("work_dir", a.cfg.WorkDir),
+		zap.String("log_dir", a.cfg.LogDir),
+		zap.Bool("mount_docker_socket", a.dockerOpts.MountDockerSocket),
+		zap.String("runner_docker_gid", a.dockerOpts.RunnerDockerGID),
+		zap.String("runner_docker_host", a.dockerOpts.RunnerDockerHost),
 		zap.String("version", a.cfg.Version),
 		zap.Bool("auto_update", a.cfg.AutoUpdate),
 	)
@@ -200,13 +203,14 @@ func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) {
 		status := "completed"
 		errMsg := ""
 		if execErr != nil {
+			errMsg = execErr.Error()
 			if jobCtx.Err() != nil {
 				status = "cancelled"
+				a.log.Info("runner task cancelled", zap.String("runner", task.RunnerName), zap.String("reason", errMsg))
 			} else {
 				status = "failed"
+				a.log.Error("runner task failed", zap.String("runner", task.RunnerName), zap.Error(execErr))
 			}
-			errMsg = execErr.Error()
-			a.log.Error("runner task failed", zap.String("runner", task.RunnerName), zap.Error(execErr))
 		} else {
 			a.log.Info("runner task completed", zap.String("runner", task.RunnerName))
 		}

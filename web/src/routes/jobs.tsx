@@ -87,8 +87,8 @@ function JobsPage() {
       </div>
 
       <div className="flex flex-wrap items-end justify-between gap-3">
-        <Tabs value={statusTab} onValueChange={(v) => setStatusTab(v || "all")}>
-          <TabsList>
+        <Tabs value={statusTab} onValueChange={(v) => setStatusTab(v || "all")} className="w-full sm:w-auto">
+          <TabsList className="w-full sm:w-auto max-w-full overflow-x-auto justify-start">
             <TabsTrigger value="all">All</TabsTrigger>
             <TabsTrigger value="awaiting_approval">Awaiting Approval</TabsTrigger>
             <TabsTrigger value="in_progress">Running</TabsTrigger>
@@ -97,7 +97,7 @@ function JobsPage() {
           </TabsList>
         </Tabs>
 
-        <search>
+        <search className="w-full sm:w-auto">
           <form
             onSubmit={(e) => {
               e.preventDefault()
@@ -114,7 +114,7 @@ function JobsPage() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="owner/repo or actor..."
-              className="w-56"
+              className="w-full sm:w-56"
               autoCorrect="off"
               autoCapitalize="none"
               spellCheck={false}

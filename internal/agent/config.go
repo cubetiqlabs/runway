@@ -7,18 +7,22 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/cubetiqlabs/runway/internal/orchestrator"
 )
 
 type Config struct {
-	ServerURL         string
-	Token             string
-	Runtime           string // auto | native | docker
-	DockerSocket      string
-	RunnerDockerHost  string
-	RunnerNetwork     string
-	MountDockerSocket bool
-	RunnerDockerGID   string
-	WorkDir           string
+	ServerURL            string
+	Token                string
+	Runtime              string // auto | native | docker
+	DockerSocket         string
+	RunnerDockerHost     string
+	RunnerNetwork        string
+	MountDockerSocket    bool
+	MountDockerSocketSet bool
+	RunnerDockerGID      string
+	WorkDir              string
+	LogDir               string
 	Concurrency       int
 	Labels            []string
 	PollInterval      time.Duration
@@ -31,10 +35,12 @@ type Config struct {
 }
 
 func DefaultConfig(version string) Config {
+	wd := defaultWorkDir()
 	return Config{
 		Runtime:           "auto",
 		DockerSocket:      defaultDockerSocket(),
-		WorkDir:           defaultWorkDir(),
+		WorkDir:           wd,
+		LogDir:            DefaultLogDir(wd),
 		Concurrency:       2,
 		PollInterval:      3 * time.Second,
 		HeartbeatInterval: 15 * time.Second,
@@ -71,12 +77,16 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_MOUNT_DOCKER_SOCKET")); v != "" {
 		c.MountDockerSocket = strings.EqualFold(v, "true") || v == "1"
+		c.MountDockerSocketSet = true
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_DOCKER_GID")); v != "" {
 		c.RunnerDockerGID = v
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_WORK_DIR")); v != "" {
 		c.WorkDir = v
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_LOG_DIR")); v != "" {
+		c.LogDir = v
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_LABELS")); v != "" {
 		c.Labels = splitLabels(v)
@@ -135,6 +145,9 @@ func (c *Config) NormalizeAndValidate(requireAuth bool) error {
 	}
 	if c.WorkDir == "" {
 		c.WorkDir = defaultWorkDir()
+	}
+	if c.LogDir == "" {
+		c.LogDir = DefaultLogDir(c.WorkDir)
 	}
 	if requireAuth {
 		if c.ServerURL == "" {
@@ -202,6 +215,47 @@ func defaultWorkDir() string {
 		return filepath.Join(home, ".local", "share", "runway-agent")
 	}
 	return filepath.Join(os.TempDir(), "runway-agent")
+}
+
+// DefaultLogDir returns /var/log/runway-agent for root on Unix or <workDir>/logs otherwise.
+func DefaultLogDir(workDir string) string {
+	if runtime.GOOS != "windows" && os.Geteuid() == 0 {
+		return "/var/log/runway-agent"
+	}
+	if workDir == "" {
+		workDir = defaultWorkDir()
+	}
+	return filepath.Join(workDir, "logs")
+}
+
+// IsLocalUnixSocket reports whether dockerHost targets a local Unix domain socket.
+func IsLocalUnixSocket(dockerHost string) bool {
+	h := strings.TrimSpace(dockerHost)
+	return h == "" || strings.HasPrefix(h, "/") || strings.HasPrefix(h, "unix://")
+}
+
+// ResolveDockerOptions resolves Docker access inside spawned runner containers, auto-mounting the local Unix Docker socket when appropriate.
+func ResolveDockerOptions(cfg Config) orchestrator.DockerOptions {
+	mountSock := cfg.MountDockerSocket
+	gid := strings.TrimSpace(cfg.RunnerDockerGID)
+	if strings.TrimSpace(cfg.RunnerDockerHost) == "" && IsLocalUnixSocket(cfg.DockerSocket) {
+		if !cfg.MountDockerSocketSet {
+			mountSock = true
+		}
+		if mountSock && gid == "" {
+			sockPath := strings.TrimPrefix(strings.TrimSpace(cfg.DockerSocket), "unix://")
+			if sockPath == "" {
+				sockPath = "/var/run/docker.sock"
+			}
+			gid = detectSocketGID(sockPath)
+		}
+	}
+	return orchestrator.DockerOptions{
+		RunnerDockerHost:  cfg.RunnerDockerHost,
+		RunnerNetwork:     cfg.RunnerNetwork,
+		MountDockerSocket: mountSock,
+		RunnerDockerGID:   gid,
+	}
 }
 
 func NormalizeOS() string {

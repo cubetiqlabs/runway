@@ -77,8 +77,10 @@ try {
     throw "SHA-256 verification failed ($actualHash != $expectedHash)."
   }
 
+  $logDir = Join-Path $dataDir "logs"
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+  New-Item -ItemType Directory -Path $logDir -Force | Out-Null
   Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
 
   if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
@@ -92,6 +94,7 @@ RUNWAY_AGENT_SERVER=$Server
 RUNWAY_AGENT_TOKEN=$Token
 RUNWAY_AGENT_RUNTIME=$Runtime
 RUNWAY_AGENT_WORK_DIR=$dataDir
+RUNWAY_AGENT_LOG_DIR=$logDir
 RUNWAY_AGENT_CONCURRENCY=$Concurrency
 RUNWAY_AGENT_LABELS=$Labels
 RUNWAY_AGENT_AUTO_UPDATE=$autoUpdateVal
@@ -107,7 +110,7 @@ RUNWAY_AGENT_UPDATE_REPO=$Repo
 
   Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
   Start-ScheduledTask -TaskName $taskName
-  Write-Host "[runway-agent] Installed $tag to $exePath and started Scheduled Task '$taskName'."
+  Write-Host "[runway-agent] Installed $tag to $exePath (logs: $logDir\agent.log) and started Scheduled Task '$taskName'."
 } finally {
   Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }

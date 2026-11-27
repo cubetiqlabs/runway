@@ -74,11 +74,13 @@ if [[ "$(id -u)" -eq 0 ]]; then
   BIN_DIR="/usr/local/bin"
   CONF_DIR="/etc/runway-agent"
   WORK_DIR="/var/lib/runway-agent"
+  LOG_DIR="${RUNWAY_AGENT_LOG_DIR:-/var/log/runway-agent}"
   LAUNCHD_PLIST="/Library/LaunchDaemons/tech.cubis.runway-agent.plist"
 else
   BIN_DIR="${HOME}/.local/bin"
   CONF_DIR="${HOME}/.config/runway-agent"
   WORK_DIR="${HOME}/.local/share/runway-agent"
+  LOG_DIR="${RUNWAY_AGENT_LOG_DIR:-${WORK_DIR}/logs}"
   LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/tech.cubis.runway-agent.plist"
 fi
 
@@ -146,7 +148,7 @@ fi
 
 [[ "${ACTUAL_HASH}" == "${EXPECTED_HASH}" ]] || err "SHA-256 verification failed (${ACTUAL_HASH} != ${EXPECTED_HASH})."
 
-mkdir -p "${BIN_DIR}" "${CONF_DIR}" "${WORK_DIR}"
+mkdir -p "${BIN_DIR}" "${CONF_DIR}" "${WORK_DIR}" "${LOG_DIR}"
 tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "${TMP_DIR}"
 install -m 0755 "${TMP_DIR}/runway-agent" "${BIN_PATH}"
 
@@ -157,6 +159,7 @@ RUNWAY_AGENT_TOKEN=${TOKEN}
 RUNWAY_AGENT_RUNTIME=${RUNTIME}
 RUNWAY_AGENT_DOCKER_SOCKET=${DOCKER_SOCKET}
 RUNWAY_AGENT_WORK_DIR=${WORK_DIR}
+RUNWAY_AGENT_LOG_DIR=${LOG_DIR}
 RUNWAY_AGENT_CONCURRENCY=${CONCURRENCY}
 RUNWAY_AGENT_LABELS=${LABELS}
 RUNWAY_AGENT_AUTO_UPDATE=${AUTO_UPDATE}
@@ -185,9 +188,9 @@ EOF
   systemctl daemon-reload
   systemctl enable --now runway-agent
   systemctl restart runway-agent
-  log "runway-agent (${TAG}) installed and running via systemd (systemctl status runway-agent)."
+  log "runway-agent (${TAG}) installed and running via systemd (logs: ${LOG_DIR}/agent.log)."
 elif [[ "${GOOS}" == "darwin" ]] && command -v launchctl >/dev/null 2>&1; then
-  mkdir -p "$(dirname "${LAUNCHD_PLIST}")" "${WORK_DIR}/logs"
+  mkdir -p "$(dirname "${LAUNCHD_PLIST}")" "${LOG_DIR}"
   cat >"${LAUNCHD_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -209,15 +212,15 @@ elif [[ "${GOOS}" == "darwin" ]] && command -v launchctl >/dev/null 2>&1; then
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>${WORK_DIR}/logs/agent.log</string>
+  <string>${LOG_DIR}/service.log</string>
   <key>StandardErrorPath</key>
-  <string>${WORK_DIR}/logs/agent.log</string>
+  <string>${LOG_DIR}/service.log</string>
 </dict>
 </plist>
 EOF
   launchctl unload -w "${LAUNCHD_PLIST}" >/dev/null 2>&1 || true
   launchctl load -w "${LAUNCHD_PLIST}"
-  log "runway-agent (${TAG}) installed and running via launchd (${LAUNCHD_PLIST})."
+  log "runway-agent (${TAG}) installed and running via launchd (logs: ${LOG_DIR}/agent.log)."
 else
   log "runway-agent (${TAG}) installed to ${BIN_PATH}."
   log "Run manually with: ${BIN_PATH} run --config ${ENV_FILE}"

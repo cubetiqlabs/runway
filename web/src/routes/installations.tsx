@@ -83,7 +83,7 @@ function InstallationsPage() {
               <code className="font-mono">installation</code>)
             </CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-3 sm:grid-cols-4 text-xs">
+          <CardContent className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 text-xs">
             <div>
               <span className="text-muted-foreground block">App ID</span>
               <span className="font-mono font-medium">{settings.app_id || "Not configured"}</span>
@@ -121,7 +121,7 @@ function InstallationsPage() {
       )}
 
       <Tabs defaultValue="installations">
-        <TabsList>
+        <TabsList className="max-w-full overflow-x-auto justify-start">
           <TabsTrigger value="installations">Installations ({installations.length})</TabsTrigger>
           <TabsTrigger value="webhooks">Webhook Deliveries ({deliveries.length})</TabsTrigger>
           <TabsTrigger value="audit">Audit Log ({audits.length})</TabsTrigger>

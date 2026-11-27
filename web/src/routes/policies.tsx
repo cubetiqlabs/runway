@@ -286,7 +286,7 @@ function PoliciesPage() {
 
       {/* Policy Editor Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{form.id ? "Edit Policy" : "Create Moderation Policy"}</DialogTitle>
             <DialogDescription>
@@ -423,7 +423,7 @@ function PoliciesPage() {
 
       {/* Policy Simulator Dialog */}
       <Dialog open={simOpen} onOpenChange={setSimOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Moderation Policy Simulator</DialogTitle>
             <DialogDescription>

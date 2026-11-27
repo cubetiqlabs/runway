@@ -70,6 +70,7 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 			PidsLimit  int64 `json:"PidsLimit"`
 			NanoCpus   int64 `json:"NanoCpus"`
 			Memory     int64 `json:"Memory"`
+			ShmSize    int64 `json:"ShmSize"`
 		} `json:"HostConfig"`
 	}
 
@@ -147,8 +148,11 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 	if capturedCreate.HostConfig.Memory != wantMaxMem {
 		t.Fatalf("expected Memory clamped to %d, got %d", wantMaxMem, capturedCreate.HostConfig.Memory)
 	}
-	if !capturedCreate.HostConfig.Init || capturedCreate.HostConfig.PidsLimit != 4096 {
-		t.Fatalf("expected Init=true and PidsLimit=4096, got %+v", capturedCreate.HostConfig)
+	if !capturedCreate.HostConfig.Init || capturedCreate.HostConfig.PidsLimit != 4096 || capturedCreate.HostConfig.ShmSize < 64*1024*1024 {
+		t.Fatalf("expected Init=true, PidsLimit=4096, and ShmSize>=64MiB, got %+v", capturedCreate.HostConfig)
+	}
+	if !containsString(capturedCreate.Env, "CI=true") || !containsString(capturedCreate.Env, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
+		t.Fatalf("expected CI=true and RUNNER_TOOL_CACHE in Env, got %v", capturedCreate.Env)
 	}
 }
 

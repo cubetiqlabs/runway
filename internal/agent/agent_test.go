@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/logger"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -117,5 +121,49 @@ func TestAgentHeartbeatClaimAndCompleteLoop(t *testing.T) {
 	}
 	if got, _ := completedStatus.Load().(string); got != "completed" {
 		t.Fatalf("expected task completion status 'completed', got %q", got)
+	}
+}
+
+func TestResolveDockerOptionsAndLogFile(t *testing.T) {
+	cfg := DefaultConfig("1.0.0")
+	cfg.DockerSocket = "/var/run/docker.sock"
+	opts := ResolveDockerOptions(cfg)
+	if !opts.MountDockerSocket {
+		t.Fatal("expected MountDockerSocket to auto-enable for local unix socket")
+	}
+
+	// Explicit opt-out must be respected.
+	cfg.MountDockerSocket = false
+	cfg.MountDockerSocketSet = true
+	opts = ResolveDockerOptions(cfg)
+	if opts.MountDockerSocket {
+		t.Fatal("expected MountDockerSocket to stay false when explicitly disabled")
+	}
+
+	// DinD RunnerDockerHost must suppress unix socket mounting.
+	cfg.MountDockerSocketSet = false
+	cfg.RunnerDockerHost = "tcp://runner-dind:2375"
+	opts = ResolveDockerOptions(cfg)
+	if opts.MountDockerSocket || opts.RunnerDockerHost != "tcp://runner-dind:2375" {
+		t.Fatalf("unexpected DinD docker options: %+v", opts)
+	}
+
+	if !IsLocalUnixSocket("unix:///var/run/docker.sock") || IsLocalUnixSocket("tcp://127.0.0.1:2375") {
+		t.Fatal("unexpected IsLocalUnixSocket classification")
+	}
+
+	logPath := filepath.Join(t.TempDir(), "logs", "agent.log")
+	log, closer, fileErr := logger.NewWithFile("production", "info", "json", logPath)
+	if fileErr != nil {
+		t.Fatalf("expected log file open without error, got: %v", fileErr)
+	}
+	log.Info("agent-file-log-check")
+	_ = log.Sync()
+	if closer != nil {
+		_ = closer.Close()
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil || !strings.Contains(string(raw), "agent-file-log-check") {
+		t.Fatalf("expected agent.log to contain test message, got %q err=%v", string(raw), err)
 	}
 }

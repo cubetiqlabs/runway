@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
 
 	"github.com/cubetiqlabs/runway/internal/agent"
 	"github.com/cubetiqlabs/runway/internal/logger"
+	"go.uber.org/zap"
 )
 
 var version = "dev"
@@ -33,6 +35,8 @@ func main() {
 		printUsage()
 	case "update":
 		os.Exit(runUpdate(args))
+	case "logs":
+		os.Exit(runLogs(args))
 	case "run":
 		os.Exit(runWorker(args))
 	default:
@@ -54,8 +58,10 @@ func runWorker(args []string) int {
 	runnerDockerHost := fs.String("runner-docker-host", "", "DOCKER_HOST injected into runner containers (e.g. tcp://runner-dind:2375)")
 	runnerNetwork := fs.String("runner-network", "", "Docker NetworkMode for spawned runner containers")
 	mountDockerSock := fs.Bool("mount-docker-socket", false, "Bind mount /var/run/docker.sock into spawned runner containers")
+	noMountDockerSock := fs.Bool("no-mount-docker-socket", false, "Disable automatic docker.sock bind mounting into runner containers")
 	runnerDockerGID := fs.String("runner-docker-gid", "", "Optional host docker GID passed as GroupAdd when mounting docker.sock")
 	workDir := fs.String("work-dir", "", "Working directory for runner cache and ephemeral jobs")
+	logDir := fs.String("log-dir", "", "Directory for persistent agent.log output")
 	concurrency := fs.Int("concurrency", 0, "Maximum concurrent runner jobs on this host")
 	labels := fs.String("labels", "", "Comma-separated extra labels advertised by this host")
 	runnerVer := fs.String("runner-version", "", "Pin actions/runner version (default: latest)")
@@ -91,12 +97,20 @@ func runWorker(args []string) int {
 	}
 	if *mountDockerSock {
 		cfg.MountDockerSocket = true
+		cfg.MountDockerSocketSet = true
+	}
+	if *noMountDockerSock {
+		cfg.MountDockerSocket = false
+		cfg.MountDockerSocketSet = true
 	}
 	if *runnerDockerGID != "" {
 		cfg.RunnerDockerGID = *runnerDockerGID
 	}
 	if *workDir != "" {
 		cfg.WorkDir = *workDir
+	}
+	if *logDir != "" {
+		cfg.LogDir = *logDir
 	}
 	if *concurrency > 0 {
 		cfg.Concurrency = *concurrency
@@ -124,12 +138,15 @@ func runWorker(args []string) int {
 		return 1
 	}
 
-	log, err := logger.New("production", *logLevel, *logFormat)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "logger error: %v\n", err)
-		return 1
+	logPath := filepath.Join(cfg.LogDir, "agent.log")
+	log, logCloser, fileErr := logger.NewWithFile("production", *logLevel, *logFormat, logPath)
+	if logCloser != nil {
+		defer func() { _ = logCloser.Close() }()
 	}
 	defer func() { _ = log.Sync() }()
+	if fileErr != nil {
+		log.Warn("unable to open log file; continuing with stdout only", zap.String("log_file", logPath), zap.Error(fileErr))
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -139,6 +156,44 @@ func runWorker(args []string) int {
 		fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+func runLogs(args []string) int {
+	cfg := agent.DefaultConfig(version)
+	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
+	configPath := fs.String("config", "", "Path to optional env config file")
+	workDir := fs.String("work-dir", "", "Working directory")
+	logDir := fs.String("log-dir", "", "Log directory")
+	lines := fs.Int("n", 100, "Number of trailing log lines to print")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	if err := cfg.ApplyEnvAndFile(*configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		return 1
+	}
+	if *workDir != "" {
+		cfg.WorkDir = *workDir
+	}
+	if *logDir != "" {
+		cfg.LogDir = *logDir
+	}
+	_ = cfg.NormalizeAndValidate(false)
+
+	logPath := filepath.Join(cfg.LogDir, "agent.log")
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read %s: %v\n", logPath, err)
+		return 1
+	}
+	fmt.Printf("==> %s <==\n", logPath)
+	all := strings.Split(strings.TrimRight(string(raw), "\r\n"), "\n")
+	if *lines > 0 && len(all) > *lines {
+		all = all[len(all)-*lines:]
+	}
+	fmt.Println(strings.Join(all, "\n"))
 	return 0
 }
 
@@ -169,6 +224,7 @@ func printUsage() {
 
 Usage:
   runway-agent [run] [flags]
+  runway-agent logs [--log-dir <path>] [-n 100]
   runway-agent update [--repo cubetiqlabs/runway] [--force]
   runway-agent version
 
@@ -177,7 +233,13 @@ Flags (run):
   --token <rwa_...>          Agent bearer token (RUNWAY_AGENT_TOKEN)
   --runtime <mode>           auto | native | docker (RUNWAY_AGENT_RUNTIME)
   --docker-socket <addr>     Docker socket or tcp:// endpoint (RUNWAY_AGENT_DOCKER_SOCKET)
+  --mount-docker-socket      Mount /var/run/docker.sock into Docker runners
+  --no-mount-docker-socket   Disable automatic docker.sock mounting
+  --runner-docker-host <u>   DOCKER_HOST inside Docker runners
+  --runner-network <net>     NetworkMode for Docker runners
+  --runner-docker-gid <gid>  Host docker GID for GroupAdd
   --work-dir <path>          Working cache & job directory (RUNWAY_AGENT_WORK_DIR)
+  --log-dir <path>           Log directory for agent.log (RUNWAY_AGENT_LOG_DIR)
   --concurrency <n>          Max concurrent runner jobs (RUNWAY_AGENT_CONCURRENCY)
   --labels <a,b>             Extra comma-separated labels (RUNWAY_AGENT_LABELS)
   --no-auto-update           Disable background auto-updates

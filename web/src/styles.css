@@ -211,6 +211,13 @@
     border-bottom: 1px solid var(--border);
   }
 
+  .runway-table tbody th,
+  .runway-table tbody td {
+    max-width: none;
+    white-space: normal;
+    word-break: break-word;
+  }
+
   .runway-table tbody td[data-label]::before {
     content: attr(data-label) ": ";
     font-weight: 600;

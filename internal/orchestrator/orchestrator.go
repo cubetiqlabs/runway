@@ -152,8 +152,10 @@ func (o *Orchestrator) TerminateRunner(ctx context.Context, runner *domain.Runne
 	return o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil)
 }
 
-// ReleaseCompletedRunner marks an ephemeral runner terminated immediately for webhooks and cleans up exited Docker containers asynchronously without blocking the webhook response.
-func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domain.Runner) error {
+// ReleaseCompletedRunner marks an ephemeral runner terminated immediately for webhooks.
+// For Docker runners, exited containers are cleaned up asynchronously without blocking the webhook response.
+// For Agent runners, an in-flight task is only signalled to cancel when cancelled == true; normal completion lets the runner process finish cleanly.
+func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domain.Runner, cancelled bool) error {
 	if err := o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil); err != nil {
 		return err
 	}
@@ -161,6 +163,14 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 		return nil
 	}
 	prov := o.selectProvisioner(runner.Provider)
+	if runner.Provider == "agent" {
+		if cancelled {
+			if err := prov.Terminate(ctx, runner.ProviderRef); err != nil {
+				o.log.Warn("agent cancel task error", zap.String("runner", runner.Name), zap.Error(err))
+			}
+		}
+		return nil
+	}
 	if runner.Provider != "docker" {
 		if err := prov.Terminate(ctx, runner.ProviderRef); err != nil {
 			o.log.Warn("provisioner terminate error", zap.String("runner", runner.Name), zap.Error(err))

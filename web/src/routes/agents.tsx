@@ -260,7 +260,7 @@ function AgentsPage() {
       </ResponsiveTable>
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Register Distributed Agent</DialogTitle>
             <DialogDescription>
@@ -387,7 +387,7 @@ function AgentsPage() {
       </Dialog>
 
       <Dialog open={Boolean(issued)} onOpenChange={(o) => !o && setIssued(null)}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-2xl max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Install Runway Agent ({issued?.agent.name})</DialogTitle>
             <DialogDescription>

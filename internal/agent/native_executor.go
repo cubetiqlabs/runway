@@ -74,6 +74,7 @@ func (e *NativeExecutor) Execute(ctx context.Context, task *TaskPayload) error {
 		cmd = exec.CommandContext(ctx, "/bin/sh", runScript, "--jitconfig", task.EncodedJITConfig)
 	}
 	cmd.Dir = jobDir
+	cmd.Env = append(os.Environ(), "CI=true")
 
 	var outBuf cappedTailBuffer
 	outBuf.maxBytes = 8192

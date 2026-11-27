@@ -159,9 +159,21 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		}
 	}
 
+	shmSize := memBytes / 2
+	const minShm = int64(64) * 1024 * 1024
+	const maxShm = int64(2) * 1024 * 1024 * 1024
+	if shmSize < minShm {
+		shmSize = minShm
+	} else if shmSize > maxShm {
+		shmSize = maxShm
+	}
+
 	pidsLimit := int64(4096)
 	env := []string{
+		"CI=true",
 		"RUNNER_NAME=" + req.RunnerName,
+		"RUNNER_TOOL_CACHE=/opt/hostedtoolcache",
+		"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache",
 		"ENCODED_JIT_CONFIG=" + req.EncodedJITConfig,
 	}
 	hostConfig := map[string]any{
@@ -172,6 +184,7 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		"PidsLimit":   pidsLimit,
 		"NanoCpus":    int64(vcpu) * 1_000_000_000,
 		"Memory":      memBytes,
+		"ShmSize":     shmSize,
 	}
 
 	if runnerDockerHost := strings.TrimSpace(d.opts.RunnerDockerHost); runnerDockerHost != "" {

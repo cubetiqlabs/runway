@@ -216,7 +216,7 @@ function PoolsPage() {
                   </Badge>
                 ))}
               </div>
-              <div className="grid grid-cols-3 gap-2 border-t border-border pt-3 text-[11px]">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 border-t border-border pt-3 text-[11px]">
                 <div>
                   <span className="text-muted-foreground block">Compute</span>
                   <span className="font-medium">
@@ -253,7 +253,7 @@ function PoolsPage() {
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{form.id ? "Edit Runner Pool" : "Create Runner Pool"}</DialogTitle>
             <DialogDescription>
@@ -310,7 +310,7 @@ function PoolsPage() {
               />
             </div>
 
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
               <div className="space-y-1">
                 <Label htmlFor="pool-vcpu">vCPU</Label>
                 <Input
