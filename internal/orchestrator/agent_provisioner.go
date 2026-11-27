@@ -73,6 +73,11 @@ func (p *AgentProvisioner) Provision(ctx context.Context, req ProvisionRequest) 
 		ContainerImage:            req.Pool.ContainerImage,
 		VCPU:                      req.Pool.VCPU,
 		MemoryMB:                  req.Pool.MemoryMB,
+		IsForkPR:                  req.IsForkPR,
+		BuildProfile:              req.Pool.BuildProfile,
+		CacheEnabled:              req.Pool.CacheEnabled,
+		CacheScope:                req.Pool.CacheScope,
+		SandboxMode:               req.Pool.SandboxMode,
 		EncodedJITConfigEncrypted: ciphertext,
 		Status:                    domain.AgentTaskPending,
 	}

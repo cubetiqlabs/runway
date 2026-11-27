@@ -14,6 +14,7 @@ import {
   Logout03Icon,
   Menu01Icon,
   Cancel01Icon,
+  Activity01Icon,
 } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -34,6 +35,7 @@ const NAV_ITEMS = [
   { to: "/pools", label: "Runner Pools", icon: Layers01Icon },
   { to: "/jobs", label: "Job Moderation", icon: WorkflowSquare06Icon },
   { to: "/policies", label: "Policies", icon: Shield01Icon },
+  { to: "/events", label: "Event Store", icon: Activity01Icon },
   { to: "/installations", label: "GitHub App & Logs", icon: GitBranchIcon },
 ] as const
 

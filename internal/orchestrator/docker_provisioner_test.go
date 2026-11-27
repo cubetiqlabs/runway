@@ -557,3 +557,168 @@ func TestDockerProvisionerStrictGVisorFailsWhenUnavailable(t *testing.T) {
 		t.Fatalf("expected error mentioning runsc when strict gvisor unavailable, got %v", err)
 	}
 }
+
+func TestDockerProvisionerUltraBuildCacheAndForkRO(t *testing.T) {
+	var createdVolumes []string
+	var deletedPaths []string
+	creates := make(map[string]map[string]any)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"NCPU":     8,
+				"MemTotal": int64(16) * 1024 * 1024 * 1024,
+				"Runtimes": map[string]any{"runc": map[string]any{}},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/volumes/"):
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/volumes/create":
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			name, _ := req["Name"].(string)
+			createdVolumes = append(createdVolumes, name)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Name": name})
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
+			name := r.URL.Query().Get("name")
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			creates[name] = req
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "id-" + name})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			deletedPaths = append(deletedPaths, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Docker API request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	prov := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		IsolatedDinD:   true,
+		SandboxRuntime: "auto",
+		CacheEnabled:   true,
+	})
+
+	// 1. Trusted ultra build mounts RW repo cache + DinD slot cache + tmpfs + ulimits.
+	res, err := prov.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-ultra-1",
+		EncodedJITConfig: "jit-1",
+		RepoFullName:     "cubetiqlabs/runway",
+		IsForkPR:         false,
+		Pool: domain.RunnerPool{
+			Slug:         "ultra-8",
+			VCPU:         8,
+			MemoryMB:     8192,
+			BuildProfile: "ultra",
+			CacheEnabled: true,
+			CacheScope:   "repo",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Ultra Provision failed: %v", err)
+	}
+	if !strings.Contains(res.ProviderRef, "d=runway-dind-cache-") {
+		t.Fatalf("expected DinD slot cache in ProviderRef, got %q", res.ProviderRef)
+	}
+	hc := creates["runner-ultra-1"]["HostConfig"].(map[string]any)
+	if int64(hc["PidsLimit"].(float64)) != 8192 {
+		t.Fatalf("expected PidsLimit=8192 for ultra build, got %v", hc["PidsLimit"])
+	}
+	if _, ok := hc["Tmpfs"].(map[string]any); !ok {
+		t.Fatalf("expected Tmpfs mounts for ultra build, got %v", hc["Tmpfs"])
+	}
+	var binds []string
+	for _, b := range hc["Binds"].([]any) {
+		binds = append(binds, b.(string))
+	}
+	hasRWCache := false
+	for _, b := range binds {
+		if strings.HasSuffix(b, ":/runway-cache") {
+			hasRWCache = true
+		}
+	}
+	if !hasRWCache {
+		t.Fatalf("expected RW /runway-cache bind, got %v", binds)
+	}
+
+	// Terminate must keep persistent cache volumes intact while deleting ephemeral work volume.
+	if err := prov.Terminate(context.Background(), res.ProviderRef); err != nil {
+		t.Fatalf("Terminate failed: %v", err)
+	}
+	for _, dp := range deletedPaths {
+		if strings.Contains(dp, "runway-cache-") || strings.Contains(dp, "runway-dind-cache-") {
+			t.Fatalf("persistent cache volume must not be deleted on Terminate, deleted %s", dp)
+		}
+	}
+
+	// 2. Fork PR must mount cache read-only and skip DinD cache lease.
+	resFork, err := prov.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-ultra-fork",
+		EncodedJITConfig: "jit-2",
+		RepoFullName:     "cubetiqlabs/runway",
+		IsForkPR:         true,
+		Pool: domain.RunnerPool{
+			Slug:         "ultra-8",
+			VCPU:         4,
+			MemoryMB:     4096,
+			BuildProfile: "ultra",
+			CacheEnabled: true,
+			CacheScope:   "repo",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Fork ultra Provision failed: %v", err)
+	}
+	if strings.Contains(resFork.ProviderRef, "d=runway-dind-cache-") {
+		t.Fatalf("fork PR must not lease DinD cache, got %q", resFork.ProviderRef)
+	}
+	forkHC := creates["runner-ultra-fork"]["HostConfig"].(map[string]any)
+	hasROCache := false
+	for _, b := range forkHC["Binds"].([]any) {
+		if strings.HasSuffix(b.(string), ":/runway-cache:ro") {
+			hasROCache = true
+		}
+	}
+	if !hasROCache {
+		t.Fatalf("expected read-only :/runway-cache:ro for fork PR, got %v", forkHC["Binds"])
+	}
+	_ = createdVolumes
+}
+
+func TestDockerProvisionerFetchLogsDemux(t *testing.T) {
+	// Build a multiplexed Docker frame: stream 1 (stdout) + stream 2 (stderr).
+	line1 := "2026-11-28T00:00:01Z hello stdout\n"
+	line2 := "2026-11-28T00:00:02Z error stderr\n"
+	makeFrame := func(stream byte, data string) []byte {
+		hdr := []byte{stream, 0, 0, 0, byte(len(data) >> 24), byte(len(data) >> 16), byte(len(data) >> 8), byte(len(data))}
+		return append(hdr, []byte(data)...)
+	}
+	payload := append(makeFrame(1, line1), makeFrame(2, line2)...)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	prov := NewDockerProvisioner(ts.URL)
+	entries, err := prov.FetchLogs(context.Background(), "cid-1", 100)
+	if err != nil {
+		t.Fatalf("FetchLogs failed: %v", err)
+	}
+	if len(entries) != 2 || entries[0].Stream != "stdout" || entries[0].Line != "hello stdout" || entries[1].Stream != "stderr" || entries[1].Level != "error" {
+		t.Fatalf("unexpected demuxed log entries: %+v", entries)
+	}
+}

@@ -124,12 +124,20 @@ func (r *JobRepo) List(ctx context.Context, filter domain.JobFilter) ([]domain.W
 	}
 
 	var models []WorkflowJobModel
+	sortCols := map[string]string{
+		"repo_full_name":      "j.repo_full_name",
+		"job_name":            "j.job_name",
+		"actor":               "j.actor",
+		"matched_pool_name":   "p.name",
+		"moderation_decision": "j.moderation_decision",
+		"status":              "j.status",
+		"queued_at":           "j.queued_at",
+	}
 	err := q.Select(jobSelectCols).
 		Joins("LEFT JOIN runner_pools p ON p.id = j.matched_pool_id").
 		Joins("LEFT JOIN moderation_policies mp ON mp.id = j.matched_policy_id").
 		Joins("LEFT JOIN runners rn ON rn.id = j.assigned_runner_id").
-		Order("j.queued_at DESC").
-		Scopes(paginate(filter.PageParams)).
+		Scopes(applySort(filter.PageParams, sortCols, "j.queued_at DESC"), paginate(filter.PageParams)).
 		Scan(&models).Error
 	if err != nil {
 		return nil, 0, mapGormError(err)

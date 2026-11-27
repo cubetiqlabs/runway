@@ -52,7 +52,7 @@ func (m *memPoolRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.RunnerPo
 	}
 	return nil, domain.ErrNotFound
 }
-func (m *memPoolRepo) List(_ context.Context, page domain.PageParams) ([]domain.RunnerPool, int, error) {
+func (m *memPoolRepo) List(_ context.Context, filter domain.PoolFilter) ([]domain.RunnerPool, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]domain.RunnerPool(nil), m.pools...), len(m.pools), nil
@@ -153,6 +153,9 @@ func (m *memRunnerRepo) GetByName(_ context.Context, name string) (*domain.Runne
 }
 func (m *memRunnerRepo) List(context.Context, domain.RunnerFilter) ([]domain.Runner, int, error) {
 	return nil, 0, nil
+}
+func (m *memRunnerRepo) ListByStatus(context.Context, domain.RunnerStatus) ([]domain.Runner, error) {
+	return nil, nil
 }
 func (m *memRunnerRepo) ListActiveByProvider(context.Context, string) ([]domain.Runner, error) {
 	return nil, nil
@@ -325,19 +328,34 @@ type memAgentRepo struct {
 func (m *memAgentRepo) Create(context.Context, *domain.Agent) error                      { return nil }
 func (m *memAgentRepo) GetByID(context.Context, uuid.UUID) (*domain.Agent, error)       { return nil, domain.ErrNotFound }
 func (m *memAgentRepo) GetByTokenHash(context.Context, string) (*domain.Agent, error)   { return nil, domain.ErrNotFound }
-func (m *memAgentRepo) List(context.Context, domain.PageParams) ([]domain.Agent, int, error) {
+func (m *memAgentRepo) List(context.Context, domain.AgentFilter) ([]domain.Agent, int, error) {
 	return nil, 0, nil
+}
+func (m *memAgentRepo) ListByStatus(context.Context, domain.AgentStatus) ([]domain.Agent, error) {
+	return nil, nil
 }
 func (m *memAgentRepo) CountOnline(context.Context) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.onlineAgents, nil
 }
-func (m *memAgentRepo) UpdateHeartbeat(context.Context, *domain.Agent) error               { return nil }
-func (m *memAgentRepo) UpdateStatus(context.Context, uuid.UUID, domain.AgentStatus) error  { return nil }
-func (m *memAgentRepo) UpdateToken(context.Context, uuid.UUID, string, string) error       { return nil }
-func (m *memAgentRepo) Delete(context.Context, uuid.UUID) error                            { return nil }
-func (m *memAgentRepo) MarkStaleOffline(context.Context, time.Time) (int64, error)         { return 0, nil }
+func (m *memAgentRepo) UpdateHeartbeat(context.Context, *domain.Agent) error              { return nil }
+func (m *memAgentRepo) UpdateStatus(context.Context, uuid.UUID, domain.AgentStatus) error { return nil }
+func (m *memAgentRepo) UpdateToken(context.Context, uuid.UUID, string, string) error      { return nil }
+func (m *memAgentRepo) Delete(context.Context, uuid.UUID) error                           { return nil }
+func (m *memAgentRepo) MarkStaleOffline(context.Context, time.Time) (int64, error)        { return 0, nil }
+func (m *memAgentRepo) MarkDrainingCompleteIfIdle(context.Context, uuid.UUID) (bool, error) {
+	return false, nil
+}
+func (m *memAgentRepo) CountActiveTasksByAgent(context.Context, uuid.UUID) (int, error) {
+	return 0, nil
+}
+func (m *memAgentRepo) ListTasksByAgent(context.Context, uuid.UUID, domain.AgentTaskFilter) ([]domain.AgentTask, int, error) {
+	return nil, 0, nil
+}
+func (m *memAgentRepo) GetAgentTaskStats(context.Context, uuid.UUID) (*domain.AgentTaskStats, error) {
+	return &domain.AgentTaskStats{}, nil
+}
 func (m *memAgentRepo) CreateTask(context.Context, *domain.AgentTask) error                { return nil }
 func (m *memAgentRepo) GetTaskByID(context.Context, uuid.UUID) (*domain.AgentTask, error)  { return nil, domain.ErrNotFound }
 func (m *memAgentRepo) ClaimNextTask(context.Context, *domain.Agent) (*domain.AgentTask, error) {
@@ -371,11 +389,11 @@ func (noopAuditRepo) InsertDeliveryIfAbsent(context.Context, *domain.WebhookDeli
 func (noopAuditRepo) UpdateDeliveryStatus(context.Context, string, string, string, int) error {
 	return nil
 }
-func (noopAuditRepo) ListDeliveries(context.Context, domain.PageParams) ([]domain.WebhookDelivery, int, error) {
+func (noopAuditRepo) ListDeliveries(context.Context, domain.DeliveryFilter) ([]domain.WebhookDelivery, int, error) {
 	return nil, 0, nil
 }
 func (noopAuditRepo) AppendAuditLog(context.Context, *domain.AuditLog) error { return nil }
-func (noopAuditRepo) ListAuditLogs(context.Context, domain.PageParams) ([]domain.AuditLog, int, error) {
+func (noopAuditRepo) ListAuditLogs(context.Context, domain.AuditFilter) ([]domain.AuditLog, int, error) {
 	return nil, 0, nil
 }
 func (noopAuditRepo) GetDashboardOverview(context.Context) (*domain.DashboardOverview, error) {

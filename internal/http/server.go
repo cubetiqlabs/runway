@@ -128,6 +128,7 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 	agentGroup.Post("/heartbeat", agentHandler.Heartbeat)
 	agentGroup.Post("/claim", agentHandler.ClaimTask)
 	agentGroup.Post("/tasks/:id/complete", agentHandler.CompleteTask)
+	agentGroup.Post("/tasks/:id/logs", agentHandler.IngestTaskLogs)
 
 	// Protected API group
 	protected := api.Group("", authMiddleware(deps.AuthSvc))
@@ -151,6 +152,7 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 	protected.Delete("/pools/:id", adminOnly, fleetHandler.DeletePool)
 
 	protected.Get("/runners", fleetHandler.ListRunners)
+	protected.Get("/runners/:id/logs", fleetHandler.GetRunnerLogs)
 	protected.Post("/runners/:id/drain", canOperate, fleetHandler.DrainRunner)
 	protected.Post("/runners/:id/terminate", canOperate, fleetHandler.TerminateRunner)
 
@@ -169,11 +171,17 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 
 	protected.Get("/webhooks/deliveries", modHandler.ListDeliveries)
 	protected.Get("/audit-logs", modHandler.ListAuditLogs)
+	protected.Get("/events", modHandler.ListEvents)
+	protected.Get("/events/summary", modHandler.EventSummary)
 	protected.Get("/settings/github-app", modHandler.SettingsStatus)
 
 	protected.Get("/agents", agentHandler.ListAgents)
 	protected.Post("/agents", canOperate, agentHandler.RegisterAgent)
+	protected.Get("/agents/:id", agentHandler.GetAgent)
+	protected.Get("/agents/:id/metrics", agentHandler.GetAgentMetrics)
+	protected.Get("/agents/:id/tasks", agentHandler.ListAgentTasks)
 	protected.Post("/agents/:id/drain", canOperate, agentHandler.DrainAgent)
+	protected.Post("/agents/:id/resume", canOperate, agentHandler.ResumeAgent)
 	protected.Post("/agents/:id/rotate-token", canOperate, agentHandler.RotateToken)
 	protected.Delete("/agents/:id", adminOnly, agentHandler.DeleteAgent)
 

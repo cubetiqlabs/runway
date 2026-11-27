@@ -95,14 +95,30 @@ func (r *PolicyRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.Moderat
 	return &out, nil
 }
 
-func (r *PolicyRepo) List(ctx context.Context, page domain.PageParams) ([]domain.ModerationPolicy, int, error) {
-	var total int64
+func (r *PolicyRepo) List(ctx context.Context, filter domain.PolicyFilter) ([]domain.ModerationPolicy, int, error) {
 	q := r.db.WithContext(ctx).Model(&ModerationPolicyModel{})
+	if filter.Action != "" {
+		q = q.Where("action = ?", filter.Action)
+	}
+	if filter.Enabled != nil {
+		q = q.Where("enabled = ?", *filter.Enabled)
+	}
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(name ILIKE ? ESCAPE '\' OR description ILIKE ? ESCAPE '\')`, like, like)
+	}
+	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
+	sortCols := map[string]string{
+		"priority":   "priority",
+		"name":       "name",
+		"action":     "action",
+		"enabled":    "enabled",
+		"created_at": "created_at",
+	}
 	var models []ModerationPolicyModel
-	if err := q.Order("priority ASC, created_at ASC").Scopes(paginate(page)).Find(&models).Error; err != nil {
+	if err := q.Scopes(applySort(filter.PageParams, sortCols, "priority ASC, created_at ASC"), paginate(filter.PageParams)).Find(&models).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
 	items := make([]domain.ModerationPolicy, 0, len(models))

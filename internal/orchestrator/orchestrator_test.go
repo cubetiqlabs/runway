@@ -90,6 +90,17 @@ func (s *stubRunnerRepo) GetByName(context.Context, string) (*domain.Runner, err
 func (s *stubRunnerRepo) List(context.Context, domain.RunnerFilter) ([]domain.Runner, int, error) {
 	return nil, 0, nil
 }
+func (s *stubRunnerRepo) ListByStatus(_ context.Context, status domain.RunnerStatus) ([]domain.Runner, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Runner
+	for _, rn := range s.runners {
+		if rn.Status == status {
+			out = append(out, *rn)
+		}
+	}
+	return out, nil
+}
 func (s *stubRunnerRepo) ListActiveByProvider(context.Context, string) ([]domain.Runner, error) {
 	return nil, nil
 }
@@ -199,15 +210,65 @@ func (s *stubAgentRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.Agent,
 func (s *stubAgentRepo) GetByTokenHash(context.Context, string) (*domain.Agent, error) {
 	return nil, domain.ErrNotFound
 }
-func (s *stubAgentRepo) List(context.Context, domain.PageParams) ([]domain.Agent, int, error) {
+func (s *stubAgentRepo) List(context.Context, domain.AgentFilter) ([]domain.Agent, int, error) {
 	return nil, 0, nil
+}
+func (s *stubAgentRepo) ListByStatus(_ context.Context, status domain.AgentStatus) ([]domain.Agent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Agent
+	for _, ag := range s.agents {
+		if ag.Status == status {
+			out = append(out, *ag)
+		}
+	}
+	return out, nil
 }
 func (s *stubAgentRepo) CountOnline(context.Context) (int, error)                          { return 1, nil }
 func (s *stubAgentRepo) UpdateHeartbeat(context.Context, *domain.Agent) error              { return nil }
-func (s *stubAgentRepo) UpdateStatus(context.Context, uuid.UUID, domain.AgentStatus) error { return nil }
+func (s *stubAgentRepo) UpdateStatus(_ context.Context, id uuid.UUID, st domain.AgentStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ag, ok := s.agents[id]; ok {
+		ag.Status = st
+	}
+	return nil
+}
 func (s *stubAgentRepo) UpdateToken(context.Context, uuid.UUID, string, string) error      { return nil }
 func (s *stubAgentRepo) Delete(context.Context, uuid.UUID) error                           { return nil }
 func (s *stubAgentRepo) MarkStaleOffline(context.Context, time.Time) (int64, error)        { return 0, nil }
+func (s *stubAgentRepo) MarkDrainingCompleteIfIdle(_ context.Context, id uuid.UUID) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ag, ok := s.agents[id]
+	if !ok || ag.Status != domain.AgentDraining {
+		return false, nil
+	}
+	for _, t := range s.tasks {
+		if t.AgentID != nil && *t.AgentID == id && (t.Status == domain.AgentTaskClaimed || t.Status == domain.AgentTaskRunning) {
+			return false, nil
+		}
+	}
+	ag.Status = domain.AgentDrained
+	return true, nil
+}
+func (s *stubAgentRepo) CountActiveTasksByAgent(_ context.Context, id uuid.UUID) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cnt := 0
+	for _, t := range s.tasks {
+		if t.AgentID != nil && *t.AgentID == id && (t.Status == domain.AgentTaskClaimed || t.Status == domain.AgentTaskRunning) {
+			cnt++
+		}
+	}
+	return cnt, nil
+}
+func (s *stubAgentRepo) ListTasksByAgent(context.Context, uuid.UUID, domain.AgentTaskFilter) ([]domain.AgentTask, int, error) {
+	return nil, 0, nil
+}
+func (s *stubAgentRepo) GetAgentTaskStats(context.Context, uuid.UUID) (*domain.AgentTaskStats, error) {
+	return &domain.AgentTaskStats{}, nil
+}
 func (s *stubAgentRepo) CreateTask(context.Context, *domain.AgentTask) error               { return nil }
 func (s *stubAgentRepo) GetTaskByID(_ context.Context, id uuid.UUID) (*domain.AgentTask, error) {
 	s.mu.Lock()
@@ -338,5 +399,61 @@ func TestReconcileRecoversOfflineAgentAndExpiredTasksAndSetProvisioned(t *testin
 	gotR3, _ := runnerRepo.GetByID(ctx, r3.ID)
 	if gotR3.Status != domain.RunnerOnline {
 		t.Fatalf("expected SetProvisioned not to overwrite online runner, got %s", gotR3.Status)
+	}
+}
+
+func TestReconcileCompletesDrainingRunnersAndAgents(t *testing.T) {
+	runnerRepo := newStubRunnerRepo()
+	jobRepo := newStubJobRepo()
+	agentRepo := newStubAgentRepo()
+
+	busyJobID := int64(7001)
+	idleRunner := &domain.Runner{ID: uuid.New(), Name: "drain-idle", Status: domain.RunnerDraining, Provider: "simulated", Ephemeral: true}
+	busyRunner := &domain.Runner{ID: uuid.New(), Name: "drain-busy", Status: domain.RunnerDraining, Provider: "simulated", ProviderRef: "sim-busy", CurrentJobID: &busyJobID, Ephemeral: true}
+	runnerRepo.runners[idleRunner.ID] = idleRunner
+	runnerRepo.runners[busyRunner.ID] = busyRunner
+	jobRepo.jobs[uuid.New()] = &domain.WorkflowJob{ID: uuid.New(), GitHubJobID: busyJobID, Status: domain.JobInProgress}
+
+	idleAgentID := uuid.New()
+	busyAgentID := uuid.New()
+	agentRepo.agents[idleAgentID] = &domain.Agent{ID: idleAgentID, Name: "ag-idle", Status: domain.AgentDraining}
+	agentRepo.agents[busyAgentID] = &domain.Agent{ID: busyAgentID, Name: "ag-busy", Status: domain.AgentDraining}
+	agentRepo.tasks[uuid.New()] = &domain.AgentTask{ID: uuid.New(), AgentID: &busyAgentID, Status: domain.AgentTaskRunning}
+
+	orch := NewOrchestrator(config.OrchestratorConfig{
+		Provider:          "simulated",
+		WorkerCount:       1,
+		QueueSize:         8,
+		ReconcileInterval: time.Minute,
+		ProvisionTimeout:  time.Minute,
+		StaleHeartbeatTTL: time.Minute,
+	}, zap.NewNop(), runnerRepo, jobRepo, nil, agentRepo, nil)
+
+	ctx := context.Background()
+	simProv := orch.selectProvisioner("simulated")
+	simRes, simErr := simProv.Provision(ctx, ProvisionRequest{RunnerID: busyRunner.ID, RunnerName: busyRunner.Name})
+	if simErr != nil {
+		t.Fatalf("simulated provision failed: %v", simErr)
+	}
+	busyRunner.ProviderRef = simRes.ProviderRef
+
+	orch.reconcileOnce(ctx)
+
+	gotIdleRunner, _ := runnerRepo.GetByID(ctx, idleRunner.ID)
+	gotBusyRunner, _ := runnerRepo.GetByID(ctx, busyRunner.ID)
+	if gotIdleRunner.Status != domain.RunnerTerminated {
+		t.Fatalf("expected idle draining runner to transition to terminated, got %s", gotIdleRunner.Status)
+	}
+	if gotBusyRunner.Status != domain.RunnerDraining {
+		t.Fatalf("expected busy draining runner to remain draining while job is in_progress, got %s", gotBusyRunner.Status)
+	}
+
+	gotIdleAgent, _ := agentRepo.GetByID(ctx, idleAgentID)
+	gotBusyAgent, _ := agentRepo.GetByID(ctx, busyAgentID)
+	if gotIdleAgent.Status != domain.AgentDrained {
+		t.Fatalf("expected idle draining agent to transition to drained, got %s", gotIdleAgent.Status)
+	}
+	if gotBusyAgent.Status != domain.AgentDraining {
+		t.Fatalf("expected busy draining agent to remain draining, got %s", gotBusyAgent.Status)
 	}
 }

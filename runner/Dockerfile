@@ -8,6 +8,8 @@ USER root
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CI=true \
+    DOCKER_BUILDKIT=1 \
+    COMPOSE_DOCKER_CLI_BUILD=1 \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
     AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 
@@ -36,7 +38,11 @@ RUN set -eux; \
       postgresql-client \
       wget \
       file \
-      patch; \
+      patch \
+      ccache \
+      pigz \
+      ninja-build \
+      lld; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; \
     chmod a+r /etc/apt/keyrings/docker.gpg; \
@@ -55,8 +61,8 @@ RUN set -eux; \
       docker-compose-plugin \
       gh \
       nodejs; \
-    mkdir -p /opt/hostedtoolcache /home/runner/_work; \
-    chown -R runner:runner /opt/hostedtoolcache /home/runner/_work; \
+    mkdir -p /opt/hostedtoolcache /home/runner/_work /runway-cache; \
+    chown -R runner:runner /opt/hostedtoolcache /home/runner/_work /runway-cache; \
     git lfs install --system; \
     make --version; \
     node --version; \

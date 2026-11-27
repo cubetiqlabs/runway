@@ -36,6 +36,11 @@ func poolToModel(p *domain.RunnerPool) RunnerPoolModel {
 		RunnerGroupID:  p.RunnerGroupID,
 		Provider:       p.Provider,
 		ContainerImage: p.ContainerImage,
+		BuildProfile:   defaultStr(p.BuildProfile, "standard"),
+		CacheEnabled:   p.CacheEnabled,
+		CacheScope:     defaultStr(p.CacheScope, "repo"),
+		CacheMaxGB:     maxInt(p.CacheMaxGB, 20),
+		SandboxMode:    defaultStr(p.SandboxMode, "auto"),
 		Enabled:        p.Enabled,
 	}
 }
@@ -63,7 +68,7 @@ func (r *PoolRepo) Update(ctx context.Context, p *domain.RunnerPool) error {
 			"installation_id", "name", "slug", "description", "labels",
 			"os", "arch", "vcpu", "memory_mb", "disk_gb",
 			"min_idle", "max_concurrency", "idle_timeout_sec", "runner_group_id",
-			"provider", "container_image", "enabled",
+			"provider", "container_image", "build_profile", "cache_enabled", "cache_scope", "cache_max_gb", "sandbox_mode", "enabled",
 		).
 		Updates(&m)
 	if res.Error != nil {
@@ -100,14 +105,34 @@ func (r *PoolRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.RunnerPoo
 	return &out, nil
 }
 
-func (r *PoolRepo) List(ctx context.Context, page domain.PageParams) ([]domain.RunnerPool, int, error) {
-	var total int64
+func (r *PoolRepo) List(ctx context.Context, filter domain.PoolFilter) ([]domain.RunnerPool, int, error) {
 	q := r.db.WithContext(ctx).Model(&RunnerPoolModel{})
+	if filter.Provider != "" {
+		q = q.Where("provider = ?", filter.Provider)
+	}
+	if filter.OS != "" {
+		q = q.Where("os = ?", filter.OS)
+	}
+	if filter.Enabled != nil {
+		q = q.Where("enabled = ?", *filter.Enabled)
+	}
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(name ILIKE ? ESCAPE '\' OR slug ILIKE ? ESCAPE '\' OR description ILIKE ? ESCAPE '\')`, like, like, like)
+	}
+	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
+	sortCols := map[string]string{
+		"name":            "name",
+		"vcpu":            "vcpu",
+		"memory_mb":       "memory_mb",
+		"max_concurrency": "max_concurrency",
+		"provider":        "provider",
+		"created_at":      "created_at",
+	}
 	var models []RunnerPoolModel
-	if err := q.Order("created_at ASC").Scopes(paginate(page)).Find(&models).Error; err != nil {
+	if err := q.Scopes(applySort(filter.PageParams, sortCols, "created_at ASC"), paginate(filter.PageParams)).Find(&models).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
 	items := make([]domain.RunnerPool, 0, len(models))

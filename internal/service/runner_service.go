@@ -10,6 +10,7 @@ import (
 
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
+	"github.com/cubetiqlabs/runway/internal/eventstore"
 	"github.com/cubetiqlabs/runway/internal/github"
 	"github.com/cubetiqlabs/runway/internal/orchestrator"
 	"github.com/google/uuid"
@@ -21,8 +22,10 @@ type RunnerService struct {
 	instRepo   domain.InstallationRepository
 	poolRepo   domain.PoolRepository
 	runnerRepo domain.RunnerRepository
+	jobRepo    domain.JobRepository
 	auditRepo  domain.AuditRepository
 	orch       *orchestrator.Orchestrator
+	eventStore eventstore.Store
 
 	hookMu      sync.RWMutex
 	onSlotFreed func()
@@ -46,6 +49,18 @@ func NewRunnerService(
 		auditRepo:  auditRepo,
 		orch:       orch,
 	}
+}
+
+func (s *RunnerService) SetJobRepo(jobRepo domain.JobRepository) {
+	s.hookMu.Lock()
+	s.jobRepo = jobRepo
+	s.hookMu.Unlock()
+}
+
+func (s *RunnerService) SetEventStore(es eventstore.Store) {
+	s.hookMu.Lock()
+	s.eventStore = es
+	s.hookMu.Unlock()
 }
 
 func (s *RunnerService) SetSlotFreedHook(fn func()) {
@@ -74,7 +89,7 @@ func (s *RunnerService) SeedDefaultPools(ctx context.Context) error {
 	if count > 0 {
 		targetImage := strings.TrimSpace(s.cfg.Orchestrator.DefaultImage)
 		if targetImage != "" && targetImage != legacyBareRunnerImage {
-			pools, _, listErr := s.poolRepo.List(ctx, domain.PageParams{Limit: 200, Offset: 0})
+			pools, _, listErr := s.poolRepo.List(ctx, domain.PoolFilter{PageParams: domain.PageParams{Limit: 200, Offset: 0}})
 			if listErr != nil {
 				return listErr
 			}
@@ -94,7 +109,7 @@ func (s *RunnerService) SeedDefaultPools(ctx context.Context) error {
 		{
 			Name:           "Ubuntu 24.04 · 4 vCPU",
 			Slug:           "runway-ubuntu-4vcpu",
-			Description:    "Fast ephemeral x64 Linux runner with NVMe scratch disk for CI builds and unit tests.",
+			Description:    "Fast ephemeral x64 Linux runner with persistent repo cache and tmpfs scratch acceleration.",
 			Labels:         []string{"self-hosted", "linux", "x64", "runway-ubuntu-4vcpu"},
 			OS:             "linux",
 			Arch:           "x64",
@@ -107,12 +122,17 @@ func (s *RunnerService) SeedDefaultPools(ctx context.Context) error {
 			RunnerGroupID:  1,
 			Provider:       s.cfg.Orchestrator.Provider,
 			ContainerImage: s.cfg.Orchestrator.DefaultImage,
+			BuildProfile:   "fast",
+			CacheEnabled:   true,
+			CacheScope:     "repo",
+			CacheMaxGB:     20,
+			SandboxMode:    "auto",
 			Enabled:        true,
 		},
 		{
-			Name:           "Ubuntu 24.04 · 8 vCPU",
+			Name:           "Ubuntu 24.04 · 8 vCPU Ultra",
 			Slug:           "runway-ubuntu-8vcpu",
-			Description:    "High-throughput ephemeral runner for Docker builds, Go/Rust compilation, and E2E suites.",
+			Description:    "Ultra Build ephemeral runner with DinD layer cache, tmpfs workspace, BuildKit, and high parallelism.",
 			Labels:         []string{"self-hosted", "linux", "x64", "runway-ubuntu-8vcpu"},
 			OS:             "linux",
 			Arch:           "x64",
@@ -125,6 +145,11 @@ func (s *RunnerService) SeedDefaultPools(ctx context.Context) error {
 			RunnerGroupID:  1,
 			Provider:       s.cfg.Orchestrator.Provider,
 			ContainerImage: s.cfg.Orchestrator.DefaultImage,
+			BuildProfile:   "ultra",
+			CacheEnabled:   true,
+			CacheScope:     "repo",
+			CacheMaxGB:     40,
+			SandboxMode:    "auto",
 			Enabled:        true,
 		},
 	}
@@ -145,8 +170,8 @@ func slugify(s string) string {
 	return strings.Trim(s, "-")
 }
 
-func (s *RunnerService) ListPools(ctx context.Context, page domain.PageParams) ([]domain.RunnerPool, int, error) {
-	return s.poolRepo.List(ctx, page)
+func (s *RunnerService) ListPools(ctx context.Context, filter domain.PoolFilter) ([]domain.RunnerPool, int, error) {
+	return s.poolRepo.List(ctx, filter)
 }
 
 func (s *RunnerService) CreatePool(ctx context.Context, p *domain.RunnerPool, actor *domain.User, ip string) error {
@@ -193,6 +218,14 @@ func (s *RunnerService) CreatePool(ctx context.Context, p *domain.RunnerPool, ac
 	}
 	if p.ContainerImage == "" {
 		p.ContainerImage = s.cfg.Orchestrator.DefaultImage
+	}
+	p.BuildProfile = normalizeBuildProfile(p.BuildProfile)
+	p.CacheScope = normalizeCacheScope(p.CacheScope)
+	if p.CacheMaxGB <= 0 {
+		p.CacheMaxGB = 20
+	}
+	if strings.TrimSpace(p.SandboxMode) == "" {
+		p.SandboxMode = "auto"
 	}
 
 	if err := s.poolRepo.Create(ctx, p); err != nil {
@@ -250,6 +283,19 @@ func (s *RunnerService) UpdatePool(ctx context.Context, p *domain.RunnerPool, ac
 	if p.ContainerImage != "" {
 		existing.ContainerImage = p.ContainerImage
 	}
+	if p.BuildProfile != "" {
+		existing.BuildProfile = normalizeBuildProfile(p.BuildProfile)
+	}
+	existing.CacheEnabled = p.CacheEnabled
+	if p.CacheScope != "" {
+		existing.CacheScope = normalizeCacheScope(p.CacheScope)
+	}
+	if p.CacheMaxGB > 0 {
+		existing.CacheMaxGB = p.CacheMaxGB
+	}
+	if p.SandboxMode != "" {
+		existing.SandboxMode = strings.ToLower(strings.TrimSpace(p.SandboxMode))
+	}
 	existing.Enabled = p.Enabled
 	existing.InstallationID = p.InstallationID
 
@@ -281,11 +327,116 @@ func (s *RunnerService) DrainRunner(ctx context.Context, id uuid.UUID, actor *do
 	if err != nil {
 		return nil, err
 	}
+	if rn.Status == domain.RunnerTerminated {
+		return rn, nil
+	}
+
+	hasActiveJob := rn.Status == domain.RunnerBusy
+	if !hasActiveJob && rn.CurrentJobID != nil {
+		s.hookMu.RLock()
+		jr := s.jobRepo
+		s.hookMu.RUnlock()
+		if jr != nil {
+			if job, jobErr := jr.GetByGitHubJobID(ctx, *rn.CurrentJobID); jobErr == nil && job != nil && job.Status == domain.JobInProgress {
+				hasActiveJob = true
+			}
+		}
+	}
+
+	if !hasActiveJob {
+		if rn.CurrentJobID != nil {
+			s.hookMu.RLock()
+			jr := s.jobRepo
+			s.hookMu.RUnlock()
+			if jr != nil {
+				if job, jobErr := jr.GetByGitHubJobID(ctx, *rn.CurrentJobID); jobErr == nil && job != nil && job.Status == domain.JobProvisioning {
+					_, _ = jr.RequeueIfProvisioning(ctx, job.ID, fmt.Sprintf("Runner %s drained before job started; requeued", rn.Name))
+				}
+			}
+		}
+		if err := s.orch.TerminateRunner(ctx, rn); err != nil {
+			return nil, err
+		}
+		s.appendAudit(ctx, actor, "runner.drained", "runner", rn.ID.String(), map[string]any{"name": rn.Name, "immediate": true}, ip)
+		return s.runnerRepo.GetByID(ctx, id)
+	}
+
 	if err := s.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerDraining, nil, "", nil); err != nil {
 		return nil, err
 	}
-	s.appendAudit(ctx, actor, "runner.drained", "runner", rn.ID.String(), map[string]any{"name": rn.Name}, ip)
+	s.appendAudit(ctx, actor, "runner.drained", "runner", rn.ID.String(), map[string]any{"name": rn.Name, "immediate": false}, ip)
 	return s.runnerRepo.GetByID(ctx, id)
+}
+
+func (s *RunnerService) GetRunnerLogs(ctx context.Context, id uuid.UUID, page domain.PageParams) ([]domain.Event, int, error) {
+	rn, err := s.runnerRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.hookMu.RLock()
+	es := s.eventStore
+	s.hookMu.RUnlock()
+
+	if es != nil {
+		if page.Limit <= 0 {
+			page.Limit = 200
+		}
+		if page.SortBy == "" {
+			page.SortBy = "occurred_at"
+			page.SortDir = "asc"
+		}
+		items, total, qErr := es.Query(ctx, domain.EventFilter{
+			Category:     domain.EventCategoryRunnerLog,
+			ResourceType: "runner",
+			ResourceID:   rn.ID.String(),
+			PageParams:   page,
+		})
+		if qErr == nil && total > 0 {
+			return items, total, nil
+		}
+	}
+
+	// Fallback to live Docker container logs while container is still running.
+	if s.orch != nil && rn.Provider == "docker" && rn.ProviderRef != "" {
+		entries, logErr := s.orch.FetchRunnerLogs(ctx, rn, 200)
+		if logErr == nil && len(entries) > 0 {
+			out := make([]domain.Event, 0, len(entries))
+			for _, e := range entries {
+				out = append(out, domain.Event{
+					ID:           uuid.New(),
+					OccurredAt:   e.Timestamp,
+					Category:     domain.EventCategoryRunnerLog,
+					EventType:    "runner.log." + e.Stream,
+					Severity:     e.Level,
+					Source:       "docker-live",
+					ResourceType: "runner",
+					ResourceID:   rn.ID.String(),
+					Status:       string(rn.Status),
+					Message:      e.Line,
+				})
+			}
+			return out, len(out), nil
+		}
+	}
+	return []domain.Event{}, 0, nil
+}
+
+func normalizeBuildProfile(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "fast", "ultra":
+		return strings.ToLower(strings.TrimSpace(p))
+	default:
+		return "standard"
+	}
+}
+
+func normalizeCacheScope(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "pool", "none":
+		return strings.ToLower(strings.TrimSpace(s))
+	default:
+		return "repo"
+	}
 }
 
 func (s *RunnerService) TerminateRunner(ctx context.Context, id uuid.UUID, actor *domain.User, ip string) error {
@@ -301,8 +452,8 @@ func (s *RunnerService) TerminateRunner(ctx context.Context, id uuid.UUID, actor
 	return nil
 }
 
-func (s *RunnerService) ListInstallations(ctx context.Context, page domain.PageParams) ([]domain.Installation, int, error) {
-	return s.instRepo.List(ctx, page)
+func (s *RunnerService) ListInstallations(ctx context.Context, filter domain.InstallationFilter) ([]domain.Installation, int, error) {
+	return s.instRepo.List(ctx, filter)
 }
 
 func (s *RunnerService) SyncInstallations(ctx context.Context, actor *domain.User, ip string) (int, error) {

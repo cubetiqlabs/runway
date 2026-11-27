@@ -1,9 +1,13 @@
 package http
 
 import (
+	"strconv"
+	"time"
+
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/service"
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 )
 
 type AgentHandler struct {
@@ -15,14 +19,102 @@ func NewAgentHandler(agentSvc *service.AgentService) *AgentHandler {
 }
 
 func (h *AgentHandler) ListAgents(c fiber.Ctx) error {
+	page := parsePage(c)
 	if h.agentSvc == nil {
-		return c.JSON(fiber.Map{"items": []domain.Agent{}, "total": 0})
+		return sendPage(c, []domain.Agent{}, 0, page)
 	}
-	items, total, err := h.agentSvc.ListAgents(c.Context(), parsePage(c))
+	var poolID *uuid.UUID
+	if rawPool := c.Query("pool_id"); rawPool != "" {
+		parsed, err := uuid.Parse(rawPool)
+		if err != nil {
+			return domain.ErrValidation
+		}
+		poolID = &parsed
+	}
+	filter := domain.AgentFilter{
+		Status:     c.Query("status"),
+		OS:         c.Query("os"),
+		Runtime:    c.Query("runtime"),
+		PoolID:     poolID,
+		Search:     c.Query("search"),
+		PageParams: page,
+	}
+	items, total, err := h.agentSvc.ListAgents(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
+}
+
+func (h *AgentHandler) GetAgent(c fiber.Ctx) error {
+	if h.agentSvc == nil {
+		return domain.ErrNotFound
+	}
+	id, err := parseUUIDParam(c, "id")
+	if err != nil {
+		return err
+	}
+	window := parseWindowDuration(c.Query("window"), time.Hour)
+	detail, err := h.agentSvc.GetAgentDetail(c.Context(), id, window)
+	if err != nil {
+		return err
+	}
+	return c.JSON(detail)
+}
+
+func (h *AgentHandler) GetAgentMetrics(c fiber.Ctx) error {
+	if h.agentSvc == nil {
+		return c.JSON(fiber.Map{"items": []domain.AgentMetricPoint{}})
+	}
+	id, err := parseUUIDParam(c, "id")
+	if err != nil {
+		return err
+	}
+	window := parseWindowDuration(c.Query("window"), time.Hour)
+	limit := 240
+	if raw := c.Query("limit"); raw != "" {
+		if v, convErr := strconv.Atoi(raw); convErr == nil && v > 0 {
+			limit = v
+		}
+	}
+	points, err := h.agentSvc.GetAgentMetrics(c.Context(), id, window, limit)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": points})
+}
+
+func (h *AgentHandler) ListAgentTasks(c fiber.Ctx) error {
+	page := parsePage(c)
+	if h.agentSvc == nil {
+		return sendPage(c, []domain.AgentTask{}, 0, page)
+	}
+	id, err := parseUUIDParam(c, "id")
+	if err != nil {
+		return err
+	}
+	filter := domain.AgentTaskFilter{
+		Status:     c.Query("status"),
+		Search:     c.Query("search"),
+		PageParams: page,
+	}
+	items, total, err := h.agentSvc.ListAgentTasks(c.Context(), id, filter)
+	if err != nil {
+		return err
+	}
+	return sendPage(c, items, total, page)
+}
+
+func (h *AgentHandler) ResumeAgent(c fiber.Ctx) error {
+	id, err := parseUUIDParam(c, "id")
+	if err != nil {
+		return err
+	}
+	agent, err := h.agentSvc.ResumeAgent(c.Context(), id, currentUser(c), c.IP())
+	if err != nil {
+		return err
+	}
+	return c.JSON(agent)
 }
 
 func (h *AgentHandler) RegisterAgent(c fiber.Ctx) error {
@@ -121,4 +213,25 @@ func (h *AgentHandler) CompleteTask(c fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+func (h *AgentHandler) IngestTaskLogs(c fiber.Ctx) error {
+	agent := currentAgent(c)
+	if agent == nil {
+		return domain.ErrUnauthorized
+	}
+	taskID, err := parseUUIDParam(c, "id")
+	if err != nil {
+		return err
+	}
+	var req struct {
+		Entries []domain.RunnerLogEntry `json:"entries"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return sendError(c, fiber.StatusBadRequest, "bad_request", "invalid task log payload")
+	}
+	if err := h.agentSvc.IngestTaskLogs(c.Context(), agent, taskID, req.Entries); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true, "accepted": len(req.Entries)})
 }

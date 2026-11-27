@@ -39,7 +39,55 @@ const STATUS_MAP: Record<string, StatusStyle> = {
   draining: {
     label: "Draining",
     className: "border-orange-500/30 bg-orange-500/10 text-orange-600 dark:text-orange-400",
+    icon: Loading03Icon,
+    spin: true,
+  },
+  drained: {
+    label: "Drained",
+    className: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
     icon: PauseCircleIcon,
+  },
+  pending: {
+    label: "Pending",
+    className: "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400",
+    icon: Clock01Icon,
+  },
+  claimed: {
+    label: "Claimed",
+    className: "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400",
+    icon: Loading03Icon,
+    spin: true,
+  },
+  running: {
+    label: "Running",
+    className: "border-primary/40 bg-primary/10 text-primary",
+    icon: Loading03Icon,
+    spin: true,
+  },
+  info: {
+    label: "Info",
+    className: "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400",
+    icon: CheckmarkCircle02Icon,
+  },
+  warn: {
+    label: "Warn",
+    className: "border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-300",
+    icon: Alert02Icon,
+  },
+  error: {
+    label: "Error",
+    className: "border-destructive/40 bg-destructive/10 text-destructive",
+    icon: CancelCircleIcon,
+  },
+  debug: {
+    label: "Debug",
+    className: "border-border bg-muted text-muted-foreground",
+    icon: Clock01Icon,
+  },
+  recorded: {
+    label: "Recorded",
+    className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    icon: CheckmarkCircle02Icon,
   },
   offline: {
     label: "Offline",

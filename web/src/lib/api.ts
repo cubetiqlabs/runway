@@ -1,7 +1,12 @@
 import type {
   Agent,
+  AgentDetail,
+  AgentMetricPoint,
+  AgentTask,
   AuditLog,
   DashboardOverview,
+  EventRecord,
+  EventSummary,
   GitHubAppSettingsStatus,
   Installation,
   ModerationPolicy,
@@ -29,6 +34,31 @@ export class ApiError extends Error {
     this.status = status
     this.code = code
   }
+}
+
+export interface ListQueryParams {
+  limit?: number
+  offset?: number
+  page?: number
+  sort_by?: string
+  sort_dir?: "asc" | "desc" | ""
+  search?: string
+  [key: string]: string | number | boolean | undefined
+}
+
+function buildQuery(params: ListQueryParams = {}, defaultLimit = 25): string {
+  const qs = new URLSearchParams()
+  for (const [key, val] of Object.entries(params)) {
+    if (val === undefined || val === null || val === "" || val === "all") {
+      continue
+    }
+    qs.set(key, String(val))
+  }
+  if (!qs.has("limit")) {
+    qs.set("limit", String(defaultLimit))
+  }
+  const encoded = qs.toString()
+  return encoded ? `?${encoded}` : ""
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -86,8 +116,8 @@ export const api = {
 
   overview: () => request<DashboardOverview>("/api/v1/dashboard/overview"),
 
-  listPools: (limit = 50, offset = 0) =>
-    request<PageResponse<RunnerPool>>(`/api/v1/pools?limit=${limit}&offset=${offset}`),
+  listPools: (params: ListQueryParams = {}) =>
+    request<PageResponse<RunnerPool>>(`/api/v1/pools${buildQuery(params, 50)}`),
   createPool: (pool: Partial<RunnerPool>) =>
     request<RunnerPool>("/api/v1/pools", { method: "POST", body: JSON.stringify(pool) }),
   updatePool: (id: string, pool: Partial<RunnerPool>) =>
@@ -95,25 +125,17 @@ export const api = {
   deletePool: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/pools/${id}`, { method: "DELETE" }),
 
-  listRunners: (params: { status?: string; search?: string; limit?: number } = {}) => {
-    const qs = new URLSearchParams()
-    if (params.status) qs.set("status", params.status)
-    if (params.search) qs.set("search", params.search)
-    qs.set("limit", String(params.limit ?? 50))
-    return request<PageResponse<Runner>>(`/api/v1/runners?${qs.toString()}`)
-  },
+  listRunners: (params: ListQueryParams = {}) =>
+    request<PageResponse<Runner>>(`/api/v1/runners${buildQuery(params, 25)}`),
+  getRunnerLogs: (id: string, params: ListQueryParams = {}) =>
+    request<PageResponse<EventRecord>>(`/api/v1/runners/${id}/logs${buildQuery(params, 200)}`),
   drainRunner: (id: string) =>
     request<Runner>(`/api/v1/runners/${id}/drain`, { method: "POST" }),
   terminateRunner: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/runners/${id}/terminate`, { method: "POST" }),
 
-  listJobs: (params: { status?: string; search?: string; limit?: number } = {}) => {
-    const qs = new URLSearchParams()
-    if (params.status) qs.set("status", params.status)
-    if (params.search) qs.set("search", params.search)
-    qs.set("limit", String(params.limit ?? 50))
-    return request<PageResponse<WorkflowJob>>(`/api/v1/jobs?${qs.toString()}`)
-  },
+  listJobs: (params: ListQueryParams = {}) =>
+    request<PageResponse<WorkflowJob>>(`/api/v1/jobs${buildQuery(params, 25)}`),
   approveJob: (id: string, reason?: string) =>
     request<WorkflowJob>(`/api/v1/jobs/${id}/approve`, {
       method: "POST",
@@ -125,8 +147,8 @@ export const api = {
       body: JSON.stringify({ reason }),
     }),
 
-  listPolicies: (limit = 50) =>
-    request<PageResponse<ModerationPolicy>>(`/api/v1/policies?limit=${limit}`),
+  listPolicies: (params: ListQueryParams = {}) =>
+    request<PageResponse<ModerationPolicy>>(`/api/v1/policies${buildQuery(params, 25)}`),
   createPolicy: (policy: Partial<ModerationPolicy>) =>
     request<ModerationPolicy>("/api/v1/policies", {
       method: "POST",
@@ -154,15 +176,30 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  listInstallations: () => request<PageResponse<Installation>>("/api/v1/installations?limit=50"),
+  listInstallations: (params: ListQueryParams = {}) =>
+    request<PageResponse<Installation>>(`/api/v1/installations${buildQuery(params, 25)}`),
   syncInstallations: () =>
     request<{ synced: number }>("/api/v1/installations/sync", { method: "POST" }),
-  listDeliveries: () =>
-    request<PageResponse<WebhookDelivery>>("/api/v1/webhooks/deliveries?limit=50"),
-  listAuditLogs: () => request<PageResponse<AuditLog>>("/api/v1/audit-logs?limit=50"),
+  listDeliveries: (params: ListQueryParams = {}) =>
+    request<PageResponse<WebhookDelivery>>(`/api/v1/webhooks/deliveries${buildQuery(params, 25)}`),
+  listAuditLogs: (params: ListQueryParams = {}) =>
+    request<PageResponse<AuditLog>>(`/api/v1/audit-logs${buildQuery(params, 25)}`),
+  listEvents: (params: ListQueryParams = {}) =>
+    request<PageResponse<EventRecord>>(`/api/v1/events${buildQuery(params, 25)}`),
+  eventSummary: (window = "24h") =>
+    request<EventSummary>(`/api/v1/events/summary?window=${encodeURIComponent(window)}`),
   settingsStatus: () => request<GitHubAppSettingsStatus>("/api/v1/settings/github-app"),
 
-  listAgents: () => request<PageResponse<Agent>>("/api/v1/agents?limit=50"),
+  listAgents: (params: ListQueryParams = {}) =>
+    request<PageResponse<Agent>>(`/api/v1/agents${buildQuery(params, 25)}`),
+  getAgent: (id: string, window = "1h") =>
+    request<AgentDetail>(`/api/v1/agents/${id}?window=${encodeURIComponent(window)}`),
+  getAgentMetrics: (id: string, window = "1h", limit = 240) =>
+    request<{ items: AgentMetricPoint[] }>(
+      `/api/v1/agents/${id}/metrics?window=${encodeURIComponent(window)}&limit=${limit}`
+    ),
+  listAgentTasks: (id: string, params: ListQueryParams = {}) =>
+    request<PageResponse<AgentTask>>(`/api/v1/agents/${id}/tasks${buildQuery(params, 25)}`),
   registerAgent: (payload: {
     name: string
     os: string
@@ -177,6 +214,7 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   drainAgent: (id: string) => request<Agent>(`/api/v1/agents/${id}/drain`, { method: "POST" }),
+  resumeAgent: (id: string) => request<Agent>(`/api/v1/agents/${id}/resume`, { method: "POST" }),
   rotateAgentToken: (id: string) =>
     request<RegisterAgentResponse>(`/api/v1/agents/${id}/rotate-token`, { method: "POST" }),
   deleteAgent: (id: string) =>

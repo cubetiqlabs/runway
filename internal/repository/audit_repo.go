@@ -51,14 +51,30 @@ func (r *AuditRepo) UpdateDeliveryStatus(ctx context.Context, deliveryID, status
 	return mapGormError(err)
 }
 
-func (r *AuditRepo) ListDeliveries(ctx context.Context, page domain.PageParams) ([]domain.WebhookDelivery, int, error) {
-	var total int64
+func (r *AuditRepo) ListDeliveries(ctx context.Context, filter domain.DeliveryFilter) ([]domain.WebhookDelivery, int, error) {
 	q := r.db.WithContext(ctx).Model(&WebhookDeliveryModel{})
+	if filter.Status != "" {
+		q = q.Where("status = ?", filter.Status)
+	}
+	if filter.EventName != "" {
+		q = q.Where("event_name = ?", filter.EventName)
+	}
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(delivery_id ILIKE ? ESCAPE '\' OR repo_full_name ILIKE ? ESCAPE '\' OR event_name ILIKE ? ESCAPE '\' OR error_message ILIKE ? ESCAPE '\')`, like, like, like, like)
+	}
+	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
+	sortCols := map[string]string{
+		"received_at":    "received_at",
+		"event_name":     "event_name",
+		"repo_full_name": "repo_full_name",
+		"status":         "status",
+		"processing_ms":  "processing_ms",
+	}
 	var models []WebhookDeliveryModel
-	if err := q.Order("received_at DESC").Scopes(paginate(page)).Find(&models).Error; err != nil {
+	if err := q.Scopes(applySort(filter.PageParams, sortCols, "received_at DESC"), paginate(filter.PageParams)).Find(&models).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
 	items := make([]domain.WebhookDelivery, 0, len(models))
@@ -85,14 +101,29 @@ func (r *AuditRepo) AppendAuditLog(ctx context.Context, log *domain.AuditLog) er
 	return nil
 }
 
-func (r *AuditRepo) ListAuditLogs(ctx context.Context, page domain.PageParams) ([]domain.AuditLog, int, error) {
-	var total int64
+func (r *AuditRepo) ListAuditLogs(ctx context.Context, filter domain.AuditFilter) ([]domain.AuditLog, int, error) {
 	q := r.db.WithContext(ctx).Model(&AuditLogModel{})
+	if filter.Action != "" {
+		q = q.Where("action = ?", filter.Action)
+	}
+	if filter.ResourceType != "" {
+		q = q.Where("resource_type = ?", filter.ResourceType)
+	}
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(actor_label ILIKE ? ESCAPE '\' OR action ILIKE ? ESCAPE '\' OR resource_type ILIKE ? ESCAPE '\' OR resource_id ILIKE ? ESCAPE '\' OR ip_address ILIKE ? ESCAPE '\')`, like, like, like, like, like)
+	}
+	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
+	sortCols := map[string]string{
+		"created_at":    "created_at",
+		"actor_label":   "actor_label",
+		"action":        "action",
+		"resource_type": "resource_type",
+	}
 	var models []AuditLogModel
-	if err := q.Order("created_at DESC").Scopes(paginate(page)).Find(&models).Error; err != nil {
+	if err := q.Scopes(applySort(filter.PageParams, sortCols, "created_at DESC"), paginate(filter.PageParams)).Find(&models).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
 	items := make([]domain.AuditLog, 0, len(models))
@@ -203,7 +234,7 @@ func (r *AuditRepo) GetDashboardOverview(ctx context.Context) (*domain.Dashboard
 	}
 	ov.RecentJobs = recentJobs
 
-	recentDeliveries, _, err := r.ListDeliveries(ctx, domain.PageParams{Limit: 8})
+	recentDeliveries, _, err := r.ListDeliveries(ctx, domain.DeliveryFilter{PageParams: domain.PageParams{Limit: 8}})
 	if err != nil {
 		return nil, err
 	}

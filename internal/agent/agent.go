@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/orchestrator"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -17,20 +18,33 @@ type Executor interface {
 	Execute(ctx context.Context, task *TaskPayload) error
 }
 
+type LogAwareExecutor interface {
+	ExecuteWithLogs(ctx context.Context, task *TaskPayload, logSink func([]domain.RunnerLogEntry)) error
+}
+
+type CacheStatsProvider interface {
+	CacheStats() (hits, misses int64)
+}
+
 type Agent struct {
 	cfg        Config
 	log        *zap.Logger
 	client     *Client
 	executor   Executor
 	updater    *Updater
+	metrics    *MetricsCollector
 	runtime    string
 	hostname   string
 	dockerOpts orchestrator.DockerOptions
 
-	activeCount atomic.Int32
-	draining    atomic.Bool
-	sem         chan struct{}
-	jobsWG      sync.WaitGroup
+	activeCount         atomic.Int32
+	draining            atomic.Bool
+	tasksCompleted      atomic.Int64
+	tasksFailed         atomic.Int64
+	tasksCancelled      atomic.Int64
+	totalTaskDurationMS atomic.Int64
+	sem                 chan struct{}
+	jobsWG              sync.WaitGroup
 
 	cancelMu sync.Mutex
 	cancels  map[uuid.UUID]context.CancelFunc
@@ -67,7 +81,7 @@ func New(cfg Config, log *zap.Logger) *Agent {
 		execImpl = dockerExec
 		effectiveRT = "docker"
 	} else {
-		execImpl = NewNativeExecutor(cfg.WorkDir, cfg.RunnerVersion)
+		execImpl = NewNativeExecutor(cfg.WorkDir, cfg.RunnerVersion, cfg.CacheEnabled)
 	}
 
 	return &Agent{
@@ -76,6 +90,7 @@ func New(cfg Config, log *zap.Logger) *Agent {
 		client:          client,
 		executor:        execImpl,
 		updater:         NewUpdater(cfg.UpdateRepo),
+		metrics:         NewMetricsCollector(cfg.WorkDir),
 		runtime:         effectiveRT,
 		hostname:        hostname,
 		dockerOpts:      dockerOpts,
@@ -109,6 +124,20 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	loopCtx, cancelLoop := context.WithCancel(ctx)
 	defer cancelLoop()
+
+	if a.cfg.PrewarmImages {
+		if de, ok := a.executor.(*DockerExecutor); ok {
+			go func() {
+				preCtx, preCancel := context.WithTimeout(loopCtx, 4*time.Minute)
+				defer preCancel()
+				imgs := []string{"ghcr.io/cubetiqlabs/runway-runner:latest"}
+				if a.dockerOpts.IsolatedDinD && a.dockerOpts.DinDImage != "" {
+					imgs = append(imgs, a.dockerOpts.DinDImage)
+				}
+				de.PrewarmImages(preCtx, imgs)
+			}()
+		}
+	}
 
 	var bgWG sync.WaitGroup
 	bgWG.Add(1)
@@ -217,19 +246,35 @@ func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) bool {
 			zap.Int64("github_job_id", task.GitHubJobID),
 		)
 
-		execErr := a.executor.Execute(jobCtx, task)
+		startedAt := time.Now()
+		var execErr error
+		if logExec, ok := a.executor.(LogAwareExecutor); ok {
+			execErr = logExec.ExecuteWithLogs(jobCtx, task, func(entries []domain.RunnerLogEntry) {
+				shipCtx, shipCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = a.client.ShipTaskLogs(shipCtx, task.TaskID, entries)
+				shipCancel()
+			})
+		} else {
+			execErr = a.executor.Execute(jobCtx, task)
+		}
+		durMS := time.Since(startedAt).Milliseconds()
+		a.totalTaskDurationMS.Add(durMS)
+
 		status := "completed"
 		errMsg := ""
 		if execErr != nil {
 			errMsg = execErr.Error()
 			if jobCtx.Err() != nil {
 				status = "cancelled"
+				a.tasksCancelled.Add(1)
 				a.log.Info("runner task cancelled", zap.String("runner", task.RunnerName), zap.String("reason", errMsg))
 			} else {
 				status = "failed"
+				a.tasksFailed.Add(1)
 				a.log.Error("runner task failed", zap.String("runner", task.RunnerName), zap.Error(execErr))
 			}
 		} else {
+			a.tasksCompleted.Add(1)
 			a.log.Info("runner task completed", zap.String("runner", task.RunnerName))
 		}
 
@@ -259,16 +304,45 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	hbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	var cacheHits, cacheMisses int64
+	if csp, ok := a.executor.(CacheStatsProvider); ok {
+		cacheHits, cacheMisses = csp.CacheStats()
+	}
+	completed := a.tasksCompleted.Load()
+	failed := a.tasksFailed.Load()
+	cancelled := a.tasksCancelled.Load()
+	totalDone := completed + failed + cancelled
+	var avgDurMS int64
+	if totalDone > 0 {
+		avgDurMS = a.totalTaskDurationMS.Load() / totalDone
+	}
+
+	var snapPtr *domain.AgentMetricsSnapshot
+	var memTotalMB int
+	if a.metrics != nil {
+		snap := a.metrics.Collect(
+			a.dockerOpts.SandboxRuntime,
+			a.dockerOpts.IsolatedDinD,
+			cacheHits, cacheMisses,
+			completed, failed, cancelled, avgDurMS,
+		)
+		memTotalMB = snap.MemoryTotalMB
+		snapPtr = &snap
+	}
+
 	res, err := a.client.Heartbeat(hbCtx, HeartbeatRequest{
 		OS:             NormalizeOS(),
 		Arch:           NormalizeArch(),
 		Runtime:        a.runtime,
+		SandboxRuntime: a.dockerOpts.SandboxRuntime,
 		Version:        a.cfg.Version,
 		Hostname:       a.hostname,
 		CPUCount:       runtime.NumCPU(),
+		MemoryMB:       memTotalMB,
 		MaxConcurrency: a.cfg.Concurrency,
 		ActiveJobs:     int(a.activeCount.Load()),
 		Labels:         a.cfg.Labels,
+		Metrics:        snapPtr,
 	})
 	if err != nil {
 		if ctx.Err() == nil {
@@ -277,9 +351,18 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		return
 	}
 
-	if res.Status == "draining" {
+	switch res.Status {
+	case "draining", "drained":
 		if !a.draining.Swap(true) {
-			a.log.Info("agent marked draining by control plane; pausing new task claims")
+			a.log.Info("agent marked draining by control plane; pausing new task claims", zap.String("status", res.Status))
+		}
+	case "online":
+		if a.draining.Swap(false) {
+			a.log.Info("agent resumed by control plane; accepting new task claims")
+			select {
+			case a.pollNowCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 

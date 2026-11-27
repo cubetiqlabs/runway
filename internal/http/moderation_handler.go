@@ -1,6 +1,8 @@
 package http
 
 import (
+	"time"
+
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/moderation"
 	"github.com/cubetiqlabs/runway/internal/service"
@@ -17,11 +19,23 @@ func NewModerationHandler(modSvc *service.ModerationService, dashboardSvc *servi
 }
 
 func (h *ModerationHandler) ListPolicies(c fiber.Ctx) error {
-	items, total, err := h.modSvc.ListPolicies(c.Context(), parsePage(c))
+	page := parsePage(c)
+	var enabled *bool
+	if raw := c.Query("enabled"); raw == "true" || raw == "false" {
+		b := raw == "true"
+		enabled = &b
+	}
+	filter := domain.PolicyFilter{
+		Action:     c.Query("action"),
+		Enabled:    enabled,
+		Search:     c.Query("search"),
+		PageParams: page,
+	}
+	items, total, err := h.modSvc.ListPolicies(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
 }
 
 func (h *ModerationHandler) CreatePolicy(c fiber.Ctx) error {
@@ -78,17 +92,18 @@ func (h *ModerationHandler) SimulatePolicy(c fiber.Ctx) error {
 }
 
 func (h *ModerationHandler) ListJobs(c fiber.Ctx) error {
+	page := parsePage(c)
 	filter := domain.JobFilter{
 		Status:     c.Query("status"),
 		Repo:       c.Query("repo"),
 		Search:     c.Query("search"),
-		PageParams: parsePage(c),
+		PageParams: page,
 	}
 	items, total, err := h.modSvc.ListJobs(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
 }
 
 func (h *ModerationHandler) ApproveJob(c fiber.Ctx) error {
@@ -124,19 +139,81 @@ func (h *ModerationHandler) RejectJob(c fiber.Ctx) error {
 }
 
 func (h *ModerationHandler) ListDeliveries(c fiber.Ctx) error {
-	items, total, err := h.dashboardSvc.ListDeliveries(c.Context(), parsePage(c))
+	page := parsePage(c)
+	filter := domain.DeliveryFilter{
+		Status:     c.Query("status"),
+		EventName:  c.Query("event_name"),
+		Search:     c.Query("search"),
+		PageParams: page,
+	}
+	items, total, err := h.dashboardSvc.ListDeliveries(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
 }
 
 func (h *ModerationHandler) ListAuditLogs(c fiber.Ctx) error {
-	items, total, err := h.dashboardSvc.ListAuditLogs(c.Context(), parsePage(c))
+	page := parsePage(c)
+	filter := domain.AuditFilter{
+		Action:       c.Query("action"),
+		ResourceType: c.Query("resource_type"),
+		Search:       c.Query("search"),
+		PageParams:   page,
+	}
+	items, total, err := h.dashboardSvc.ListAuditLogs(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
+}
+
+func (h *ModerationHandler) ListEvents(c fiber.Ctx) error {
+	page := parsePage(c)
+	var since *time.Time
+	if rawSince := c.Query("window"); rawSince != "" {
+		t := time.Now().UTC().Add(-parseWindowDuration(rawSince, 24*time.Hour))
+		since = &t
+	} else if rawTS := c.Query("since"); rawTS != "" {
+		if parsed, err := time.Parse(time.RFC3339, rawTS); err == nil {
+			u := parsed.UTC()
+			since = &u
+		}
+	}
+	var until *time.Time
+	if rawUntil := c.Query("until"); rawUntil != "" {
+		if parsed, err := time.Parse(time.RFC3339, rawUntil); err == nil {
+			u := parsed.UTC()
+			until = &u
+		}
+	}
+	filter := domain.EventFilter{
+		Category:      c.Query("category"),
+		EventType:     c.Query("event_type"),
+		Severity:      c.Query("severity"),
+		ResourceType:  c.Query("resource_type"),
+		ResourceID:    c.Query("resource_id"),
+		CorrelationID: c.Query("correlation_id"),
+		Repo:          c.Query("repo"),
+		Search:        c.Query("search"),
+		Since:         since,
+		Until:         until,
+		PageParams:    page,
+	}
+	items, total, err := h.dashboardSvc.ListEvents(c.Context(), filter)
+	if err != nil {
+		return err
+	}
+	return sendPage(c, items, total, page)
+}
+
+func (h *ModerationHandler) EventSummary(c fiber.Ctx) error {
+	window := parseWindowDuration(c.Query("window"), 24*time.Hour)
+	sum, err := h.dashboardSvc.GetEventSummary(c.Context(), time.Now().UTC().Add(-window))
+	if err != nil {
+		return err
+	}
+	return c.JSON(sum)
 }
 
 func (h *ModerationHandler) SettingsStatus(c fiber.Ctx) error {

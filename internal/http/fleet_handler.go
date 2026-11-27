@@ -25,11 +25,24 @@ func (h *FleetHandler) Overview(c fiber.Ctx) error {
 }
 
 func (h *FleetHandler) ListPools(c fiber.Ctx) error {
-	items, total, err := h.runnerSvc.ListPools(c.Context(), parsePage(c))
+	page := parsePage(c)
+	var enabled *bool
+	if raw := c.Query("enabled"); raw == "true" || raw == "false" {
+		b := raw == "true"
+		enabled = &b
+	}
+	filter := domain.PoolFilter{
+		Provider:   c.Query("provider"),
+		OS:         c.Query("os"),
+		Enabled:    enabled,
+		Search:     c.Query("search"),
+		PageParams: page,
+	}
+	items, total, err := h.runnerSvc.ListPools(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
 }
 
 func (h *FleetHandler) CreatePool(c fiber.Ctx) error {
@@ -71,6 +84,7 @@ func (h *FleetHandler) DeletePool(c fiber.Ctx) error {
 }
 
 func (h *FleetHandler) ListRunners(c fiber.Ctx) error {
+	page := parsePage(c)
 	var poolID *uuid.UUID
 	if rawPool := c.Query("pool_id"); rawPool != "" {
 		parsed, err := uuid.Parse(rawPool)
@@ -81,15 +95,29 @@ func (h *FleetHandler) ListRunners(c fiber.Ctx) error {
 	}
 	filter := domain.RunnerFilter{
 		Status:     c.Query("status"),
+		Provider:   c.Query("provider"),
 		PoolID:     poolID,
 		Search:     c.Query("search"),
-		PageParams: parsePage(c),
+		PageParams: page,
 	}
 	items, total, err := h.runnerSvc.ListRunners(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
+}
+
+func (h *FleetHandler) GetRunnerLogs(c fiber.Ctx) error {
+	id, err := parseUUIDParam(c, "id")
+	if err != nil {
+		return err
+	}
+	page := parsePage(c)
+	items, total, err := h.runnerSvc.GetRunnerLogs(c.Context(), id, page)
+	if err != nil {
+		return err
+	}
+	return sendPage(c, items, total, page)
 }
 
 func (h *FleetHandler) DrainRunner(c fiber.Ctx) error {
@@ -116,11 +144,16 @@ func (h *FleetHandler) TerminateRunner(c fiber.Ctx) error {
 }
 
 func (h *FleetHandler) ListInstallations(c fiber.Ctx) error {
-	items, total, err := h.runnerSvc.ListInstallations(c.Context(), parsePage(c))
+	page := parsePage(c)
+	filter := domain.InstallationFilter{
+		Search:     c.Query("search"),
+		PageParams: page,
+	}
+	items, total, err := h.runnerSvc.ListInstallations(c.Context(), filter)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": items, "total": total})
+	return sendPage(c, items, total, page)
 }
 
 func (h *FleetHandler) SyncInstallations(c fiber.Ctx) error {

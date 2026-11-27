@@ -14,6 +14,7 @@ import (
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/database"
+	"github.com/cubetiqlabs/runway/internal/eventstore"
 	"github.com/cubetiqlabs/runway/internal/github"
 	apphttp "github.com/cubetiqlabs/runway/internal/http"
 	"github.com/cubetiqlabs/runway/internal/logger"
@@ -66,6 +67,21 @@ func main() {
 		log.Fatal("failed to auto-migrate database schema", zap.Error(err))
 	}
 
+	evStore, err := eventstore.New(ctx, cfg.EventStore, db, log)
+	if err != nil {
+		log.Fatal("failed to initialize eventstore", zap.Error(err))
+	}
+	if err := evStore.EnsureSchema(ctx); err != nil {
+		log.Fatal("failed to initialize eventstore schema", zap.Error(err))
+	}
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		if closeErr := evStore.Close(closeCtx); closeErr != nil {
+			log.Warn("eventstore shutdown error", zap.Error(closeErr))
+		}
+	}()
+
 	ghAuth, err := github.NewAppAuth(cfg.GitHub.AppID, cfg.GitHub.PrivateKeyPEM, cfg.GitHub.PrivateKeyPath, cfg.GitHub.APIBaseURL, nil)
 	if err != nil {
 		log.Fatal("failed to initialize GitHub App auth", zap.Error(err))
@@ -78,7 +94,7 @@ func main() {
 	runnerRepo := repository.NewRunnerRepo(db)
 	jobRepo := repository.NewJobRepo(db)
 	policyRepo := repository.NewPolicyRepo(db)
-	auditRepo := repository.NewAuditRepo(db)
+	auditRepo := service.NewEventPublishingAuditRepo(repository.NewAuditRepo(db), evStore)
 	agentRepo := repository.NewAgentRepo(db)
 
 	encKey, err := crypto.ParseKey32(cfg.Security.EncryptionKey)
@@ -88,6 +104,7 @@ func main() {
 
 	engine := moderation.NewEngine(cfg.Moderation.DefaultAction)
 	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, runnerRepo, jobRepo, auditRepo, agentRepo, encKey)
+	orch.SetEventStore(evStore)
 	orch.Start(ctx)
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
@@ -105,12 +122,15 @@ func main() {
 	}
 
 	runnerSvc := service.NewRunnerService(cfg, ghClient, instRepo, poolRepo, runnerRepo, auditRepo, orch)
+	runnerSvc.SetJobRepo(jobRepo)
+	runnerSvc.SetEventStore(evStore)
 	if err := runnerSvc.SeedDefaultPools(ctx); err != nil {
 		log.Fatal("failed to seed default runner pools", zap.Error(err))
 	}
 
 	dispatcher := service.NewJobDispatcher(cfg, log, ghClient, instRepo, poolRepo, jobRepo, runnerRepo, agentRepo, auditRepo, orch)
 	agentSvc := service.NewAgentService(log, agentRepo, runnerRepo, jobRepo, auditRepo, poolRepo, encKey)
+	agentSvc.SetEventStore(evStore)
 	orch.SetSlotFreedHook(dispatcher.Trigger)
 	orch.SetRunnerCleanupHook(dispatcher.CleanupGitHubRunner)
 	runnerSvc.SetSlotFreedHook(dispatcher.Trigger)
@@ -123,6 +143,7 @@ func main() {
 
 	webhookSvc := service.NewWebhookService(cfg, log, ghClient, instRepo, poolRepo, policyRepo, jobRepo, runnerRepo, auditRepo, engine, orch, dispatcher)
 	dashboardSvc := service.NewDashboardService(cfg, ghClient, auditRepo, orch)
+	dashboardSvc.SetEventStore(evStore)
 	dispatcher.Start(ctx)
 
 	app, err := apphttp.NewServer(apphttp.ServerDeps{

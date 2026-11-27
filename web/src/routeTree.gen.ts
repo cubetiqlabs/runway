@@ -11,12 +11,14 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AgentsRouteImport } from './routes/agents'
+import { Route as EventsRouteImport } from './routes/events'
 import { Route as InstallationsRouteImport } from './routes/installations'
 import { Route as JobsRouteImport } from './routes/jobs'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as PoliciesRouteImport } from './routes/policies'
 import { Route as PoolsRouteImport } from './routes/pools'
 import { Route as RunnersRouteImport } from './routes/runners'
+import { Route as AgentsAgentIdRouteImport } from './routes/agents_.$agentId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -26,6 +28,11 @@ const IndexRoute = IndexRouteImport.update({
 const AgentsRoute = AgentsRouteImport.update({
   id: '/agents',
   path: '/agents',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const EventsRoute = EventsRouteImport.update({
+  id: '/events',
+  path: '/events',
   getParentRoute: () => rootRouteImport,
 } as any)
 const InstallationsRoute = InstallationsRouteImport.update({
@@ -58,80 +65,99 @@ const RunnersRoute = RunnersRouteImport.update({
   path: '/runners',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AgentsAgentIdRoute = AgentsAgentIdRouteImport.update({
+  id: '/agents_/$agentId',
+  path: '/agents/$agentId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/agents': typeof AgentsRoute
+  '/events': typeof EventsRoute
   '/installations': typeof InstallationsRoute
   '/jobs': typeof JobsRoute
   '/login': typeof LoginRoute
   '/policies': typeof PoliciesRoute
   '/pools': typeof PoolsRoute
   '/runners': typeof RunnersRoute
+  '/agents/$agentId': typeof AgentsAgentIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/agents': typeof AgentsRoute
+  '/events': typeof EventsRoute
   '/installations': typeof InstallationsRoute
   '/jobs': typeof JobsRoute
   '/login': typeof LoginRoute
   '/policies': typeof PoliciesRoute
   '/pools': typeof PoolsRoute
   '/runners': typeof RunnersRoute
+  '/agents/$agentId': typeof AgentsAgentIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/agents': typeof AgentsRoute
+  '/events': typeof EventsRoute
   '/installations': typeof InstallationsRoute
   '/jobs': typeof JobsRoute
   '/login': typeof LoginRoute
   '/policies': typeof PoliciesRoute
   '/pools': typeof PoolsRoute
   '/runners': typeof RunnersRoute
+  '/agents_/$agentId': typeof AgentsAgentIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
     | '/agents'
+    | '/events'
     | '/installations'
     | '/jobs'
     | '/login'
     | '/policies'
     | '/pools'
     | '/runners'
+    | '/agents/$agentId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/agents'
+    | '/events'
     | '/installations'
     | '/jobs'
     | '/login'
     | '/policies'
     | '/pools'
     | '/runners'
+    | '/agents/$agentId'
   id:
     | '__root__'
     | '/'
     | '/agents'
+    | '/events'
     | '/installations'
     | '/jobs'
     | '/login'
     | '/policies'
     | '/pools'
     | '/runners'
+    | '/agents_/$agentId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AgentsRoute: typeof AgentsRoute
+  EventsRoute: typeof EventsRoute
   InstallationsRoute: typeof InstallationsRoute
   JobsRoute: typeof JobsRoute
   LoginRoute: typeof LoginRoute
   PoliciesRoute: typeof PoliciesRoute
   PoolsRoute: typeof PoolsRoute
   RunnersRoute: typeof RunnersRoute
+  AgentsAgentIdRoute: typeof AgentsAgentIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -148,6 +174,13 @@ declare module '@tanstack/react-router' {
       path: '/agents'
       fullPath: '/agents'
       preLoaderRoute: typeof AgentsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/events': {
+      id: '/events'
+      path: '/events'
+      fullPath: '/events'
+      preLoaderRoute: typeof EventsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/installations': {
@@ -192,18 +225,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RunnersRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/agents_/$agentId': {
+      id: '/agents_/$agentId'
+      path: '/agents/$agentId'
+      fullPath: '/agents/$agentId'
+      preLoaderRoute: typeof AgentsAgentIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AgentsRoute: AgentsRoute,
+  EventsRoute: EventsRoute,
   InstallationsRoute: InstallationsRoute,
   JobsRoute: JobsRoute,
   LoginRoute: LoginRoute,
   PoliciesRoute: PoliciesRoute,
   PoolsRoute: PoolsRoute,
   RunnersRoute: RunnersRoute,
+  AgentsAgentIdRoute: AgentsAgentIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

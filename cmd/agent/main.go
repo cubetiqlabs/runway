@@ -72,6 +72,8 @@ func runWorker(args []string) int {
 	runnerVer := fs.String("runner-version", "", "Pin actions/runner version (default: latest)")
 	updateRepo := fs.String("update-repo", "", "GitHub repository for self-updates (owner/repo)")
 	noAutoUpdate := fs.Bool("no-auto-update", false, "Disable automatic background self-updates")
+	noCache := fs.Bool("no-cache", false, "Disable persistent build caches on this agent")
+	noPrewarm := fs.Bool("no-prewarm-images", false, "Disable background runner container image prewarming")
 	logLevel := fs.String("log-level", "info", "Log level (debug, info, warn, error)")
 	logFormat := fs.String("log-format", "console", "Log format (console or json)")
 	if err := fs.Parse(args); err != nil {
@@ -158,6 +160,12 @@ func runWorker(args []string) int {
 	}
 	if *noAutoUpdate {
 		cfg.AutoUpdate = false
+	}
+	if *noCache {
+		cfg.CacheEnabled = false
+	}
+	if *noPrewarm {
+		cfg.PrewarmImages = false
 	}
 
 	if err := cfg.NormalizeAndValidate(true); err != nil {
@@ -274,6 +282,8 @@ Flags (run):
   --log-dir <path>           Log directory for agent.log (RUNWAY_AGENT_LOG_DIR)
   --concurrency <n>          Max concurrent runner jobs (RUNWAY_AGENT_CONCURRENCY)
   --labels <a,b>             Extra comma-separated labels (RUNWAY_AGENT_LABELS)
+  --no-cache                 Disable persistent build caches on this host
+  --no-prewarm-images        Disable background container image prewarming
   --no-auto-update           Disable background auto-updates
   --config <path>            Optional env config file
 `, version)

@@ -162,6 +162,54 @@
   white-space: nowrap;
 }
 
+.runway-table thead th:has(> button) {
+  padding: 0;
+}
+
+.runway-table-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.375rem;
+  width: 100%;
+  min-height: 2.35rem;
+  padding: 0.65rem 0.75rem;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  text-align: left;
+  background: transparent;
+  border: 0;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.runway-table-sort-btn:hover {
+  color: var(--foreground);
+  background: color-mix(in oklch, var(--muted), transparent 55%);
+}
+
+.runway-table-sort-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.runway-table thead th[aria-sort] .runway-table-sort-btn {
+  color: var(--foreground);
+}
+
+.runway-table thead th .runway-sort-icon {
+  opacity: 0.35;
+  transition: transform 150ms ease, opacity 150ms ease;
+}
+
+.runway-table thead th[aria-sort] .runway-sort-icon {
+  opacity: 1;
+  color: var(--primary);
+}
+
+.runway-table thead th[aria-sort="descending"] .runway-sort-icon {
+  transform: rotate(180deg);
+}
+
 .runway-table tbody th[scope="row"] {
   position: sticky;
   inset-inline-start: 0;

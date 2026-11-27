@@ -29,7 +29,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { api } from "@/lib/api"
-import type { RunnerPool } from "@/lib/types"
+import type { BuildProfile, CacheScope, RunnerPool } from "@/lib/types"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/pools")({
@@ -50,6 +50,11 @@ interface PoolFormState {
   max_concurrency: string
   provider: "simulated" | "docker" | "agent"
   container_image: string
+  build_profile: BuildProfile
+  cache_enabled: boolean
+  cache_scope: CacheScope
+  cache_max_gb: string
+  sandbox_mode: string
   enabled: boolean
 }
 
@@ -66,11 +71,19 @@ const EMPTY_FORM: PoolFormState = {
   max_concurrency: "10",
   provider: "simulated",
   container_image: "ghcr.io/cubetiqlabs/runway-runner:latest",
+  build_profile: "fast",
+  cache_enabled: true,
+  cache_scope: "repo",
+  cache_max_gb: "20",
+  sandbox_mode: "auto",
   enabled: true,
 }
 
 function PoolsPage() {
   const [pools, setPools] = useState<RunnerPool[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const pageSize = 20
   const [dialogOpen, setDialogOpen] = useState(false)
   const [form, setForm] = useState<PoolFormState>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
@@ -78,12 +91,13 @@ function PoolsPage() {
 
   const load = useCallback(async () => {
     try {
-      const res = await api.listPools()
+      const res = await api.listPools({ limit: pageSize, page })
       setPools(res.items)
+      setTotal(res.total)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load runner pools")
     }
-  }, [])
+  }, [page])
 
   useEffect(() => {
     void load()
@@ -109,6 +123,11 @@ function PoolsPage() {
       max_concurrency: String(p.max_concurrency),
       provider: p.provider,
       container_image: p.container_image,
+      build_profile: p.build_profile || "standard",
+      cache_enabled: p.cache_enabled ?? true,
+      cache_scope: p.cache_scope || "repo",
+      cache_max_gb: String(p.cache_max_gb || 20),
+      sandbox_mode: p.sandbox_mode || "auto",
       enabled: p.enabled,
     })
     setDialogOpen(true)
@@ -137,6 +156,11 @@ function PoolsPage() {
       max_concurrency: Number(form.max_concurrency) || 10,
       provider: form.provider,
       container_image: form.container_image.trim(),
+      build_profile: form.build_profile,
+      cache_enabled: form.cache_enabled,
+      cache_scope: form.cache_scope,
+      cache_max_gb: Number(form.cache_max_gb) || 20,
+      sandbox_mode: form.sandbox_mode,
       enabled: form.enabled,
     }
     try {
@@ -178,13 +202,15 @@ function PoolsPage() {
     }
   }
 
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="font-heading text-xl font-semibold">Runner Pools</h1>
           <p className="text-xs text-muted-foreground">
-            Define Blacksmith-style ephemeral machine profiles, label matchers, and concurrency caps.
+            Define high-speed machine profiles, Ultra Build acceleration, isolated caching, and sandbox runtimes.
           </p>
         </div>
         <Button type="button" size="sm" onClick={openCreate}>
@@ -198,7 +224,15 @@ function PoolsPage() {
           <Card key={p.id}>
             <CardHeader className="flex flex-row items-start justify-between gap-3">
               <div>
-                <CardTitle>{p.name}</CardTitle>
+                <div className="flex flex-wrap items-center gap-2">
+                  <CardTitle>{p.name}</CardTitle>
+                  <Badge
+                    variant={p.build_profile === "ultra" ? "default" : "outline"}
+                    className="uppercase text-[10px]"
+                  >
+                    {p.build_profile || "standard"}
+                  </Badge>
+                </div>
                 <CardDescription className="font-mono text-[11px]">{p.slug}</CardDescription>
               </div>
               <Switch
@@ -216,7 +250,7 @@ function PoolsPage() {
                   </Badge>
                 ))}
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 border-t border-border pt-3 text-[11px]">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 border-t border-border pt-3 text-[11px]">
                 <div>
                   <span className="text-muted-foreground block">Compute</span>
                   <span className="font-medium">
@@ -228,8 +262,16 @@ function PoolsPage() {
                   <span className="font-medium">Max {p.max_concurrency}</span>
                 </div>
                 <div>
-                  <span className="text-muted-foreground block">Provider</span>
-                  <span className="font-medium capitalize">{p.provider}</span>
+                  <span className="text-muted-foreground block">Cache</span>
+                  <span className="font-medium capitalize">
+                    {p.cache_enabled ? `${p.cache_scope} (${p.cache_max_gb || 20}GB)` : "Off"}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground block">Provider / Sandbox</span>
+                  <span className="font-medium capitalize">
+                    {p.provider} · {p.sandbox_mode || "auto"}
+                  </span>
                 </div>
               </div>
               <div className="flex items-center justify-end gap-2 pt-1">
@@ -252,13 +294,41 @@ function PoolsPage() {
         ))}
       </div>
 
+      {total > pageSize && (
+        <div className="flex items-center justify-between border border-border bg-card px-3 py-2 text-xs">
+          <span className="text-muted-foreground">
+            Page {page} of {totalPages} ({total} pools)
+          </span>
+          <div className="flex items-center gap-1.5">
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => p - 1)}
+            >
+              Previous
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      )}
+
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{form.id ? "Edit Runner Pool" : "Create Runner Pool"}</DialogTitle>
             <DialogDescription>
-              Jobs whose GitHub Actions <code className="font-mono">runs-on</code> labels are a subset
-              of this pool&apos;s labels and slug will route here.
+              Jobs whose GitHub Actions <code className="font-mono">runs-on</code> labels match
+              this pool will route here with configured cache and Ultra Build optimizations.
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleSave} className="space-y-3">
@@ -270,7 +340,7 @@ function PoolsPage() {
                   required
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  placeholder="Ubuntu 24.04 · 16 vCPU"
+                  placeholder="Ubuntu 24.04 · 16 vCPU Ultra"
                 />
               </div>
               <div className="space-y-1">
@@ -411,6 +481,80 @@ function PoolsPage() {
                   autoCorrect="off"
                   autoCapitalize="none"
                   spellCheck={false}
+                />
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2 border-t border-border pt-3">
+              <div className="space-y-1">
+                <Label htmlFor="pool-build-profile">Build Speed Profile</Label>
+                <Select
+                  value={form.build_profile}
+                  onValueChange={(v) =>
+                    setForm({ ...form, build_profile: (v as BuildProfile) || "standard" })
+                  }
+                >
+                  <SelectTrigger id="pool-build-profile" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="standard">Standard</SelectItem>
+                    <SelectItem value="fast">Fast (tmpfs + BuildKit)</SelectItem>
+                    <SelectItem value="ultra">Ultra Build (tmpfs + DinD Layer Cache)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="pool-sandbox">Sandbox Mode</Label>
+                <Select
+                  value={form.sandbox_mode}
+                  onValueChange={(v) => setForm({ ...form, sandbox_mode: v || "auto" })}
+                >
+                  <SelectTrigger id="pool-sandbox" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Auto (gVisor if available)</SelectItem>
+                    <SelectItem value="gvisor">gVisor (runsc)</SelectItem>
+                    <SelectItem value="kata">Kata Containers</SelectItem>
+                    <SelectItem value="runc">Standard OCI (runc)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3 items-end">
+              <div className="flex items-center justify-between border border-border px-3 py-2">
+                <Label htmlFor="pool-cache-enabled">Persistent Cache</Label>
+                <Switch
+                  id="pool-cache-enabled"
+                  checked={form.cache_enabled}
+                  onCheckedChange={(checked) => setForm({ ...form, cache_enabled: checked })}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="pool-cache-scope">Cache Scope</Label>
+                <Select
+                  value={form.cache_scope}
+                  onValueChange={(v) => setForm({ ...form, cache_scope: (v as CacheScope) || "repo" })}
+                >
+                  <SelectTrigger id="pool-cache-scope" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="repo">Per-Repo (Isolated)</SelectItem>
+                    <SelectItem value="pool">Pool-Wide</SelectItem>
+                    <SelectItem value="none">Disabled</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="pool-cache-gb">Cache Max (GB)</Label>
+                <Input
+                  id="pool-cache-gb"
+                  inputMode="numeric"
+                  value={form.cache_max_gb}
+                  onChange={(e) => setForm({ ...form, cache_max_gb: e.target.value })}
                 />
               </div>
             </div>

@@ -15,12 +15,26 @@ type Config struct {
 	App          AppConfig          `mapstructure:"app"`
 	Server       ServerConfig       `mapstructure:"server"`
 	Database     DatabaseConfig     `mapstructure:"database"`
+	EventStore   EventStoreConfig   `mapstructure:"eventstore"`
 	GitHub       GitHubConfig       `mapstructure:"github"`
 	Security     SecurityConfig     `mapstructure:"security"`
 	Admin        AdminConfig        `mapstructure:"admin"`
 	Moderation   ModerationConfig   `mapstructure:"moderation"`
 	Orchestrator OrchestratorConfig `mapstructure:"orchestrator"`
 	Logging      LoggingConfig      `mapstructure:"logging"`
+}
+
+type EventStoreConfig struct {
+	Driver             string        `mapstructure:"driver"` // postgres | clickhouse | disabled
+	PostgresURL        string        `mapstructure:"postgres_url"`
+	ClickHouseURL      string        `mapstructure:"clickhouse_url"`
+	ClickHouseDatabase string        `mapstructure:"clickhouse_database"`
+	ClickHouseUsername string        `mapstructure:"clickhouse_username"`
+	ClickHousePassword string        `mapstructure:"clickhouse_password"`
+	BatchSize          int           `mapstructure:"batch_size"`
+	FlushInterval      time.Duration `mapstructure:"flush_interval"`
+	BufferSize         int           `mapstructure:"buffer_size"`
+	RetentionDays      int           `mapstructure:"retention_days"`
 }
 
 type AppConfig struct {
@@ -96,6 +110,9 @@ type OrchestratorConfig struct {
 	ReconcileInterval       time.Duration `mapstructure:"reconcile_interval"`
 	ProvisionTimeout        time.Duration `mapstructure:"provision_timeout"`
 	StaleHeartbeatTTL       time.Duration `mapstructure:"stale_heartbeat_ttl"`
+	CacheEnabled            bool          `mapstructure:"cache_enabled"`
+	CacheMaxGB              int           `mapstructure:"cache_max_gb"`
+	PrewarmImages           bool          `mapstructure:"prewarm_images"`
 }
 
 type LoggingConfig struct {
@@ -160,6 +177,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.max_conn_lifetime", "30m")
 	v.SetDefault("database.max_conn_idle_time", "5m")
 
+	v.SetDefault("eventstore.driver", "postgres")
+	v.SetDefault("eventstore.postgres_url", "")
+	v.SetDefault("eventstore.clickhouse_url", "")
+	v.SetDefault("eventstore.clickhouse_database", "runway")
+	v.SetDefault("eventstore.clickhouse_username", "default")
+	v.SetDefault("eventstore.clickhouse_password", "")
+	v.SetDefault("eventstore.batch_size", 256)
+	v.SetDefault("eventstore.flush_interval", "500ms")
+	v.SetDefault("eventstore.buffer_size", 8192)
+	v.SetDefault("eventstore.retention_days", 90)
+
 	v.SetDefault("github.app_slug", "runway")
 	v.SetDefault("github.api_base_url", "https://api.github.com")
 
@@ -190,6 +218,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("orchestrator.reconcile_interval", "30s")
 	v.SetDefault("orchestrator.provision_timeout", "3m")
 	v.SetDefault("orchestrator.stale_heartbeat_ttl", "5m")
+	v.SetDefault("orchestrator.cache_enabled", true)
+	v.SetDefault("orchestrator.cache_max_gb", 20)
+	v.SetDefault("orchestrator.prewarm_images", true)
 
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")
@@ -205,6 +236,9 @@ func bindEnvKeys(v *viper.Viper) {
 		"server.allowed_origins", "server.trusted_proxies",
 		"database.url", "database.max_conns", "database.min_conns",
 		"database.max_conn_lifetime", "database.max_conn_idle_time",
+		"eventstore.driver", "eventstore.postgres_url", "eventstore.clickhouse_url",
+		"eventstore.clickhouse_database", "eventstore.clickhouse_username", "eventstore.clickhouse_password",
+		"eventstore.batch_size", "eventstore.flush_interval", "eventstore.buffer_size", "eventstore.retention_days",
 		"github.app_id", "github.app_slug", "github.client_id",
 		"github.webhook_secret", "github.private_key_pem", "github.private_key_path",
 		"github.api_base_url",
@@ -221,6 +255,7 @@ func bindEnvKeys(v *viper.Viper) {
 		"orchestrator.worker_count", "orchestrator.queue_size",
 		"orchestrator.reconcile_interval", "orchestrator.provision_timeout",
 		"orchestrator.stale_heartbeat_ttl",
+		"orchestrator.cache_enabled", "orchestrator.cache_max_gb", "orchestrator.prewarm_images",
 		"logging.level", "logging.format",
 	}
 	for _, k := range keys {
@@ -288,6 +323,31 @@ func (c *Config) validateAndNormalize() error {
 	}
 	if c.Orchestrator.QueueSize < 8 {
 		c.Orchestrator.QueueSize = 8
+	}
+
+	c.EventStore.Driver = strings.ToLower(strings.TrimSpace(c.EventStore.Driver))
+	if c.EventStore.Driver == "" {
+		c.EventStore.Driver = "postgres"
+	}
+	switch c.EventStore.Driver {
+	case "postgres", "clickhouse", "disabled":
+	default:
+		return fmt.Errorf("invalid eventstore.driver %q: must be 'postgres', 'clickhouse', or 'disabled'", c.EventStore.Driver)
+	}
+	if c.EventStore.Driver == "clickhouse" && strings.TrimSpace(c.EventStore.ClickHouseURL) == "" {
+		return fmt.Errorf("eventstore.clickhouse_url (RUNWAY_EVENTSTORE_CLICKHOUSE_URL) is required when eventstore.driver is 'clickhouse'")
+	}
+	if c.EventStore.BatchSize < 1 {
+		c.EventStore.BatchSize = 256
+	}
+	if c.EventStore.BufferSize < 64 {
+		c.EventStore.BufferSize = 8192
+	}
+	if c.EventStore.FlushInterval <= 0 {
+		c.EventStore.FlushInterval = 500 * time.Millisecond
+	}
+	if c.EventStore.RetentionDays < 1 {
+		c.EventStore.RetentionDays = 90
 	}
 
 	return nil

@@ -80,6 +80,11 @@ type RunnerPool struct {
 	RunnerGroupID  int64     `json:"runner_group_id"`
 	Provider       string    `json:"provider"`
 	ContainerImage string    `json:"container_image"`
+	BuildProfile   string    `json:"build_profile"`
+	CacheEnabled   bool      `json:"cache_enabled"`
+	CacheScope     string    `json:"cache_scope"`
+	CacheMaxGB     int       `json:"cache_max_gb"`
+	SandboxMode    string    `json:"sandbox_mode"`
 	Enabled        bool      `json:"enabled"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
@@ -245,30 +250,90 @@ type AgentStatus string
 const (
 	AgentOnline   AgentStatus = "online"
 	AgentDraining AgentStatus = "draining"
+	AgentDrained  AgentStatus = "drained"
 	AgentOffline  AgentStatus = "offline"
 )
 
+type AgentMetricsSnapshot struct {
+	CPUUsagePercent    float64   `json:"cpu_usage_percent"`
+	MemoryTotalMB      int       `json:"memory_total_mb"`
+	MemoryUsedMB       int       `json:"memory_used_mb"`
+	MemoryUsagePercent float64   `json:"memory_usage_percent"`
+	DiskTotalGB        float64   `json:"disk_total_gb"`
+	DiskUsedGB         float64   `json:"disk_used_gb"`
+	DiskFreeGB         float64   `json:"disk_free_gb"`
+	DiskUsagePercent   float64   `json:"disk_usage_percent"`
+	LoadAvg1           float64   `json:"load_avg_1"`
+	LoadAvg5           float64   `json:"load_avg_5"`
+	LoadAvg15          float64   `json:"load_avg_15"`
+	UptimeSec          int64     `json:"uptime_sec"`
+	HostUptimeSec      int64     `json:"host_uptime_sec"`
+	SandboxRuntime     string    `json:"sandbox_runtime,omitempty"`
+	IsolatedDinD       bool      `json:"isolated_dind"`
+	CacheHitCount      int64     `json:"cache_hit_count"`
+	CacheMissCount     int64     `json:"cache_miss_count"`
+	CacheSizeMB        int64     `json:"cache_size_mb"`
+	TasksCompleted     int64     `json:"tasks_completed"`
+	TasksFailed        int64     `json:"tasks_failed"`
+	TasksCancelled     int64     `json:"tasks_cancelled"`
+	AvgTaskDurationMS  int64     `json:"avg_task_duration_ms"`
+	CollectedAt        time.Time `json:"collected_at"`
+}
+
+type AgentTaskStats struct {
+	TotalTasks     int64   `json:"total_tasks"`
+	CompletedTasks int64   `json:"completed_tasks"`
+	FailedTasks    int64   `json:"failed_tasks"`
+	CancelledTasks int64   `json:"cancelled_tasks"`
+	ActiveTasks    int64   `json:"active_tasks"`
+	Tasks24h       int64   `json:"tasks_24h"`
+	SuccessRate    float64 `json:"success_rate"`
+	AvgDurationMS  int64   `json:"avg_duration_ms"`
+	P95DurationMS  int64   `json:"p95_duration_ms"`
+}
+
+type AgentMetricPoint struct {
+	Timestamp          time.Time `json:"timestamp"`
+	CPUUsagePercent    float64   `json:"cpu_usage_percent"`
+	MemoryUsagePercent float64   `json:"memory_usage_percent"`
+	DiskUsagePercent   float64   `json:"disk_usage_percent"`
+	MemoryUsedMB       int       `json:"memory_used_mb"`
+	ActiveJobs         int       `json:"active_jobs"`
+	LoadAvg1           float64   `json:"load_avg_1"`
+	CacheHitCount      int64     `json:"cache_hit_count"`
+	CacheMissCount     int64     `json:"cache_miss_count"`
+}
+
 type Agent struct {
-	ID              uuid.UUID   `json:"id"`
-	Name            string      `json:"name"`
-	TokenPrefix     string      `json:"token_prefix"`
-	TokenHash       string      `json:"-"`
-	OS              string      `json:"os"`
-	Arch            string      `json:"arch"`
-	Runtime         string      `json:"runtime"`
-	Labels          []string    `json:"labels"`
-	PoolID          *uuid.UUID  `json:"pool_id,omitempty"`
-	PoolName        string      `json:"pool_name,omitempty"`
-	Version         string      `json:"version"`
-	Hostname        string      `json:"hostname"`
-	CPUCount        int         `json:"cpu_count"`
-	MemoryMB        int         `json:"memory_mb"`
-	MaxConcurrency  int         `json:"max_concurrency"`
-	ActiveJobs      int         `json:"active_jobs"`
-	Status          AgentStatus `json:"status"`
-	LastHeartbeatAt *time.Time  `json:"last_heartbeat_at,omitempty"`
-	CreatedAt       time.Time   `json:"created_at"`
-	UpdatedAt       time.Time   `json:"updated_at"`
+	ID              uuid.UUID       `json:"id"`
+	Name            string          `json:"name"`
+	TokenPrefix     string          `json:"token_prefix"`
+	TokenHash       string          `json:"-"`
+	OS              string          `json:"os"`
+	Arch            string          `json:"arch"`
+	Runtime         string          `json:"runtime"`
+	SandboxRuntime  string          `json:"sandbox_runtime,omitempty"`
+	Labels          []string        `json:"labels"`
+	PoolID          *uuid.UUID      `json:"pool_id,omitempty"`
+	PoolName        string          `json:"pool_name,omitempty"`
+	Version         string          `json:"version"`
+	Hostname        string          `json:"hostname"`
+	CPUCount        int             `json:"cpu_count"`
+	MemoryMB        int             `json:"memory_mb"`
+	MaxConcurrency  int             `json:"max_concurrency"`
+	ActiveJobs      int             `json:"active_jobs"`
+	Status          AgentStatus     `json:"status"`
+	Metrics         json.RawMessage `json:"metrics"`
+	LastHeartbeatAt *time.Time      `json:"last_heartbeat_at,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+}
+
+type AgentDetail struct {
+	Agent         Agent              `json:"agent"`
+	Stats         AgentTaskStats     `json:"stats"`
+	MetricHistory []AgentMetricPoint `json:"metric_history"`
+	RecentTasks   []AgentTask        `json:"recent_tasks"`
 }
 
 type AgentTaskStatus string
@@ -298,6 +363,11 @@ type AgentTask struct {
 	ContainerImage            string          `json:"container_image"`
 	VCPU                      int             `json:"vcpu"`
 	MemoryMB                  int             `json:"memory_mb"`
+	IsForkPR                  bool            `json:"is_fork_pr"`
+	BuildProfile              string          `json:"build_profile"`
+	CacheEnabled              bool            `json:"cache_enabled"`
+	CacheScope                string          `json:"cache_scope"`
+	SandboxMode               string          `json:"sandbox_mode"`
 	EncodedJITConfigEncrypted []byte          `json:"-"`
 	Status                    AgentTaskStatus `json:"status"`
 	ErrorMessage              string          `json:"error_message"`
@@ -305,4 +375,61 @@ type AgentTask struct {
 	CompletedAt               *time.Time      `json:"completed_at,omitempty"`
 	CreatedAt                 time.Time       `json:"created_at"`
 	UpdatedAt                 time.Time       `json:"updated_at"`
+}
+
+const (
+	EventCategoryWebhook         = "webhook"
+	EventCategoryAudit           = "audit"
+	EventCategoryRunnerLog       = "runner_log"
+	EventCategoryRunnerLifecycle = "runner_lifecycle"
+	EventCategoryJobLifecycle    = "job_lifecycle"
+	EventCategoryAgentLifecycle  = "agent_lifecycle"
+	EventCategoryAgentMetric     = "agent_metric"
+	EventCategorySystem          = "system"
+)
+
+type Event struct {
+	ID            uuid.UUID       `json:"id"`
+	OccurredAt    time.Time       `json:"occurred_at"`
+	Category      string          `json:"category"`
+	EventType     string          `json:"event_type"`
+	Severity      string          `json:"severity"`
+	Source        string          `json:"source"`
+	ActorType     string          `json:"actor_type"`
+	ActorID       string          `json:"actor_id"`
+	ActorLabel    string          `json:"actor_label"`
+	ResourceType  string          `json:"resource_type"`
+	ResourceID    string          `json:"resource_id"`
+	CorrelationID string          `json:"correlation_id"`
+	RepoFullName  string          `json:"repo_full_name"`
+	DurationMS    int64           `json:"duration_ms"`
+	Status        string          `json:"status"`
+	Message       string          `json:"message"`
+	Payload       json.RawMessage `json:"payload"`
+	IPAddress     string          `json:"ip_address"`
+	SchemaVersion int             `json:"schema_version"`
+}
+
+type EventIngestionStats struct {
+	Published      int64 `json:"published"`
+	Flushed        int64 `json:"flushed"`
+	Dropped        int64 `json:"dropped"`
+	BatchErrors    int64 `json:"batch_errors"`
+	QueueDepth     int   `json:"queue_depth"`
+	BufferCapacity int   `json:"buffer_capacity"`
+}
+
+type EventSummary struct {
+	Driver      string              `json:"driver"`
+	TotalEvents int64               `json:"total_events"`
+	ByCategory  map[string]int64    `json:"by_category"`
+	BySeverity  map[string]int64    `json:"by_severity"`
+	Ingestion   EventIngestionStats `json:"ingestion"`
+}
+
+type RunnerLogEntry struct {
+	Timestamp time.Time `json:"timestamp"`
+	Stream    string    `json:"stream"`
+	Level     string    `json:"level"`
+	Line      string    `json:"line"`
 }

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/domain"
+	"github.com/cubetiqlabs/runway/internal/eventstore"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -20,6 +22,7 @@ type AgentService struct {
 	jobRepo    domain.JobRepository
 	auditRepo  domain.AuditRepository
 	poolRepo   domain.PoolRepository
+	eventStore eventstore.Store
 	encKey     []byte
 
 	hookMu      sync.RWMutex
@@ -43,6 +46,21 @@ func NewAgentService(
 		auditRepo:  auditRepo,
 		poolRepo:   poolRepo,
 		encKey:     encKey,
+	}
+}
+
+func (s *AgentService) SetEventStore(es eventstore.Store) {
+	s.hookMu.Lock()
+	s.eventStore = es
+	s.hookMu.Unlock()
+}
+
+func (s *AgentService) emitEvent(ev domain.Event) {
+	s.hookMu.RLock()
+	es := s.eventStore
+	s.hookMu.RUnlock()
+	if es != nil {
+		es.Publish(ev)
 	}
 }
 
@@ -144,16 +162,124 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 	return &RegisterAgentResponse{Agent: *out, Token: rawToken}, nil
 }
 
-func (s *AgentService) ListAgents(ctx context.Context, page domain.PageParams) ([]domain.Agent, int, error) {
-	return s.agentRepo.List(ctx, page)
+func (s *AgentService) ListAgents(ctx context.Context, filter domain.AgentFilter) ([]domain.Agent, int, error) {
+	return s.agentRepo.List(ctx, filter)
 }
 
 func (s *AgentService) DrainAgent(ctx context.Context, id uuid.UUID, actor *domain.User, ip string) (*domain.Agent, error) {
-	if err := s.agentRepo.UpdateStatus(ctx, id, domain.AgentDraining); err != nil {
+	ag, err := s.agentRepo.GetByID(ctx, id)
+	if err != nil {
 		return nil, err
 	}
-	s.appendAudit(ctx, actor, "agent.drained", "agent", id.String(), nil, ip)
+	activeTasks, _ := s.agentRepo.CountActiveTasksByAgent(ctx, id)
+	nextStatus := domain.AgentDraining
+	auditAction := "agent.draining"
+	if activeTasks == 0 && ag.ActiveJobs == 0 {
+		nextStatus = domain.AgentDrained
+		auditAction = "agent.drained"
+	}
+	if err := s.agentRepo.UpdateStatus(ctx, id, nextStatus); err != nil {
+		return nil, err
+	}
+	s.appendAudit(ctx, actor, auditAction, "agent", id.String(), map[string]any{"name": ag.Name, "status": nextStatus}, ip)
+	s.emitEvent(domain.Event{
+		Category:     domain.EventCategoryAgentLifecycle,
+		EventType:    auditAction,
+		Severity:     "info",
+		Source:       "control-plane",
+		ActorLabel:   actorEmail(actor),
+		ResourceType: "agent",
+		ResourceID:   id.String(),
+		Status:       string(nextStatus),
+		Message:      fmt.Sprintf("Agent %s transitioned to %s", ag.Name, nextStatus),
+		IPAddress:    ip,
+	})
 	return s.agentRepo.GetByID(ctx, id)
+}
+
+func (s *AgentService) ResumeAgent(ctx context.Context, id uuid.UUID, actor *domain.User, ip string) (*domain.Agent, error) {
+	ag, err := s.agentRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	nextStatus := domain.AgentOffline
+	if ag.LastHeartbeatAt != nil && time.Since(*ag.LastHeartbeatAt) < 2*time.Minute {
+		nextStatus = domain.AgentOnline
+	}
+	if err := s.agentRepo.UpdateStatus(ctx, id, nextStatus); err != nil {
+		return nil, err
+	}
+	s.appendAudit(ctx, actor, "agent.resumed", "agent", id.String(), map[string]any{"name": ag.Name, "status": nextStatus}, ip)
+	s.emitEvent(domain.Event{
+		Category:     domain.EventCategoryAgentLifecycle,
+		EventType:    "agent.resumed",
+		Severity:     "info",
+		Source:       "control-plane",
+		ActorLabel:   actorEmail(actor),
+		ResourceType: "agent",
+		ResourceID:   id.String(),
+		Status:       string(nextStatus),
+		Message:      fmt.Sprintf("Agent %s resumed (%s)", ag.Name, nextStatus),
+		IPAddress:    ip,
+	})
+	if nextStatus == domain.AgentOnline {
+		s.notifySlotFreed()
+	}
+	return s.agentRepo.GetByID(ctx, id)
+}
+
+func (s *AgentService) GetAgentDetail(ctx context.Context, id uuid.UUID, window time.Duration) (*domain.AgentDetail, error) {
+	ag, err := s.agentRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	stats, err := s.agentRepo.GetAgentTaskStats(ctx, id)
+	if err != nil || stats == nil {
+		stats = &domain.AgentTaskStats{}
+	}
+	tasks, _, _ := s.agentRepo.ListTasksByAgent(ctx, id, domain.AgentTaskFilter{
+		PageParams: domain.PageParams{Limit: 10, Offset: 0},
+	})
+	if tasks == nil {
+		tasks = []domain.AgentTask{}
+	}
+	history, _ := s.GetAgentMetrics(ctx, id, window, 240)
+	if history == nil {
+		history = []domain.AgentMetricPoint{}
+	}
+	return &domain.AgentDetail{
+		Agent:         *ag,
+		Stats:         *stats,
+		MetricHistory: history,
+		RecentTasks:   tasks,
+	}, nil
+}
+
+func (s *AgentService) ListAgentTasks(ctx context.Context, id uuid.UUID, filter domain.AgentTaskFilter) ([]domain.AgentTask, int, error) {
+	if _, err := s.agentRepo.GetByID(ctx, id); err != nil {
+		return nil, 0, err
+	}
+	return s.agentRepo.ListTasksByAgent(ctx, id, filter)
+}
+
+func (s *AgentService) GetAgentMetrics(ctx context.Context, id uuid.UUID, window time.Duration, limit int) ([]domain.AgentMetricPoint, error) {
+	if window <= 0 {
+		window = time.Hour
+	}
+	s.hookMu.RLock()
+	es := s.eventStore
+	s.hookMu.RUnlock()
+	if es == nil {
+		return []domain.AgentMetricPoint{}, nil
+	}
+	return es.QueryAgentMetrics(ctx, id, time.Now().UTC().Add(-window), limit)
+}
+
+func actorEmail(u *domain.User) string {
+	if u != nil {
+		return u.Email
+	}
+	return "system"
 }
 
 func (s *AgentService) RotateToken(ctx context.Context, id uuid.UUID, actor *domain.User, ip string) (*RegisterAgentResponse, error) {
@@ -194,16 +320,18 @@ func (s *AgentService) AuthenticateAgent(ctx context.Context, rawBearer string) 
 }
 
 type AgentHeartbeatInput struct {
-	OS             string   `json:"os"`
-	Arch           string   `json:"arch"`
-	Runtime        string   `json:"runtime"`
-	Version        string   `json:"version"`
-	Hostname       string   `json:"hostname"`
-	CPUCount       int      `json:"cpu_count"`
-	MemoryMB       int      `json:"memory_mb"`
-	MaxConcurrency int      `json:"max_concurrency"`
-	ActiveJobs     int      `json:"active_jobs"`
-	Labels         []string `json:"labels"`
+	OS             string                       `json:"os"`
+	Arch           string                       `json:"arch"`
+	Runtime        string                       `json:"runtime"`
+	SandboxRuntime string                       `json:"sandbox_runtime,omitempty"`
+	Version        string                       `json:"version"`
+	Hostname       string                       `json:"hostname"`
+	CPUCount       int                          `json:"cpu_count"`
+	MemoryMB       int                          `json:"memory_mb"`
+	MaxConcurrency int                          `json:"max_concurrency"`
+	ActiveJobs     int                          `json:"active_jobs"`
+	Labels         []string                     `json:"labels"`
+	Metrics        *domain.AgentMetricsSnapshot `json:"metrics,omitempty"`
 }
 
 type AgentHeartbeatResponse struct {
@@ -221,6 +349,9 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 	}
 	if in.Runtime != "" {
 		update.Runtime = strings.ToLower(strings.TrimSpace(in.Runtime))
+	}
+	if in.SandboxRuntime != "" {
+		update.SandboxRuntime = strings.ToLower(strings.TrimSpace(in.SandboxRuntime))
 	}
 	if in.Version != "" {
 		update.Version = strings.TrimSpace(in.Version)
@@ -241,6 +372,11 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 	if len(in.Labels) > 0 {
 		update.Labels = in.Labels
 	}
+	if in.Metrics != nil {
+		if rawMetrics, mErr := json.Marshal(in.Metrics); mErr == nil {
+			update.Metrics = rawMetrics
+		}
+	}
 
 	wasOffline := agent.Status == domain.AgentOffline
 	if err := s.agentRepo.UpdateHeartbeat(ctx, &update); err != nil {
@@ -253,6 +389,48 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 	} else if status == domain.AgentOffline {
 		status = domain.AgentOnline
 	}
+
+	if status == domain.AgentDraining && in.ActiveJobs == 0 {
+		if transitioned, trErr := s.agentRepo.MarkDrainingCompleteIfIdle(ctx, agent.ID); trErr == nil && transitioned {
+			status = domain.AgentDrained
+			s.emitEvent(domain.Event{
+				Category:     domain.EventCategoryAgentLifecycle,
+				EventType:    "agent.drained",
+				Severity:     "info",
+				Source:       "agent-heartbeat",
+				ResourceType: "agent",
+				ResourceID:   agent.ID.String(),
+				Status:       string(domain.AgentDrained),
+				Message:      fmt.Sprintf("Agent %s completed draining", agent.Name),
+			})
+		}
+	}
+
+	if in.Metrics != nil {
+		metricPayload, _ := json.Marshal(map[string]any{
+			"cpu_usage_percent":    in.Metrics.CPUUsagePercent,
+			"memory_usage_percent": in.Metrics.MemoryUsagePercent,
+			"disk_usage_percent":   in.Metrics.DiskUsagePercent,
+			"memory_used_mb":       in.Metrics.MemoryUsedMB,
+			"active_jobs":          in.ActiveJobs,
+			"load_avg_1":           in.Metrics.LoadAvg1,
+			"cache_hit_count":      in.Metrics.CacheHitCount,
+			"cache_miss_count":     in.Metrics.CacheMissCount,
+		})
+		s.emitEvent(domain.Event{
+			Category:     domain.EventCategoryAgentMetric,
+			EventType:    "agent.metrics",
+			Severity:     "info",
+			Source:       "runway-agent",
+			ActorLabel:   agent.Name,
+			ResourceType: "agent",
+			ResourceID:   agent.ID.String(),
+			Status:       string(status),
+			Message:      fmt.Sprintf("CPU %.1f%% · RAM %.1f%% · Disk %.1f%%", in.Metrics.CPUUsagePercent, in.Metrics.MemoryUsagePercent, in.Metrics.DiskUsagePercent),
+			Payload:      metricPayload,
+		})
+	}
+
 	if wasOffline && status == domain.AgentOnline {
 		s.notifySlotFreed()
 	}
@@ -279,11 +457,16 @@ type ClaimedTaskPayload struct {
 	ContainerImage   string    `json:"container_image"`
 	VCPU             int       `json:"vcpu"`
 	MemoryMB         int       `json:"memory_mb"`
+	IsForkPR         bool      `json:"is_fork_pr"`
+	BuildProfile     string    `json:"build_profile"`
+	CacheEnabled     bool      `json:"cache_enabled"`
+	CacheScope       string    `json:"cache_scope"`
+	SandboxMode      string    `json:"sandbox_mode"`
 	EncodedJITConfig string    `json:"encoded_jit_config"`
 }
 
 func (s *AgentService) ClaimTask(ctx context.Context, agent *domain.Agent) (*ClaimedTaskPayload, error) {
-	if agent.Status == domain.AgentDraining {
+	if agent.Status == domain.AgentDraining || agent.Status == domain.AgentDrained {
 		return nil, nil
 	}
 	task, err := s.agentRepo.ClaimNextTask(ctx, agent)
@@ -323,8 +506,51 @@ func (s *AgentService) ClaimTask(ctx context.Context, agent *domain.Agent) (*Cla
 		ContainerImage:   task.ContainerImage,
 		VCPU:             task.VCPU,
 		MemoryMB:         task.MemoryMB,
+		IsForkPR:         task.IsForkPR,
+		BuildProfile:     task.BuildProfile,
+		CacheEnabled:     task.CacheEnabled,
+		CacheScope:       task.CacheScope,
+		SandboxMode:      task.SandboxMode,
 		EncodedJITConfig: string(plainJIT),
 	}, nil
+}
+
+func (s *AgentService) IngestTaskLogs(ctx context.Context, agent *domain.Agent, taskID uuid.UUID, entries []domain.RunnerLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	task, err := s.agentRepo.GetTaskByID(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.AgentID == nil || *task.AgentID != agent.ID {
+		return domain.ErrForbidden
+	}
+	for _, entry := range entries {
+		stream := entry.Stream
+		if stream == "" {
+			stream = "stdout"
+		}
+		lvl := entry.Level
+		if lvl == "" {
+			lvl = "info"
+		}
+		s.emitEvent(domain.Event{
+			OccurredAt:    entry.Timestamp,
+			Category:      domain.EventCategoryRunnerLog,
+			EventType:     "runner.log." + stream,
+			Severity:      lvl,
+			Source:        "runway-agent",
+			ActorLabel:    agent.Name,
+			ResourceType:  "runner",
+			ResourceID:    task.RunnerID.String(),
+			CorrelationID: task.JobID.String(),
+			RepoFullName:  task.RepoFullName,
+			Status:        string(task.Status),
+			Message:       entry.Line,
+		})
+	}
+	return nil
 }
 
 func (s *AgentService) CompleteTask(ctx context.Context, agent *domain.Agent, taskID uuid.UUID, status domain.AgentTaskStatus, errMsg string) error {
@@ -363,6 +589,18 @@ func (s *AgentService) CompleteTask(ctx context.Context, agent *domain.Agent, ta
 			"github_job_id": task.GitHubJobID,
 			"error":         strings.TrimSpace(errMsg),
 		}, "")
+	}
+	if transitioned, trErr := s.agentRepo.MarkDrainingCompleteIfIdle(ctx, agent.ID); trErr == nil && transitioned {
+		s.emitEvent(domain.Event{
+			Category:     domain.EventCategoryAgentLifecycle,
+			EventType:    "agent.drained",
+			Severity:     "info",
+			Source:       "control-plane",
+			ResourceType: "agent",
+			ResourceID:   agent.ID.String(),
+			Status:       string(domain.AgentDrained),
+			Message:      fmt.Sprintf("Agent %s completed draining after task %s", agent.Name, task.RunnerName),
+		})
 	}
 	s.notifySlotFreed()
 	return nil

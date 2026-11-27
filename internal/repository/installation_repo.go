@@ -41,14 +41,23 @@ func (r *InstallationRepo) Upsert(ctx context.Context, inst *domain.Installation
 	return nil
 }
 
-func (r *InstallationRepo) List(ctx context.Context, page domain.PageParams) ([]domain.Installation, int, error) {
-	var total int64
+func (r *InstallationRepo) List(ctx context.Context, filter domain.InstallationFilter) ([]domain.Installation, int, error) {
 	q := r.db.WithContext(ctx).Model(&InstallationModel{})
+	if like := sanitizeLike(filter.Search); like != "" {
+		q = q.Where(`(account_login ILIKE ? ESCAPE '\' OR account_type ILIKE ? ESCAPE '\')`, like, like)
+	}
+	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
+	sortCols := map[string]string{
+		"id":            "id",
+		"account_login": "account_login",
+		"account_type":  "account_type",
+		"updated_at":    "updated_at",
+	}
 	var models []InstallationModel
-	if err := q.Order("updated_at DESC").Scopes(paginate(page)).Find(&models).Error; err != nil {
+	if err := q.Scopes(applySort(filter.PageParams, sortCols, "updated_at DESC"), paginate(filter.PageParams)).Find(&models).Error; err != nil {
 		return nil, 0, mapGormError(err)
 	}
 	items := make([]domain.Installation, 0, len(models))

@@ -3,11 +3,13 @@ package agent
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,54 +18,62 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cubetiqlabs/runway/internal/domain"
+	"github.com/cubetiqlabs/runway/internal/orchestrator"
 )
 
 type NativeExecutor struct {
 	workDir       string
 	runnerVersion string
+	cacheEnabled  bool
 	httpClient    *http.Client
+	cache         *orchestrator.CacheManager
 
 	mu            sync.Mutex
 	cachedVersion string
 	cachedAt      time.Time
 }
 
-func NewNativeExecutor(workDir, runnerVersion string) *NativeExecutor {
+func NewNativeExecutor(workDir, runnerVersion string, cacheEnabled bool) *NativeExecutor {
 	return &NativeExecutor{
 		workDir:       workDir,
 		runnerVersion: strings.TrimPrefix(strings.TrimSpace(runnerVersion), "v"),
+		cacheEnabled:  cacheEnabled,
 		httpClient:    &http.Client{Timeout: 5 * time.Minute},
+		cache:         orchestrator.NewCacheManager(),
 	}
 }
 
+func (e *NativeExecutor) CacheStats() (hits, misses int64) {
+	if e.cache == nil {
+		return 0, 0
+	}
+	return e.cache.Stats()
+}
+
 func (e *NativeExecutor) Execute(ctx context.Context, task *TaskPayload) error {
+	return e.ExecuteWithLogs(ctx, task, nil)
+}
+
+func (e *NativeExecutor) ExecuteWithLogs(ctx context.Context, task *TaskPayload, logSink func([]domain.RunnerLogEntry)) error {
 	if strings.TrimSpace(task.EncodedJITConfig) == "" {
 		return fmt.Errorf("task missing encoded_jit_config")
 	}
 
-	archivePath, isZip, err := e.ensureRunnerArchive(ctx)
+	templateDir, err := e.ensureUnpackedTemplate(ctx)
 	if err != nil {
 		return err
 	}
 
 	jobDir := filepath.Join(e.workDir, "jobs", sanitizePathSegment(task.RunnerName))
 	_ = os.RemoveAll(jobDir)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		return fmt.Errorf("create job directory: %w", err)
+	if err := cloneTemplateDir(templateDir, jobDir); err != nil {
+		return fmt.Errorf("prepare job directory from template: %w", err)
 	}
 	defer func() {
 		_ = os.RemoveAll(jobDir)
 	}()
-
-	if isZip {
-		if err := extractZip(archivePath, jobDir); err != nil {
-			return fmt.Errorf("extract windows actions-runner: %w", err)
-		}
-	} else {
-		if err := extractTarGz(archivePath, jobDir); err != nil {
-			return fmt.Errorf("extract actions-runner: %w", err)
-		}
-	}
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -74,33 +84,234 @@ func (e *NativeExecutor) Execute(ctx context.Context, task *TaskPayload) error {
 		cmd = exec.CommandContext(ctx, "/bin/sh", runScript, "--jitconfig", task.EncodedJITConfig)
 	}
 	cmd.Dir = jobDir
-	cmd.Env = append(os.Environ(), "CI=true")
+	env := append(os.Environ(), "CI=true")
+	if e.cacheEnabled && task.CacheEnabled && !task.IsForkPR && strings.ToLower(strings.TrimSpace(task.CacheScope)) != "none" && e.cache != nil {
+		scopeKey := e.cache.ScopeKey(task.PoolSlug, task.RepoFullName, task.CacheScope)
+		if scopeKey != "" {
+			cacheRoot := filepath.Join(e.workDir, "build-cache", scopeKey)
+			_, statErr := os.Stat(cacheRoot)
+			existed := statErr == nil
+			if mkErr := os.MkdirAll(cacheRoot, 0o755); mkErr == nil {
+				e.cache.TrackVolumeHitMiss(cacheRoot, existed)
+				for _, sub := range []string{"gomod", "gocache", "npm", "bun", "pip", "cargo", "ccache", "sccache", "toolcache"} {
+					_ = os.MkdirAll(filepath.Join(cacheRoot, sub), 0o755)
+				}
+				vcpu := task.VCPU
+				if vcpu <= 0 {
+					vcpu = runtime.NumCPU()
+				}
+				env = append(env, orchestrator.CacheEnvVars(cacheRoot, task.BuildProfile, vcpu)...)
+			}
+		}
+	}
+	cmd.Env = env
 
 	var outBuf cappedTailBuffer
 	outBuf.maxBytes = 8192
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &outBuf
 
-	if err := cmd.Run(); err != nil {
-		tail := strings.TrimSpace(outBuf.String())
-		if tail != "" {
-			// Scrub JIT config token if echoed.
-			tail = strings.ReplaceAll(tail, task.EncodedJITConfig, "[REDACTED]")
-			return fmt.Errorf("runner exited with %v: %s", err, tail)
+	if logSink == nil {
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &outBuf
+		if err := cmd.Run(); err != nil {
+			return formatRunnerExitError(err, outBuf.String(), task.EncodedJITConfig)
 		}
-		return fmt.Errorf("runner exited: %w", err)
+		return nil
+	}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	var logWG sync.WaitGroup
+	logCh := make(chan domain.RunnerLogEntry, 256)
+	readStream := func(r io.Reader, streamName, lvl string) {
+		defer logWG.Done()
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			if task.EncodedJITConfig != "" {
+				line = strings.ReplaceAll(line, task.EncodedJITConfig, "[REDACTED]")
+			}
+			_, _ = outBuf.Write([]byte(line + "\n"))
+			select {
+			case logCh <- domain.RunnerLogEntry{
+				Timestamp: time.Now().UTC(),
+				Stream:    streamName,
+				Level:     lvl,
+				Line:      line,
+			}:
+			default:
+			}
+		}
+	}
+
+	shipDone := make(chan struct{})
+	go func() {
+		defer close(shipDone)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		batch := make([]domain.RunnerLogEntry, 0, 50)
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			logSink(append([]domain.RunnerLogEntry(nil), batch...))
+			batch = batch[:0]
+		}
+		for {
+			select {
+			case entry, ok := <-logCh:
+				if !ok {
+					flush()
+					return
+				}
+				batch = append(batch, entry)
+				if len(batch) >= 50 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+	}()
+
+	logWG.Add(2)
+	go readStream(stdoutPipe, "stdout", "info")
+	go readStream(stderrPipe, "stderr", "error")
+	logWG.Wait()
+	close(logCh)
+	<-shipDone
+
+	if err := cmd.Wait(); err != nil {
+		return formatRunnerExitError(err, outBuf.String(), task.EncodedJITConfig)
 	}
 	return nil
 }
 
-func (e *NativeExecutor) ensureRunnerArchive(ctx context.Context) (string, bool, error) {
+func formatRunnerExitError(err error, tailRaw, secret string) error {
+	tail := strings.TrimSpace(tailRaw)
+	if tail != "" {
+		if secret != "" {
+			tail = strings.ReplaceAll(tail, secret, "[REDACTED]")
+		}
+		return fmt.Errorf("runner exited with %v: %s", err, tail)
+	}
+	return fmt.Errorf("runner exited: %w", err)
+}
+
+// ensureUnpackedTemplate extracts the actions/runner archive once per version so every job clones in milliseconds.
+func (e *NativeExecutor) ensureUnpackedTemplate(ctx context.Context) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	ver, err := e.resolveVersionLocked(ctx)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
+	unpackedDir := filepath.Join(e.workDir, "cache", "unpacked", ver+"-"+runtime.GOOS+"-"+runtime.GOARCH)
+	sentinel := filepath.Join(unpackedDir, ".runway-ready")
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		return unpackedDir, nil
+	}
+
+	archivePath, isZip, err := e.ensureRunnerArchiveLocked(ctx, ver)
+	if err != nil {
+		return "", err
+	}
+	tmpDir := unpackedDir + ".tmp"
+	_ = os.RemoveAll(tmpDir)
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return "", fmt.Errorf("create unpacked template dir: %w", err)
+	}
+	if isZip {
+		if err := extractZip(archivePath, tmpDir); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return "", fmt.Errorf("extract windows actions-runner: %w", err)
+		}
+	} else {
+		if err := extractTarGz(archivePath, tmpDir); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return "", fmt.Errorf("extract actions-runner: %w", err)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(tmpDir, ".runway-ready"), []byte(ver), 0o644)
+	_ = os.RemoveAll(unpackedDir)
+	if err := os.Rename(tmpDir, unpackedDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("finalize unpacked template dir: %w", err)
+	}
+	return unpackedDir, nil
+}
+
+func cloneTemplateDir(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if err := exec.Command("cp", "-cR", src, dst).Run(); err == nil {
+			return nil
+		}
+	case "linux":
+		if err := exec.Command("cp", "-a", "--reflink=auto", src, dst).Run(); err == nil {
+			return nil
+		}
+	}
+	return copyDirRecursive(src, dst)
+}
+
+func copyDirRecursive(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(src, path)
+		if relErr != nil {
+			return relErr
+		}
+		target := filepath.Join(dst, rel)
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		if d.IsDir() {
+			return os.MkdirAll(target, info.Mode()&0o777)
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			linkDest, linkErr := os.Readlink(path)
+			if linkErr != nil {
+				return linkErr
+			}
+			return os.Symlink(linkDest, target)
+		}
+		in, openErr := os.Open(path)
+		if openErr != nil {
+			return openErr
+		}
+		defer in.Close()
+		out, createErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode()&0o777)
+		if createErr != nil {
+			return createErr
+		}
+		_, copyErr := io.Copy(out, in)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
+func (e *NativeExecutor) ensureRunnerArchiveLocked(ctx context.Context, ver string) (string, bool, error) {
 	filename, isZip, err := actionsRunnerFilename(ver, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return "", false, err
