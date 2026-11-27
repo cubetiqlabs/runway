@@ -9,4 +9,5 @@ var (
 	ErrForbidden    = errors.New("forbidden")
 	ErrValidation   = errors.New("validation failed")
 	ErrPolicyDenied = errors.New("denied by moderation policy")
+	ErrCapacityFull = errors.New("runner capacity currently full")
 )

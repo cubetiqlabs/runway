@@ -35,6 +35,7 @@ type Agent struct {
 	cancelMu sync.Mutex
 	cancels  map[uuid.UUID]context.CancelFunc
 
+	pollNowCh       chan struct{}
 	updateRestartCh chan string
 }
 
@@ -80,6 +81,7 @@ func New(cfg Config, log *zap.Logger) *Agent {
 		dockerOpts:      dockerOpts,
 		sem:             make(chan struct{}, cfg.Concurrency),
 		cancels:         make(map[uuid.UUID]context.CancelFunc),
+		pollNowCh:       make(chan struct{}, 1),
 		updateRestartCh: make(chan string, 1),
 	}
 }
@@ -130,10 +132,9 @@ claimLoop:
 		case <-loopCtx.Done():
 			break claimLoop
 		case <-pollTicker.C:
-			if a.draining.Load() {
-				continue
-			}
-			a.tryClaimAndStart(loopCtx, ctx)
+			a.drainClaims(loopCtx, ctx)
+		case <-a.pollNowCh:
+			a.drainClaims(loopCtx, ctx)
 		}
 	}
 
@@ -151,11 +152,22 @@ claimLoop:
 	return nil
 }
 
-func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) {
+func (a *Agent) drainClaims(loopCtx, rootCtx context.Context) {
+	if a.draining.Load() {
+		return
+	}
+	for i := 0; i < a.cfg.Concurrency; i++ {
+		if !a.tryClaimAndStart(loopCtx, rootCtx) {
+			return
+		}
+	}
+}
+
+func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) bool {
 	select {
 	case a.sem <- struct{}{}:
 	default:
-		return
+		return false
 	}
 
 	claimCtx, cancel := context.WithTimeout(loopCtx, 15*time.Second)
@@ -166,11 +178,11 @@ func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) {
 		if loopCtx.Err() == nil {
 			a.log.Warn("claim task failed", zap.Error(err))
 		}
-		return
+		return false
 	}
 	if task == nil {
 		<-a.sem
-		return
+		return false
 	}
 
 	a.jobsWG.Add(1)
@@ -189,6 +201,10 @@ func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) {
 			a.cancelMu.Unlock()
 			a.activeCount.Add(-1)
 			<-a.sem
+			select {
+			case a.pollNowCh <- struct{}{}:
+			default:
+			}
 			a.jobsWG.Done()
 		}()
 
@@ -221,6 +237,7 @@ func (a *Agent) tryClaimAndStart(loopCtx, rootCtx context.Context) {
 		}
 		compCancel()
 	}()
+	return true
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context) {

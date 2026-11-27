@@ -119,7 +119,15 @@ func (p *AgentProvisioner) Healthy(ctx context.Context, providerRef string) (boo
 		return false, nil
 	}
 	switch task.Status {
-	case domain.AgentTaskPending, domain.AgentTaskClaimed, domain.AgentTaskRunning:
+	case domain.AgentTaskPending:
+		return true, nil
+	case domain.AgentTaskClaimed, domain.AgentTaskRunning:
+		if task.AgentID != nil {
+			ag, agErr := p.agentRepo.GetByID(ctx, *task.AgentID)
+			if agErr != nil || ag.Status == domain.AgentOffline {
+				return false, nil
+			}
+		}
 		return true, nil
 	default:
 		return false, nil

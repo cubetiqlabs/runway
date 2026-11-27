@@ -93,9 +93,9 @@ func TestServerSecurityAndRouting(t *testing.T) {
 	auditRepo := &stubAuditRepo{}
 	authSvc := service.NewAuthService(cfg, log, &stubAuthRepo{}, auditRepo)
 	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, nil, nil, auditRepo, nil, nil)
-	webhookSvc := service.NewWebhookService(cfg, log, nil, nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch)
+	webhookSvc := service.NewWebhookService(cfg, log, nil, nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch, nil)
 	runnerSvc := service.NewRunnerService(cfg, nil, nil, nil, nil, auditRepo, orch)
-	modSvc := service.NewModerationService(nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch)
+	modSvc := service.NewModerationService(nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch, nil)
 	dashSvc := service.NewDashboardService(cfg, nil, auditRepo, orch)
 
 	app, err := NewServer(ServerDeps{

@@ -49,10 +49,11 @@ func (r *RunnerRepo) Create(ctx context.Context, rn *domain.Runner) error {
 	return nil
 }
 
-func (r *RunnerRepo) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.RunnerStatus, githubRunnerID *int64, providerRef string, currentJobID *int64) error {
+func runnerStatusUpdates(status domain.RunnerStatus, githubRunnerID *int64, providerRef string, currentJobID *int64) map[string]any {
+	now := time.Now().UTC()
 	updates := map[string]any{
 		"status":     string(status),
-		"updated_at": time.Now().UTC(),
+		"updated_at": now,
 	}
 	if githubRunnerID != nil {
 		updates["github_runner_id"] = *githubRunnerID
@@ -64,15 +65,29 @@ func (r *RunnerRepo) UpdateStatus(ctx context.Context, id uuid.UUID, status doma
 		updates["current_job_id"] = *currentJobID
 	}
 	if status == domain.RunnerOnline || status == domain.RunnerBusy {
-		updates["last_heartbeat_at"] = time.Now().UTC()
+		updates["last_heartbeat_at"] = now
 	}
+	return updates
+}
 
-	res := r.db.WithContext(ctx).Model(&RunnerModel{}).Where("id = ?", id).Updates(updates)
+func (r *RunnerRepo) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.RunnerStatus, githubRunnerID *int64, providerRef string, currentJobID *int64) error {
+	res := r.db.WithContext(ctx).Model(&RunnerModel{}).Where("id = ?", id).Updates(runnerStatusUpdates(status, githubRunnerID, providerRef, currentJobID))
 	if res.Error != nil {
 		return mapGormError(res.Error)
 	}
 	if res.RowsAffected == 0 {
 		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// SetProvisioned transitions a runner out of provisioning without downgrading runners already claimed/online/terminated.
+func (r *RunnerRepo) SetProvisioned(ctx context.Context, id uuid.UUID, status domain.RunnerStatus, githubRunnerID *int64, providerRef string, currentJobID *int64) error {
+	res := r.db.WithContext(ctx).Model(&RunnerModel{}).
+		Where("id = ? AND status = ?", id, string(domain.RunnerProvisioning)).
+		Updates(runnerStatusUpdates(status, githubRunnerID, providerRef, currentJobID))
+	if res.Error != nil {
+		return mapGormError(res.Error)
 	}
 	return nil
 }

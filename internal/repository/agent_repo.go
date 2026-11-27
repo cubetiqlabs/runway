@@ -281,6 +281,19 @@ func (r *AgentRepo) ClaimNextTask(ctx context.Context, agent *domain.Agent) (*do
 		chosen.Status = string(domain.AgentTaskClaimed)
 		chosen.ClaimedAt = &now
 		chosen.UpdatedAt = now
+
+		var activeCount int64
+		if err := tx.Model(&AgentTaskModel{}).
+			Where("agent_id = ? AND status IN ?", agent.ID, []string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)}).
+			Count(&activeCount).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&AgentModel{}).
+			Where("id = ?", agent.ID).
+			Updates(map[string]any{"active_jobs": int(activeCount), "updated_at": now}).Error; err != nil {
+			return err
+		}
+
 		dom := chosen.toDomain()
 		claimed = &dom
 		return nil
@@ -292,13 +305,17 @@ func (r *AgentRepo) ClaimNextTask(ctx context.Context, agent *domain.Agent) (*do
 }
 
 func taskCompatibleWithAgent(t *AgentTaskModel, a *domain.Agent) bool {
-	if a.PoolID != nil && (t.PoolID == nil || *t.PoolID != *a.PoolID) {
+	return agentMatchesPoolSpec(a, t.PoolID, t.PoolSlug, t.OS, t.Arch, []string(t.Labels))
+}
+
+func agentMatchesPoolSpec(a *domain.Agent, poolID *uuid.UUID, poolSlug, osName, archName string, labels []string) bool {
+	if a.PoolID != nil && (poolID == nil || *a.PoolID != *poolID) {
 		return false
 	}
-	if t.OS != "" && a.OS != "" && !strings.EqualFold(t.OS, a.OS) {
+	if osName != "" && a.OS != "" && !strings.EqualFold(osName, a.OS) {
 		return false
 	}
-	if t.Arch != "" && a.Arch != "" && !strings.EqualFold(t.Arch, a.Arch) {
+	if archName != "" && a.Arch != "" && !strings.EqualFold(archName, a.Arch) {
 		return false
 	}
 	if len(a.Labels) == 0 {
@@ -315,12 +332,12 @@ func taskCompatibleWithAgent(t *AgentTaskModel, a *domain.Agent) bool {
 			advertised[norm] = struct{}{}
 		}
 	}
-	if slug := strings.ToLower(strings.TrimSpace(t.PoolSlug)); slug != "" {
+	if slug := strings.ToLower(strings.TrimSpace(poolSlug)); slug != "" {
 		if _, ok := advertised[slug]; ok {
 			return true
 		}
 	}
-	for _, req := range t.Labels {
+	for _, req := range labels {
 		norm := strings.ToLower(strings.TrimSpace(req))
 		if norm == "" {
 			continue
@@ -348,6 +365,14 @@ func (r *AgentRepo) CompleteTask(ctx context.Context, taskID, agentID uuid.UUID,
 	}
 	if res.RowsAffected == 0 {
 		return nil, domain.ErrNotFound
+	}
+	var activeCount int64
+	if countErr := r.db.WithContext(ctx).Model(&AgentTaskModel{}).
+		Where("agent_id = ? AND status IN ?", agentID, []string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)}).
+		Count(&activeCount).Error; countErr == nil {
+		_ = r.db.WithContext(ctx).Model(&AgentModel{}).
+			Where("id = ?", agentID).
+			Updates(map[string]any{"active_jobs": int(activeCount), "updated_at": now}).Error
 	}
 	return r.GetTaskByID(ctx, taskID)
 }
@@ -422,6 +447,147 @@ func (r *AgentRepo) ExpirePendingTasks(ctx context.Context, before time.Time) ([
 		return nil, mapGormError(err)
 	}
 	return expired, nil
+}
+
+func (r *AgentRepo) CountAvailableSlotsForPool(ctx context.Context, pool domain.RunnerPool) (int, int, error) {
+	var agentModels []AgentModel
+	if err := r.db.WithContext(ctx).
+		Where("status = ?", string(domain.AgentOnline)).
+		Find(&agentModels).Error; err != nil {
+		return 0, 0, mapGormError(err)
+	}
+
+	compatible := make([]domain.Agent, 0, len(agentModels))
+	agentIDs := make([]uuid.UUID, 0, len(agentModels))
+	for _, m := range agentModels {
+		ag := m.toDomain()
+		if agentMatchesPoolSpec(&ag, &pool.ID, pool.Slug, pool.OS, pool.Arch, pool.Labels) {
+			compatible = append(compatible, ag)
+			agentIDs = append(agentIDs, ag.ID)
+		}
+	}
+	if len(compatible) == 0 {
+		return 0, 0, nil
+	}
+
+	type agentCount struct {
+		AgentID uuid.UUID `gorm:"column:agent_id"`
+		Cnt     int       `gorm:"column:cnt"`
+	}
+	var counts []agentCount
+	if err := r.db.WithContext(ctx).
+		Model(&AgentTaskModel{}).
+		Select("agent_id, COUNT(*) AS cnt").
+		Where("status IN ? AND agent_id IN ?", []string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)}, agentIDs).
+		Group("agent_id").
+		Scan(&counts).Error; err != nil {
+		return 0, 0, mapGormError(err)
+	}
+	activeByAgent := make(map[uuid.UUID]int, len(counts))
+	for _, c := range counts {
+		activeByAgent[c.AgentID] = c.Cnt
+	}
+
+	freeSlots := 0
+	for _, ag := range compatible {
+		maxConc := maxInt(ag.MaxConcurrency, 1)
+		if rem := maxConc - activeByAgent[ag.ID]; rem > 0 {
+			freeSlots += rem
+		}
+	}
+	if freeSlots <= 0 {
+		return 0, len(compatible), nil
+	}
+
+	type provisioningDemandRow struct {
+		PoolID   *uuid.UUID     `gorm:"column:pool_id"`
+		Labels   pq.StringArray `gorm:"column:labels;type:text[]"`
+		PoolSlug string         `gorm:"column:pool_slug"`
+		OS       string         `gorm:"column:os"`
+		Arch     string         `gorm:"column:arch"`
+		PoolLbls pq.StringArray `gorm:"column:pool_labels;type:text[]"`
+	}
+	var demands []provisioningDemandRow
+	if err := r.db.WithContext(ctx).
+		Table("runners r").
+		Select(`r.pool_id, r.labels, COALESCE(p.slug, '') AS pool_slug, COALESCE(p.os, 'linux') AS os, COALESCE(p.arch, 'x64') AS arch, COALESCE(p.labels, '{}') AS pool_labels`).
+		Joins("LEFT JOIN runner_pools p ON p.id = r.pool_id").
+		Where("r.provider = ? AND r.status = ? AND NOT EXISTS (SELECT 1 FROM agent_tasks t WHERE t.runner_id = r.id AND t.status IN ?)",
+			"agent", string(domain.RunnerProvisioning), []string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)}).
+		Scan(&demands).Error; err != nil {
+		return 0, 0, mapGormError(err)
+	}
+
+	for _, d := range demands {
+		lbls := []string(d.Labels)
+		if len(lbls) == 0 {
+			lbls = []string(d.PoolLbls)
+		}
+		for i := range compatible {
+			if agentMatchesPoolSpec(&compatible[i], d.PoolID, d.PoolSlug, d.OS, d.Arch, lbls) {
+				freeSlots--
+				break
+			}
+		}
+		if freeSlots <= 0 {
+			return 0, len(compatible), nil
+		}
+	}
+	return freeSlots, len(compatible), nil
+}
+
+func (r *AgentRepo) FailTasksForOfflineAgents(ctx context.Context) ([]domain.AgentTask, error) {
+	var failed []domain.AgentTask
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var models []AgentTaskModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("status IN ? AND agent_id IN (SELECT id FROM agents WHERE status = ?)",
+				[]string{string(domain.AgentTaskClaimed), string(domain.AgentTaskRunning)},
+				string(domain.AgentOffline)).
+			Find(&models).Error; err != nil {
+			return err
+		}
+		if len(models) == 0 {
+			return nil
+		}
+		now := time.Now().UTC()
+		ids := make([]uuid.UUID, 0, len(models))
+		agentIDSet := make(map[uuid.UUID]struct{}, len(models))
+		for _, m := range models {
+			ids = append(ids, m.ID)
+			if m.AgentID != nil {
+				agentIDSet[*m.AgentID] = struct{}{}
+			}
+			failed = append(failed, m.toDomain())
+		}
+		if err := tx.Model(&AgentTaskModel{}).
+			Where("id IN ?", ids).
+			Updates(map[string]any{
+				"status":                       string(domain.AgentTaskFailed),
+				"error_message":                "Assigned runway-agent went offline",
+				"encoded_jit_config_encrypted": nil,
+				"completed_at":                 now,
+				"updated_at":                   now,
+			}).Error; err != nil {
+			return err
+		}
+		if len(agentIDSet) > 0 {
+			agentIDs := make([]uuid.UUID, 0, len(agentIDSet))
+			for id := range agentIDSet {
+				agentIDs = append(agentIDs, id)
+			}
+			if err := tx.Model(&AgentModel{}).
+				Where("id IN ? AND status = ?", agentIDs, string(domain.AgentOffline)).
+				Updates(map[string]any{"active_jobs": 0, "updated_at": now}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+	return failed, nil
 }
 
 func defaultStr(s, fallback string) string {

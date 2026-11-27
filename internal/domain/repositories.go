@@ -62,6 +62,7 @@ type PoolRepository interface {
 type RunnerRepository interface {
 	Create(ctx context.Context, runner *Runner) error
 	UpdateStatus(ctx context.Context, id uuid.UUID, status RunnerStatus, githubRunnerID *int64, providerRef string, currentJobID *int64) error
+	SetProvisioned(ctx context.Context, id uuid.UUID, status RunnerStatus, githubRunnerID *int64, providerRef string, currentJobID *int64) error
 	Heartbeat(ctx context.Context, id uuid.UUID) error
 	GetByID(ctx context.Context, id uuid.UUID) (*Runner, error)
 	GetByName(ctx context.Context, name string) (*Runner, error)
@@ -76,7 +77,11 @@ type JobRepository interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*WorkflowJob, error)
 	GetByGitHubJobID(ctx context.Context, githubJobID int64) (*WorkflowJob, error)
 	List(ctx context.Context, filter JobFilter) ([]WorkflowJob, int, error)
+	ListDispatchableQueued(ctx context.Context, limit int) ([]WorkflowJob, error)
 	CountActiveForRepo(ctx context.Context, repoFullName string) (int, error)
+	ClaimForProvisioning(ctx context.Context, id uuid.UUID, poolID *uuid.UUID, runnerID *uuid.UUID, reason string) (bool, error)
+	RequeueIfProvisioning(ctx context.Context, id uuid.UUID, reason string) (bool, error)
+	FindOrphanedProvisioningJobs(ctx context.Context, olderThan time.Time, limit int) ([]WorkflowJob, error)
 	UpdateModerationAndRunner(ctx context.Context, id uuid.UUID, status JobStatus, decision, reason string, moderatedBy, poolID, runnerID *uuid.UUID) error
 	UpdateLifecycle(ctx context.Context, githubJobID int64, status JobStatus, conclusion string, startedAt, completedAt *time.Time) error
 }
@@ -119,4 +124,6 @@ type AgentRepository interface {
 	CancelTaskByID(ctx context.Context, taskID uuid.UUID) error
 	ListCancelledTaskIDsForAgent(ctx context.Context, agentID uuid.UUID) ([]uuid.UUID, error)
 	ExpirePendingTasks(ctx context.Context, before time.Time) ([]AgentTask, error)
+	CountAvailableSlotsForPool(ctx context.Context, pool RunnerPool) (freeSlots int, onlineAgents int, err error)
+	FailTasksForOfflineAgents(ctx context.Context) ([]AgentTask, error)
 }

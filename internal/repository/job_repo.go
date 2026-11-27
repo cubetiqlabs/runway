@@ -142,6 +142,87 @@ func (r *JobRepo) List(ctx context.Context, filter domain.JobFilter) ([]domain.W
 	return items, int(total), nil
 }
 
+func clampQueryLimit(limit, def int) int {
+	if limit <= 0 {
+		return def
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func (r *JobRepo) ListDispatchableQueued(ctx context.Context, limit int) ([]domain.WorkflowJob, error) {
+	var models []WorkflowJobModel
+	err := r.jobBaseQuery(ctx).
+		Where("j.status = ? AND j.moderation_decision IN ?", string(domain.JobQueued), []string{string(domain.ActionAllow), "approved"}).
+		Order("j.queued_at ASC").
+		Limit(clampQueryLimit(limit, 50)).
+		Scan(&models).Error
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+	items := make([]domain.WorkflowJob, 0, len(models))
+	for _, m := range models {
+		items = append(items, m.toDomain())
+	}
+	return items, nil
+}
+
+func (r *JobRepo) ClaimForProvisioning(ctx context.Context, id uuid.UUID, poolID *uuid.UUID, runnerID *uuid.UUID, reason string) (bool, error) {
+	updates := map[string]any{
+		"status":            string(domain.JobProvisioning),
+		"moderation_reason": reason,
+		"updated_at":        time.Now().UTC(),
+	}
+	if poolID != nil {
+		updates["matched_pool_id"] = *poolID
+	}
+	if runnerID != nil {
+		updates["assigned_runner_id"] = *runnerID
+	}
+	res := r.db.WithContext(ctx).Model(&WorkflowJobModel{}).
+		Where("id = ? AND status = ?", id, string(domain.JobQueued)).
+		Updates(updates)
+	if res.Error != nil {
+		return false, mapGormError(res.Error)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func (r *JobRepo) RequeueIfProvisioning(ctx context.Context, id uuid.UUID, reason string) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&WorkflowJobModel{}).
+		Where("id = ? AND status IN ?", id, []string{string(domain.JobQueued), string(domain.JobProvisioning)}).
+		Updates(map[string]any{
+			"status":             string(domain.JobQueued),
+			"assigned_runner_id": nil,
+			"moderation_reason":  reason,
+			"updated_at":         time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return false, mapGormError(res.Error)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func (r *JobRepo) FindOrphanedProvisioningJobs(ctx context.Context, olderThan time.Time, limit int) ([]domain.WorkflowJob, error) {
+	var models []WorkflowJobModel
+	err := r.jobBaseQuery(ctx).
+		Where("j.status = ? AND j.updated_at < ? AND (j.assigned_runner_id IS NULL OR rn.id IS NULL OR rn.status IN ?)",
+			string(domain.JobProvisioning), olderThan, []string{string(domain.RunnerOffline), string(domain.RunnerTerminated)}).
+		Order("j.queued_at ASC").
+		Limit(clampQueryLimit(limit, 50)).
+		Scan(&models).Error
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+	items := make([]domain.WorkflowJob, 0, len(models))
+	for _, m := range models {
+		items = append(items, m.toDomain())
+	}
+	return items, nil
+}
+
 func (r *JobRepo) CountActiveForRepo(ctx context.Context, repoFullName string) (int, error) {
 	var count int64
 	err := r.db.WithContext(ctx).Model(&WorkflowJobModel{}).

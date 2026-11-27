@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -22,6 +23,7 @@ type ModerationService struct {
 	auditRepo  domain.AuditRepository
 	engine     *moderation.Engine
 	orch       *orchestrator.Orchestrator
+	dispatcher *JobDispatcher
 }
 
 func NewModerationService(
@@ -33,6 +35,7 @@ func NewModerationService(
 	auditRepo domain.AuditRepository,
 	engine *moderation.Engine,
 	orch *orchestrator.Orchestrator,
+	dispatcher *JobDispatcher,
 ) *ModerationService {
 	return &ModerationService{
 		ghClient:   ghClient,
@@ -43,6 +46,7 @@ func NewModerationService(
 		auditRepo:  auditRepo,
 		engine:     engine,
 		orch:       orch,
+		dispatcher: dispatcher,
 	}
 }
 
@@ -192,9 +196,13 @@ func (s *ModerationService) ApproveJob(ctx context.Context, jobID uuid.UUID, rea
 	job.ModerationReason = reason
 	job.ModeratedBy = &actor.ID
 
-	if matchedPool != nil {
-		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool, ""); err != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrConflict, err)
+	if matchedPool != nil && s.dispatcher != nil {
+		if err := s.dispatcher.DispatchJob(ctx, job, *matchedPool, ""); err != nil {
+			if errors.Is(err, domain.ErrCapacityFull) {
+				_, _ = s.jobRepo.RequeueIfProvisioning(ctx, job.ID, err.Error())
+			} else {
+				return nil, fmt.Errorf("%w: %v", domain.ErrConflict, err)
+			}
 		}
 	}
 

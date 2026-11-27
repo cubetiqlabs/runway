@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
@@ -22,6 +23,9 @@ type RunnerService struct {
 	runnerRepo domain.RunnerRepository
 	auditRepo  domain.AuditRepository
 	orch       *orchestrator.Orchestrator
+
+	hookMu      sync.RWMutex
+	onSlotFreed func()
 }
 
 func NewRunnerService(
@@ -41,6 +45,21 @@ func NewRunnerService(
 		runnerRepo: runnerRepo,
 		auditRepo:  auditRepo,
 		orch:       orch,
+	}
+}
+
+func (s *RunnerService) SetSlotFreedHook(fn func()) {
+	s.hookMu.Lock()
+	s.onSlotFreed = fn
+	s.hookMu.Unlock()
+}
+
+func (s *RunnerService) notifySlotFreed() {
+	s.hookMu.RLock()
+	fn := s.onSlotFreed
+	s.hookMu.RUnlock()
+	if fn != nil {
+		fn()
 	}
 }
 
@@ -239,6 +258,9 @@ func (s *RunnerService) UpdatePool(ctx context.Context, p *domain.RunnerPool, ac
 	}
 	*p = *existing
 	s.appendAudit(ctx, actor, "pool.updated", "runner_pool", p.ID.String(), map[string]any{"name": p.Name, "enabled": p.Enabled}, ip)
+	if existing.Enabled {
+		s.notifySlotFreed()
+	}
 	return nil
 }
 
@@ -275,6 +297,7 @@ func (s *RunnerService) TerminateRunner(ctx context.Context, id uuid.UUID, actor
 		return err
 	}
 	s.appendAudit(ctx, actor, "runner.terminated", "runner", rn.ID.String(), map[string]any{"name": rn.Name}, ip)
+	s.notifySlotFreed()
 	return nil
 }
 

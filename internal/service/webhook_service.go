@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -29,6 +30,7 @@ type WebhookService struct {
 	auditRepo  domain.AuditRepository
 	engine     *moderation.Engine
 	orch       *orchestrator.Orchestrator
+	dispatcher *JobDispatcher
 }
 
 func NewWebhookService(
@@ -43,6 +45,7 @@ func NewWebhookService(
 	auditRepo domain.AuditRepository,
 	engine *moderation.Engine,
 	orch *orchestrator.Orchestrator,
+	dispatcher *JobDispatcher,
 ) *WebhookService {
 	return &WebhookService{
 		cfg:        cfg,
@@ -56,6 +59,7 @@ func NewWebhookService(
 		auditRepo:  auditRepo,
 		engine:     engine,
 		orch:       orch,
+		dispatcher: dispatcher,
 	}
 }
 
@@ -203,10 +207,23 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 		if err := s.jobRepo.UpdateLifecycle(ctx, ev.WorkflowJob.ID, status, ev.WorkflowJob.Conclusion, nil, &now); err != nil && err != domain.ErrNotFound {
 			return "failed", "", err
 		}
-		if ev.WorkflowJob.RunnerName != "" {
+		cancelled := ev.WorkflowJob.Conclusion == "cancelled"
+		var released bool
+		if ev.WorkflowJob.RunnerName != "" && s.runnerRepo != nil {
 			if rn, err := s.runnerRepo.GetByName(ctx, ev.WorkflowJob.RunnerName); err == nil && rn.Ephemeral {
-				_ = s.orch.ReleaseCompletedRunner(ctx, rn, ev.WorkflowJob.Conclusion == "cancelled")
+				_ = s.orch.ReleaseCompletedRunner(ctx, rn, cancelled)
+				released = true
 			}
+		}
+		if !released && s.runnerRepo != nil {
+			if job, err := s.jobRepo.GetByGitHubJobID(ctx, ev.WorkflowJob.ID); err == nil && job.AssignedRunnerID != nil {
+				if rn, rErr := s.runnerRepo.GetByID(ctx, *job.AssignedRunnerID); rErr == nil && rn.Ephemeral {
+					_ = s.orch.ReleaseCompletedRunner(ctx, rn, cancelled)
+				}
+			}
+		}
+		if s.dispatcher != nil {
+			s.dispatcher.Trigger()
 		}
 		return "processed", "", nil
 	default:
@@ -331,8 +348,12 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 		Metadata:     meta,
 	})
 
-	if decision.Action == domain.ActionAllow {
-		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool, ev.Repository.Owner.Type); err != nil {
+	if decision.Action == domain.ActionAllow && s.dispatcher != nil {
+		if err := s.dispatcher.DispatchJob(ctx, job, *matchedPool, ev.Repository.Owner.Type); err != nil {
+			if errors.Is(err, domain.ErrCapacityFull) {
+				_, _ = s.jobRepo.RequeueIfProvisioning(ctx, job.ID, err.Error())
+				return "processed", fmt.Sprintf("queued for pool %q (%s)", matchedPool.Slug, err.Error()), nil
+			}
 			s.log.Warn("failed to dispatch runner provision for queued job", zap.Error(err), zap.Int64("github_job_id", job.GitHubJobID))
 			failMeta, _ := json.Marshal(map[string]any{
 				"repo":          job.RepoFullName,
@@ -347,75 +368,12 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 				ResourceID:   job.ID.String(),
 				Metadata:     failMeta,
 			})
-			_ = s.jobRepo.UpdateModerationAndRunner(ctx, job.ID, domain.JobQueued, job.ModerationDecision, "Dispatch failed: "+err.Error(), job.ModeratedBy, &matchedPool.ID, nil)
+			_, _ = s.jobRepo.RequeueIfProvisioning(ctx, job.ID, "Dispatch failed: "+err.Error())
 			return "failed", "", err
 		}
 	}
 
 	return "processed", fmt.Sprintf("matched pool %q (%s)", matchedPool.Slug, decision.Action), nil
-}
-
-// DispatchProvisionForJob enforces pool concurrency, generates GitHub JIT config when configured, and enqueues provisioning.
-func DispatchProvisionForJob(
-	ctx context.Context,
-	ghClient *github.Client,
-	runnerRepo domain.RunnerRepository,
-	orch *orchestrator.Orchestrator,
-	job *domain.WorkflowJob,
-	pool domain.RunnerPool,
-	ownerType string,
-) error {
-	activeInPool, err := runnerRepo.CountActiveInPool(ctx, pool.ID)
-	if err != nil {
-		return err
-	}
-	if activeInPool >= pool.MaxConcurrency {
-		return fmt.Errorf("pool %q reached max_concurrency (%d)", pool.Name, pool.MaxConcurrency)
-	}
-
-	runnerName := buildRunnerName(pool.Slug, job.GitHubJobID)
-
-	var encodedJIT string
-	var ghRunnerID *int64
-	if ghClient != nil && ghClient.IsConfigured() && job.InstallationID != nil {
-		parts := strings.SplitN(job.RepoFullName, "/", 2)
-		if len(parts) == 2 {
-			groupID := pool.RunnerGroupID
-			if groupID <= 0 {
-				groupID = 1
-			}
-			req := github.JITConfigRequest{
-				Name:          runnerName,
-				RunnerGroupID: groupID,
-				Labels:        mergeRunnerLabels(pool, job.Labels),
-			}
-			var res *github.JITConfigResponse
-			if strings.EqualFold(ownerType, "User") {
-				res, err = ghClient.GenerateRepoJITConfig(ctx, *job.InstallationID, parts[0], parts[1], req)
-				if err != nil {
-					return fmt.Errorf("generate github jit config: %w", err)
-				}
-			} else {
-				var orgErr error
-				res, orgErr = ghClient.GenerateOrgJITConfig(ctx, *job.InstallationID, parts[0], req)
-				if orgErr != nil {
-					var repoErr error
-					res, repoErr = ghClient.GenerateRepoJITConfig(ctx, *job.InstallationID, parts[0], parts[1], req)
-					if repoErr != nil {
-						return fmt.Errorf("generate github jit config: org (%v); repo (%w)", orgErr, repoErr)
-					}
-				}
-			}
-			encodedJIT = res.EncodedJITConfig
-			id := res.Runner.ID
-			ghRunnerID = &id
-		}
-	}
-
-	if ok := orch.EnqueueProvision(job, pool, runnerName, encodedJIT, ghRunnerID); !ok {
-		return fmt.Errorf("orchestrator provision queue is full")
-	}
-	return nil
 }
 
 func buildRunnerName(poolSlug string, githubJobID int64) string {

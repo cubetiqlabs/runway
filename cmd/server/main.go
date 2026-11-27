@@ -109,14 +109,21 @@ func main() {
 		log.Fatal("failed to seed default runner pools", zap.Error(err))
 	}
 
-	modSvc := service.NewModerationService(ghClient, policyRepo, jobRepo, poolRepo, runnerRepo, auditRepo, engine, orch)
+	dispatcher := service.NewJobDispatcher(cfg, log, ghClient, instRepo, poolRepo, jobRepo, runnerRepo, agentRepo, auditRepo, orch)
+	agentSvc := service.NewAgentService(log, agentRepo, runnerRepo, jobRepo, auditRepo, poolRepo, encKey)
+	orch.SetSlotFreedHook(dispatcher.Trigger)
+	orch.SetRunnerCleanupHook(dispatcher.CleanupGitHubRunner)
+	runnerSvc.SetSlotFreedHook(dispatcher.Trigger)
+	agentSvc.SetSlotFreedHook(dispatcher.Trigger)
+
+	modSvc := service.NewModerationService(ghClient, policyRepo, jobRepo, poolRepo, runnerRepo, auditRepo, engine, orch, dispatcher)
 	if err := modSvc.SeedDefaultPolicies(ctx); err != nil {
 		log.Fatal("failed to seed default moderation policies", zap.Error(err))
 	}
 
-	webhookSvc := service.NewWebhookService(cfg, log, ghClient, instRepo, poolRepo, policyRepo, jobRepo, runnerRepo, auditRepo, engine, orch)
+	webhookSvc := service.NewWebhookService(cfg, log, ghClient, instRepo, poolRepo, policyRepo, jobRepo, runnerRepo, auditRepo, engine, orch, dispatcher)
 	dashboardSvc := service.NewDashboardService(cfg, ghClient, auditRepo, orch)
-	agentSvc := service.NewAgentService(log, agentRepo, runnerRepo, jobRepo, auditRepo, poolRepo, encKey)
+	dispatcher.Start(ctx)
 
 	app, err := apphttp.NewServer(apphttp.ServerDeps{
 		Config:        cfg,
@@ -160,6 +167,7 @@ func main() {
 	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		log.Error("HTTP server graceful shutdown failed", zap.Error(err))
 	}
+	dispatcher.Wait()
 	orch.Wait()
 	log.Info("Runway server stopped cleanly")
 }

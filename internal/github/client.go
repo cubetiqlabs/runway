@@ -202,3 +202,35 @@ func (c *Client) DeleteOrgRunner(ctx context.Context, installationID int64, org 
 	path := fmt.Sprintf("/orgs/%s/actions/runners/%d", org, runnerID)
 	return c.doJSON(ctx, http.MethodDelete, path, tok, nil, nil)
 }
+
+func (c *Client) DeleteRepoRunner(ctx context.Context, installationID int64, owner, repo string, runnerID int64) error {
+	tok, err := c.auth.InstallationToken(ctx, installationID)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/actions/runners/%d", owner, repo, runnerID)
+	return c.doJSON(ctx, http.MethodDelete, path, tok, nil, nil)
+}
+
+type WorkflowJobRemote struct {
+	ID          int64      `json:"id"`
+	RunID       int64      `json:"run_id"`
+	Status      string     `json:"status"`
+	Conclusion  string     `json:"conclusion"`
+	RunnerName  string     `json:"runner_name"`
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
+}
+
+func (c *Client) GetWorkflowJob(ctx context.Context, installationID int64, owner, repo string, jobID int64) (*WorkflowJobRemote, error) {
+	tok, err := c.auth.InstallationToken(ctx, installationID)
+	if err != nil {
+		return nil, err
+	}
+	var out WorkflowJobRemote
+	path := fmt.Sprintf("/repos/%s/%s/actions/jobs/%d", owner, repo, jobID)
+	if err := c.doJSON(ctx, http.MethodGet, path, tok, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

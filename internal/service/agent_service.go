@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/domain"
@@ -20,6 +21,9 @@ type AgentService struct {
 	auditRepo  domain.AuditRepository
 	poolRepo   domain.PoolRepository
 	encKey     []byte
+
+	hookMu      sync.RWMutex
+	onSlotFreed func()
 }
 
 func NewAgentService(
@@ -39,6 +43,21 @@ func NewAgentService(
 		auditRepo:  auditRepo,
 		poolRepo:   poolRepo,
 		encKey:     encKey,
+	}
+}
+
+func (s *AgentService) SetSlotFreedHook(fn func()) {
+	s.hookMu.Lock()
+	s.onSlotFreed = fn
+	s.hookMu.Unlock()
+}
+
+func (s *AgentService) notifySlotFreed() {
+	s.hookMu.RLock()
+	fn := s.onSlotFreed
+	s.hookMu.RUnlock()
+	if fn != nil {
+		fn()
 	}
 }
 
@@ -223,6 +242,7 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 		update.Labels = in.Labels
 	}
 
+	wasOffline := agent.Status == domain.AgentOffline
 	if err := s.agentRepo.UpdateHeartbeat(ctx, &update); err != nil {
 		return nil, err
 	}
@@ -232,6 +252,9 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 		status = latest.Status
 	} else if status == domain.AgentOffline {
 		status = domain.AgentOnline
+	}
+	if wasOffline && status == domain.AgentOnline {
+		s.notifySlotFreed()
 	}
 	cancelIDs, _ := s.agentRepo.ListCancelledTaskIDsForAgent(ctx, agent.ID)
 	if cancelIDs == nil {
@@ -327,7 +350,11 @@ func (s *AgentService) CompleteTask(ctx context.Context, agent *domain.Agent, ta
 	if status == domain.AgentTaskFailed {
 		if s.jobRepo != nil {
 			if job, getErr := s.jobRepo.GetByID(ctx, task.JobID); getErr == nil {
-				_ = s.jobRepo.UpdateModerationAndRunner(ctx, job.ID, job.Status, job.ModerationDecision, "Agent execution failed: "+strings.TrimSpace(errMsg), job.ModeratedBy, job.MatchedPoolID, &task.RunnerID)
+				if job.Status == domain.JobProvisioning {
+					_, _ = s.jobRepo.RequeueIfProvisioning(ctx, job.ID, "Agent execution failed before job started: "+strings.TrimSpace(errMsg))
+				} else {
+					_ = s.jobRepo.UpdateModerationAndRunner(ctx, job.ID, job.Status, job.ModerationDecision, "Agent execution failed: "+strings.TrimSpace(errMsg), job.ModeratedBy, job.MatchedPoolID, &task.RunnerID)
+				}
 			}
 		}
 		s.appendAudit(ctx, nil, "runner.agent_failed", "agent", agent.ID.String(), map[string]any{
@@ -337,6 +364,7 @@ func (s *AgentService) CompleteTask(ctx context.Context, agent *domain.Agent, ta
 			"error":         strings.TrimSpace(errMsg),
 		}, "")
 	}
+	s.notifySlotFreed()
 	return nil
 }
 
