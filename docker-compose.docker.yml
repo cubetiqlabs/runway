@@ -1,0 +1,10 @@
+# Optional overlay for provisioning ephemeral Docker runner containers on the host:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
+# Or set RUNWAY_ORCHESTRATOR_DOCKER_SOCKET=tcp://docker-proxy:2375 without mounting the socket directly.
+
+services:
+  runway:
+    group_add:
+      - "${DOCKER_GID:-999}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -83,6 +83,15 @@ func main() {
 	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, runnerRepo, jobRepo, auditRepo)
 	orch.Start(ctx)
 
+	pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
+	if err := orch.HealthCheck(pingCtx); err != nil {
+		log.Warn("orchestrator backend unreachable on startup; verify socket/endpoint configuration",
+			zap.String("provider", cfg.Orchestrator.Provider),
+			zap.Error(err),
+		)
+	}
+	pingCancel()
+
 	authSvc := service.NewAuthService(cfg, log, authRepo, auditRepo)
 	if err := authSvc.BootstrapAdmin(ctx); err != nil {
 		log.Fatal("failed to bootstrap initial admin account", zap.Error(err))
@@ -99,7 +108,7 @@ func main() {
 	}
 
 	webhookSvc := service.NewWebhookService(cfg, log, ghClient, instRepo, poolRepo, policyRepo, jobRepo, runnerRepo, auditRepo, engine, orch)
-	dashboardSvc := service.NewDashboardService(cfg, ghClient, auditRepo)
+	dashboardSvc := service.NewDashboardService(cfg, ghClient, auditRepo, orch)
 
 	app, err := apphttp.NewServer(apphttp.ServerDeps{
 		Config:        cfg,

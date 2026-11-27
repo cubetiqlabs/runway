@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,42 +9,144 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DockerProvisioner speaks directly to the Docker Engine Unix socket with zero heavy SDK deps.
+const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
+
+// DockerProvisioner speaks directly to the Docker Engine socket or TCP/HTTP API with zero heavy SDK deps.
 type DockerProvisioner struct {
-	socketPath string
+	dockerHost string
+	baseURL    string
 	client     *http.Client
+	pullClient *http.Client
 }
 
-func NewDockerProvisioner(socketPath string) *DockerProvisioner {
-	if strings.TrimSpace(socketPath) == "" {
-		socketPath = "/var/run/docker.sock"
+// NewDockerProvisioner creates a Docker Engine provisioner supporting Unix sockets or HTTP/TCP endpoints.
+func NewDockerProvisioner(dockerHost string) *DockerProvisioner {
+	host := strings.TrimSpace(dockerHost)
+	if host == "" {
+		host = "/var/run/docker.sock"
 	}
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socketPath)
-		},
+
+	var transport *http.Transport
+	var baseURL string
+
+	switch {
+	case strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://"):
+		baseURL = strings.TrimRight(host, "/")
+		transport = &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		}
+	case strings.HasPrefix(host, "tcp://"):
+		baseURL = "http://" + strings.TrimRight(strings.TrimPrefix(host, "tcp://"), "/")
+		transport = &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		}
+	default:
+		socketPath := strings.TrimPrefix(host, "unix://")
+		baseURL = "http://docker"
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socketPath)
+			},
+		}
 	}
+
 	return &DockerProvisioner{
-		socketPath: socketPath,
+		dockerHost: host,
+		baseURL:    baseURL,
 		client:     &http.Client{Transport: transport, Timeout: 30 * time.Second},
+		pullClient: &http.Client{Transport: transport, Timeout: 5 * time.Minute},
 	}
 }
 
 func (d *DockerProvisioner) Name() string { return "docker" }
 
+// Ping checks connectivity to the configured Docker Engine endpoint.
+func (d *DockerProvisioner) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.baseURL+"/_ping", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("docker ping (%s): %w", d.dockerHost, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("docker ping failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
+}
+
+func (d *DockerProvisioner) hostInfo(ctx context.Context) (ncpu int, memTotal int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.baseURL+"/info", nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("docker info failed (%d)", resp.StatusCode)
+	}
+	var info struct {
+		NCPU     int   `json:"NCPU"`
+		MemTotal int64 `json:"MemTotal"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info); err != nil {
+		return 0, 0, err
+	}
+	return info.NCPU, info.MemTotal, nil
+}
+
 func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest) (*ProvisionResult, error) {
-	image := req.Pool.ContainerImage
-	if strings.TrimSpace(image) == "" {
+	if strings.TrimSpace(req.EncodedJITConfig) == "" {
+		return nil, fmt.Errorf("docker provisioner requires encoded_jit_config (ensure GitHub App credentials and installation permissions are configured)")
+	}
+
+	image := strings.TrimSpace(req.Pool.ContainerImage)
+	if image == "" {
 		image = "ghcr.io/actions/actions-runner:latest"
 	}
 
-	pidsLimit := int64(512)
+	vcpu := req.Pool.VCPU
+	if vcpu <= 0 {
+		vcpu = 1
+	}
+	memBytes := int64(req.Pool.MemoryMB) * 1024 * 1024
+	if memBytes <= 0 {
+		memBytes = 512 * 1024 * 1024
+	}
+
+	if ncpu, memTotal, err := d.hostInfo(ctx); err == nil {
+		if ncpu > 0 && vcpu > ncpu {
+			vcpu = ncpu
+		}
+		if memTotal > 0 {
+			maxMem := int64(float64(memTotal) * 0.85)
+			if maxMem < 256*1024*1024 && memTotal >= 256*1024*1024 {
+				maxMem = 256 * 1024 * 1024
+			} else if maxMem <= 0 {
+				maxMem = memTotal
+			}
+			if memBytes > maxMem {
+				memBytes = maxMem
+			}
+		}
+	}
+
+	pidsLimit := int64(4096)
 	payload := map[string]any{
-		"Image": image,
+		"Image":      image,
+		"Entrypoint": []string{"/bin/sh", "-c"},
+		"Cmd":        []string{defaultRunnerCmd},
 		"Env": []string{
 			"RUNNER_NAME=" + req.RunnerName,
 			"ENCODED_JIT_CONFIG=" + req.EncodedJITConfig,
@@ -55,11 +158,12 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		},
 		"HostConfig": map[string]any{
 			"AutoRemove":  true,
+			"Init":        true,
 			"CapDrop":     []string{"ALL"},
 			"SecurityOpt": []string{"no-new-privileges:true"},
 			"PidsLimit":   pidsLimit,
-			"NanoCpus":    int64(req.Pool.VCPU) * 1_000_000_000,
-			"Memory":      int64(req.Pool.MemoryMB) * 1024 * 1024,
+			"NanoCpus":    int64(vcpu) * 1_000_000_000,
+			"Memory":      memBytes,
 		},
 	}
 
@@ -68,55 +172,162 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		return nil, err
 	}
 
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker/containers/create?name="+req.RunnerName, bytes.NewReader(body))
+	containerID, err := d.createContainer(ctx, req.RunnerName, body)
+	if err != nil && isImageNotFoundError(err) {
+		if pullErr := d.pullImage(ctx, image); pullErr != nil {
+			return nil, pullErr
+		}
+		containerID, err = d.createContainer(ctx, req.RunnerName, body)
+	}
 	if err != nil {
 		return nil, err
+	}
+
+	startReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/containers/%s/start", d.baseURL, url.PathEscape(containerID)), nil)
+	if err != nil {
+		_ = d.Terminate(ctx, containerID)
+		return nil, err
+	}
+	startResp, err := d.client.Do(startReq)
+	if err != nil {
+		_ = d.Terminate(ctx, containerID)
+		return nil, fmt.Errorf("docker start container: %w", err)
+	}
+	startRaw, _ := io.ReadAll(io.LimitReader(startResp.Body, 1<<20))
+	startResp.Body.Close()
+	if startResp.StatusCode < 200 || startResp.StatusCode >= 300 {
+		_ = d.Terminate(ctx, containerID)
+		return nil, fmt.Errorf("docker start container failed (%d): %s", startResp.StatusCode, strings.TrimSpace(string(startRaw)))
+	}
+
+	hostInfo, _ := json.Marshal(map[string]any{
+		"provider":     "docker",
+		"container_id": containerID,
+		"image":        image,
+		"vcpu":         vcpu,
+		"memory_mb":    memBytes / (1024 * 1024),
+	})
+	return &ProvisionResult{ProviderRef: containerID, HostInfo: hostInfo}, nil
+}
+
+type dockerStatusError struct {
+	statusCode int
+	message    string
+}
+
+func (e *dockerStatusError) Error() string {
+	return fmt.Sprintf("docker create container failed (%d): %s", e.statusCode, e.message)
+}
+
+func isImageNotFoundError(err error) bool {
+	de, ok := err.(*dockerStatusError)
+	return ok && de.statusCode == http.StatusNotFound
+}
+
+func (d *DockerProvisioner) createContainer(ctx context.Context, runnerName string, body []byte) (string, error) {
+	createURL := d.baseURL + "/containers/create?name=" + url.QueryEscape(runnerName)
+	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
 	}
 	createReq.Header.Set("Content-Type", "application/json")
 
 	createResp, err := d.client.Do(createReq)
 	if err != nil {
-		return nil, fmt.Errorf("docker create container: %w", err)
+		return "", fmt.Errorf("docker create container: %w", err)
 	}
 	defer createResp.Body.Close()
 
 	raw, _ := io.ReadAll(io.LimitReader(createResp.Body, 1<<20))
 	if createResp.StatusCode < 200 || createResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("docker create container failed (%d): %s", createResp.StatusCode, strings.TrimSpace(string(raw)))
+		return "", &dockerStatusError{
+			statusCode: createResp.StatusCode,
+			message:    strings.TrimSpace(string(raw)),
+		}
 	}
 
 	var created struct {
 		ID string `json:"Id"`
 	}
 	if err := json.Unmarshal(raw, &created); err != nil {
-		return nil, fmt.Errorf("decode docker create response: %w", err)
+		return "", fmt.Errorf("decode docker create response: %w", err)
+	}
+	if created.ID == "" {
+		return "", fmt.Errorf("docker create container returned empty container Id")
+	}
+	return created.ID, nil
+}
+
+func (d *DockerProvisioner) pullImage(ctx context.Context, image string) error {
+	repo, tag := splitImageRepoTag(image)
+	q := url.Values{}
+	q.Set("fromImage", repo)
+	if tag != "" {
+		q.Set("tag", tag)
 	}
 
-	startReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://docker/containers/%s/start", created.ID), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.baseURL+"/images/create?"+q.Encode(), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	startResp, err := d.client.Do(startReq)
+	resp, err := d.pullClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("docker start container: %w", err)
+		return fmt.Errorf("docker pull image %q: %w", image, err)
 	}
-	startResp.Body.Close()
-	if startResp.StatusCode < 200 || startResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("docker start container failed (%d)", startResp.StatusCode)
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("docker pull image %q failed (%d): %s", image, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
-	hostInfo, _ := json.Marshal(map[string]any{
-		"provider":     "docker",
-		"container_id": created.ID,
-		"image":        image,
-		"vcpu":         req.Pool.VCPU,
-		"memory_mb":    req.Pool.MemoryMB,
-	})
-	return &ProvisionResult{ProviderRef: created.ID, HostInfo: hostInfo}, nil
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 16<<20))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var evt struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if json.Unmarshal([]byte(line), &evt) == nil {
+			errMsg := evt.Error
+			if errMsg == "" {
+				errMsg = evt.ErrorDetail.Message
+			}
+			if errMsg != "" {
+				return fmt.Errorf("docker pull image %q: %s", image, errMsg)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("docker pull image %q stream error: %w", image, err)
+	}
+	return nil
+}
+
+func splitImageRepoTag(image string) (repo, tag string) {
+	image = strings.TrimSpace(image)
+	if strings.Contains(image, "@") {
+		return image, ""
+	}
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon > lastSlash {
+		return image[:lastColon], image[lastColon+1:]
+	}
+	return image, "latest"
 }
 
 func (d *DockerProvisioner) Terminate(ctx context.Context, providerRef string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("http://docker/containers/%s?force=true", providerRef), nil)
+	if strings.TrimSpace(providerRef) == "" {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s/containers/%s?force=true", d.baseURL, url.PathEscape(providerRef)), nil)
 	if err != nil {
 		return err
 	}
@@ -132,7 +343,7 @@ func (d *DockerProvisioner) Healthy(ctx context.Context, providerRef string) (bo
 	if providerRef == "" {
 		return false, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://docker/containers/%s/json", providerRef), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/containers/%s/json", d.baseURL, url.PathEscape(providerRef)), nil)
 	if err != nil {
 		return false, err
 	}
@@ -141,8 +352,11 @@ func (d *DockerProvisioner) Healthy(ctx context.Context, providerRef string) (bo
 		return false, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusNotFound {
 		return false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("docker inspect container failed (%d)", resp.StatusCode)
 	}
 	var inspect struct {
 		State struct {

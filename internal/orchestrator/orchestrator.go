@@ -29,6 +29,7 @@ type ProvisionResult struct {
 
 type Provisioner interface {
 	Name() string
+	Ping(ctx context.Context) error
 	Provision(ctx context.Context, req ProvisionRequest) (*ProvisionResult, error)
 	Terminate(ctx context.Context, providerRef string) error
 	Healthy(ctx context.Context, providerRef string) (bool, error)
@@ -37,6 +38,7 @@ type Provisioner interface {
 type dispatchTask struct {
 	job              *domain.WorkflowJob
 	pool             domain.RunnerPool
+	runnerName       string
 	encodedJITConfig string
 	githubRunnerID   *int64
 }
@@ -89,11 +91,16 @@ func (o *Orchestrator) Wait() {
 	o.wg.Wait()
 }
 
-func (o *Orchestrator) EnqueueProvision(job *domain.WorkflowJob, pool domain.RunnerPool, encodedJITConfig string, githubRunnerID *int64) bool {
+func (o *Orchestrator) HealthCheck(ctx context.Context) error {
+	return o.selectProvisioner(o.cfg.Provider).Ping(ctx)
+}
+
+func (o *Orchestrator) EnqueueProvision(job *domain.WorkflowJob, pool domain.RunnerPool, runnerName, encodedJITConfig string, githubRunnerID *int64) bool {
 	select {
 	case o.queue <- dispatchTask{
 		job:              job,
 		pool:             pool,
+		runnerName:       runnerName,
 		encodedJITConfig: encodedJITConfig,
 		githubRunnerID:   githubRunnerID,
 	}:
@@ -130,7 +137,10 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 	provCtx, cancel := context.WithTimeout(ctx, o.cfg.ProvisionTimeout)
 	defer cancel()
 
-	runnerName := fmt.Sprintf("runway-%s-%s", task.pool.Slug, uuid.NewString()[:8])
+	runnerName := task.runnerName
+	if runnerName == "" {
+		runnerName = fmt.Sprintf("runway-%s-%s", task.pool.Slug, uuid.NewString()[:8])
+	}
 	providerName := task.pool.Provider
 	if providerName == "" {
 		providerName = o.cfg.Provider
@@ -168,6 +178,24 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 	if err != nil {
 		o.log.Error("runner provisioning failed", zap.String("runner", runnerName), zap.Error(err))
 		_ = o.runnerRepo.UpdateStatus(provCtx, rn.ID, domain.RunnerOffline, nil, "", nil)
+		if o.jobRepo != nil {
+			_ = o.jobRepo.UpdateModerationAndRunner(provCtx, task.job.ID, domain.JobQueued, task.job.ModerationDecision, "Provisioning failed: "+err.Error(), task.job.ModeratedBy, &task.pool.ID, &rn.ID)
+		}
+		if o.auditRepo != nil {
+			meta, _ := json.Marshal(map[string]any{
+				"runner":        runnerName,
+				"provider":      prov.Name(),
+				"github_job_id": task.job.GitHubJobID,
+				"error":         err.Error(),
+			})
+			_ = o.auditRepo.AppendAuditLog(provCtx, &domain.AuditLog{
+				ActorLabel:   "orchestrator",
+				Action:       "runner.provision_failed",
+				ResourceType: "runner",
+				ResourceID:   rn.ID.String(),
+				Metadata:     meta,
+			})
+		}
 		return
 	}
 
@@ -198,6 +226,8 @@ func (o *Orchestrator) reconcileLoop(ctx context.Context) {
 
 func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	now := time.Now().UTC()
+	seen := make(map[uuid.UUID]struct{})
+
 	stale, err := o.runnerRepo.FindStaleRunners(
 		ctx,
 		now.Add(-o.cfg.ProvisionTimeout),
@@ -205,17 +235,41 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 	)
 	if err != nil {
 		o.log.Warn("reconcile query stale runners failed", zap.Error(err))
+	} else {
+		for _, rn := range stale {
+			seen[rn.ID] = struct{}{}
+			prov := o.selectProvisioner(rn.Provider)
+			healthy, healthErr := prov.Healthy(ctx, rn.ProviderRef)
+			if healthy {
+				_ = o.runnerRepo.Heartbeat(ctx, rn.ID)
+				continue
+			}
+			if healthErr != nil {
+				o.log.Warn("reconcile health check error", zap.String("runner", rn.Name), zap.Error(healthErr))
+				continue
+			}
+			_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerOffline, nil, "", nil)
+			o.log.Info("marked stale runner offline", zap.String("runner", rn.Name))
+		}
+	}
+
+	// Promptly detect exited ephemeral Docker containers so concurrency slots recover before StaleHeartbeatTTL.
+	dockerActive, err := o.runnerRepo.ListActiveByProvider(ctx, "docker")
+	if err != nil {
+		o.log.Warn("reconcile query active docker runners failed", zap.Error(err))
 		return
 	}
-	for _, rn := range stale {
-		prov := o.selectProvisioner(rn.Provider)
-		healthy, _ := prov.Healthy(ctx, rn.ProviderRef)
-		if healthy {
-			_ = o.runnerRepo.Heartbeat(ctx, rn.ID)
+	dockerProv := o.selectProvisioner("docker")
+	for _, rn := range dockerActive {
+		if _, already := seen[rn.ID]; already {
 			continue
 		}
-		_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerOffline, nil, "", nil)
-		o.log.Info("marked stale runner offline", zap.String("runner", rn.Name))
+		healthy, healthErr := dockerProv.Healthy(ctx, rn.ProviderRef)
+		if healthErr != nil || healthy {
+			continue
+		}
+		_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
+		o.log.Info("reconciled exited docker runner", zap.String("runner", rn.Name))
 	}
 }
 

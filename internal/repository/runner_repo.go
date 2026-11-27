@@ -146,6 +146,21 @@ func (r *RunnerRepo) List(ctx context.Context, filter domain.RunnerFilter) ([]do
 	return items, int(total), nil
 }
 
+func (r *RunnerRepo) ListActiveByProvider(ctx context.Context, provider string) ([]domain.Runner, error) {
+	var models []RunnerModel
+	err := r.runnerQuery(ctx).
+		Where("r.provider = ? AND r.status IN ?", provider, []string{"online", "busy", "draining"}).
+		Scan(&models).Error
+	if err != nil {
+		return nil, mapGormError(err)
+	}
+	items := make([]domain.Runner, 0, len(models))
+	for _, m := range models {
+		items = append(items, m.toDomain())
+	}
+	return items, nil
+}
+
 func (r *RunnerRepo) CountActiveInPool(ctx context.Context, poolID uuid.UUID) (int, error) {
 	var count int64
 	err := r.db.WithContext(ctx).Model(&RunnerModel{}).

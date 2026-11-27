@@ -193,7 +193,7 @@ func (s *ModerationService) ApproveJob(ctx context.Context, jobID uuid.UUID, rea
 	job.ModeratedBy = &actor.ID
 
 	if matchedPool != nil {
-		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool); err != nil {
+		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool, ""); err != nil {
 			return nil, fmt.Errorf("%w: %v", domain.ErrConflict, err)
 		}
 	}

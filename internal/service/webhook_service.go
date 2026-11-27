@@ -13,6 +13,7 @@ import (
 	"github.com/cubetiqlabs/runway/internal/github"
 	"github.com/cubetiqlabs/runway/internal/moderation"
 	"github.com/cubetiqlabs/runway/internal/orchestrator"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -120,15 +121,17 @@ func (s *WebhookService) HandleGitHubWebhook(ctx context.Context, in WebhookInpu
 
 	var procErr error
 	status := "processed"
+	detail := ""
 	switch in.EventName {
 	case "ping":
 		status = "processed"
 	case "installation":
 		procErr = s.handleInstallationEvent(ctx, in.RawBody)
 	case "workflow_job":
-		status, procErr = s.handleWorkflowJobEvent(ctx, in.RawBody)
+		status, detail, procErr = s.handleWorkflowJobEvent(ctx, in.RawBody)
 	default:
 		status = "ignored"
+		detail = fmt.Sprintf("ignored event %q", in.EventName)
 	}
 
 	ms := int(time.Since(start).Milliseconds())
@@ -136,7 +139,7 @@ func (s *WebhookService) HandleGitHubWebhook(ctx context.Context, in WebhookInpu
 		_ = s.auditRepo.UpdateDeliveryStatus(ctx, in.DeliveryID, "failed", procErr.Error(), ms)
 		return procErr
 	}
-	_ = s.auditRepo.UpdateDeliveryStatus(ctx, in.DeliveryID, status, "", ms)
+	_ = s.auditRepo.UpdateDeliveryStatus(ctx, in.DeliveryID, status, detail, ms)
 	return nil
 }
 
@@ -165,10 +168,10 @@ func (s *WebhookService) handleInstallationEvent(ctx context.Context, raw []byte
 	return s.instRepo.Upsert(ctx, inst)
 }
 
-func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte) (string, error) {
+func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte) (string, string, error) {
 	var ev github.WorkflowJobEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		return "failed", fmt.Errorf("%w: invalid workflow_job payload", domain.ErrValidation)
+		return "failed", "", fmt.Errorf("%w: invalid workflow_job payload", domain.ErrValidation)
 	}
 
 	switch ev.Action {
@@ -180,14 +183,14 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 			now = *ev.WorkflowJob.StartedAt
 		}
 		if err := s.jobRepo.UpdateLifecycle(ctx, ev.WorkflowJob.ID, domain.JobInProgress, "", &now, nil); err != nil && err != domain.ErrNotFound {
-			return "failed", err
+			return "failed", "", err
 		}
 		if ev.WorkflowJob.RunnerName != "" {
 			if rn, err := s.runnerRepo.GetByName(ctx, ev.WorkflowJob.RunnerName); err == nil {
 				_ = s.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerBusy, ev.WorkflowJob.RunnerID, "", &ev.WorkflowJob.ID)
 			}
 		}
-		return "processed", nil
+		return "processed", "", nil
 	case "completed":
 		now := time.Now().UTC()
 		if ev.WorkflowJob.CompletedAt != nil {
@@ -198,20 +201,20 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 			status = domain.JobCancelled
 		}
 		if err := s.jobRepo.UpdateLifecycle(ctx, ev.WorkflowJob.ID, status, ev.WorkflowJob.Conclusion, nil, &now); err != nil && err != domain.ErrNotFound {
-			return "failed", err
+			return "failed", "", err
 		}
 		if ev.WorkflowJob.RunnerName != "" {
 			if rn, err := s.runnerRepo.GetByName(ctx, ev.WorkflowJob.RunnerName); err == nil && rn.Ephemeral {
 				_ = s.orch.TerminateRunner(ctx, rn)
 			}
 		}
-		return "processed", nil
+		return "processed", "", nil
 	default:
-		return "ignored", nil
+		return "ignored", fmt.Sprintf("ignored workflow_job action %q", ev.Action), nil
 	}
 }
 
-func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJobEvent) (string, error) {
+func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJobEvent) (string, string, error) {
 	var instID *int64
 	if ev.Installation.ID > 0 {
 		id := ev.Installation.ID
@@ -238,12 +241,12 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 
 	pools, err := s.poolRepo.ListEnabled(ctx)
 	if err != nil {
-		return "failed", err
+		return "failed", "", err
 	}
 	matchedPool := moderation.MatchPool(pools, instID, ev.WorkflowJob.Labels)
 	if matchedPool == nil {
-		// Not targeted at any Runway-managed runner pool; ignore cleanly.
-		return "ignored", nil
+		// Not targeted at any Runway-managed runner pool; ignore cleanly with reason for operators.
+		return "ignored", fmt.Sprintf("no enabled runner pool matched job labels %v", ev.WorkflowJob.Labels), nil
 	}
 
 	isForkPR := ev.Repository.Fork
@@ -258,11 +261,11 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 
 	policies, err := s.policyRepo.ListEnabledOrdered(ctx)
 	if err != nil {
-		return "failed", err
+		return "failed", "", err
 	}
 	activeRepoCount, err := s.jobRepo.CountActiveForRepo(ctx, ev.Repository.FullName)
 	if err != nil {
-		return "failed", err
+		return "failed", "", err
 	}
 
 	decision := s.engine.Evaluate(policies, moderation.JobContext{
@@ -311,7 +314,7 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 	}
 
 	if err := s.jobRepo.UpsertFromWebhook(ctx, job); err != nil {
-		return "failed", err
+		return "failed", "", err
 	}
 
 	meta, _ := json.Marshal(map[string]any{
@@ -329,12 +332,27 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 	})
 
 	if decision.Action == domain.ActionAllow {
-		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool); err != nil {
+		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool, ev.Repository.Owner.Type); err != nil {
 			s.log.Warn("failed to dispatch runner provision for queued job", zap.Error(err), zap.Int64("github_job_id", job.GitHubJobID))
+			failMeta, _ := json.Marshal(map[string]any{
+				"repo":          job.RepoFullName,
+				"pool":          matchedPool.Name,
+				"github_job_id": job.GitHubJobID,
+				"error":         err.Error(),
+			})
+			_ = s.auditRepo.AppendAuditLog(ctx, &domain.AuditLog{
+				ActorLabel:   "webhook-dispatcher",
+				Action:       "job.provision_failed",
+				ResourceType: "workflow_job",
+				ResourceID:   job.ID.String(),
+				Metadata:     failMeta,
+			})
+			_ = s.jobRepo.UpdateModerationAndRunner(ctx, job.ID, domain.JobQueued, job.ModerationDecision, "Dispatch failed: "+err.Error(), job.ModeratedBy, &matchedPool.ID, nil)
+			return "failed", "", err
 		}
 	}
 
-	return "processed", nil
+	return "processed", fmt.Sprintf("matched pool %q (%s)", matchedPool.Slug, decision.Action), nil
 }
 
 // DispatchProvisionForJob enforces pool concurrency, generates GitHub JIT config when configured, and enqueues provisioning.
@@ -345,6 +363,7 @@ func DispatchProvisionForJob(
 	orch *orchestrator.Orchestrator,
 	job *domain.WorkflowJob,
 	pool domain.RunnerPool,
+	ownerType string,
 ) error {
 	activeInPool, err := runnerRepo.CountActiveInPool(ctx, pool.ID)
 	if err != nil {
@@ -354,22 +373,38 @@ func DispatchProvisionForJob(
 		return fmt.Errorf("pool %q reached max_concurrency (%d)", pool.Name, pool.MaxConcurrency)
 	}
 
+	runnerName := buildRunnerName(pool.Slug, job.GitHubJobID)
+
 	var encodedJIT string
 	var ghRunnerID *int64
 	if ghClient != nil && ghClient.IsConfigured() && job.InstallationID != nil {
 		parts := strings.SplitN(job.RepoFullName, "/", 2)
 		if len(parts) == 2 {
+			groupID := pool.RunnerGroupID
+			if groupID <= 0 {
+				groupID = 1
+			}
 			req := github.JITConfigRequest{
-				Name:          fmt.Sprintf("runway-%s-%d", pool.Slug, job.GitHubJobID),
-				RunnerGroupID: pool.RunnerGroupID,
-				Labels:        pool.Labels,
+				Name:          runnerName,
+				RunnerGroupID: groupID,
+				Labels:        mergeRunnerLabels(pool, job.Labels),
 			}
-			res, err := ghClient.GenerateOrgJITConfig(ctx, *job.InstallationID, parts[0], req)
-			if err != nil {
+			var res *github.JITConfigResponse
+			if strings.EqualFold(ownerType, "User") {
 				res, err = ghClient.GenerateRepoJITConfig(ctx, *job.InstallationID, parts[0], parts[1], req)
-			}
-			if err != nil {
-				return fmt.Errorf("generate github jit config: %w", err)
+				if err != nil {
+					return fmt.Errorf("generate github jit config: %w", err)
+				}
+			} else {
+				var orgErr error
+				res, orgErr = ghClient.GenerateOrgJITConfig(ctx, *job.InstallationID, parts[0], req)
+				if orgErr != nil {
+					var repoErr error
+					res, repoErr = ghClient.GenerateRepoJITConfig(ctx, *job.InstallationID, parts[0], parts[1], req)
+					if repoErr != nil {
+						return fmt.Errorf("generate github jit config: org (%v); repo (%w)", orgErr, repoErr)
+					}
+				}
 			}
 			encodedJIT = res.EncodedJITConfig
 			id := res.Runner.ID
@@ -377,6 +412,66 @@ func DispatchProvisionForJob(
 		}
 	}
 
-	orch.EnqueueProvision(job, pool, encodedJIT, ghRunnerID)
+	if ok := orch.EnqueueProvision(job, pool, runnerName, encodedJIT, ghRunnerID); !ok {
+		return fmt.Errorf("orchestrator provision queue is full")
+	}
 	return nil
+}
+
+func buildRunnerName(poolSlug string, githubJobID int64) string {
+	slug := strings.ToLower(strings.TrimSpace(poolSlug))
+	slug = strings.TrimPrefix(slug, "runway-")
+	var clean strings.Builder
+	for _, r := range slug {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			clean.WriteRune(r)
+		} else {
+			clean.WriteByte('-')
+		}
+	}
+	base := strings.Trim(clean.String(), "-")
+	if base == "" {
+		base = "runner"
+	}
+
+	suffix := fmt.Sprintf("-%d-%s", githubJobID, strings.ReplaceAll(uuid.NewString(), "-", "")[:6])
+	prefix := "runway-"
+	maxBase := 64 - len(prefix) - len(suffix)
+	if maxBase < 1 {
+		maxBase = 1
+	}
+	if len(base) > maxBase {
+		base = strings.TrimRight(base[:maxBase], "-")
+		if base == "" {
+			base = "r"
+		}
+	}
+	return prefix + base + suffix
+}
+
+func mergeRunnerLabels(pool domain.RunnerPool, jobLabels []string) []string {
+	out := make([]string, 0, len(pool.Labels)+len(jobLabels)+2)
+	seen := make(map[string]struct{}, len(pool.Labels)+len(jobLabels)+2)
+	add := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return
+		}
+		key := strings.ToLower(trimmed)
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			out = append(out, trimmed)
+		}
+	}
+	for _, l := range pool.Labels {
+		add(l)
+	}
+	add(pool.Slug)
+	for _, l := range jobLabels {
+		add(l)
+	}
+	if len(out) == 0 {
+		out = append(out, "self-hosted")
+	}
+	return out
 }

@@ -117,40 +117,111 @@ func (e *Engine) Evaluate(policies []domain.ModerationPolicy, job JobContext) De
 	}
 }
 
-// MatchPool selects the first enabled RunnerPool whose labels are a subset of the job's requested labels
-// (ignoring generic 'self-hosted' if pool defines more specific labels, or matching all pool labels).
+// MatchPool selects the best enabled RunnerPool whose advertised labels satisfy all of the job's requested labels.
+// GitHub sends only the exact `runs-on` labels in workflow_job.labels, so every requested job label
+// must be present in the pool's label set (pool.Labels plus slug, os, arch, and "self-hosted").
 func MatchPool(pools []domain.RunnerPool, installationID *int64, jobLabels []string) *domain.RunnerPool {
-	if len(jobLabels) == 0 {
-		return nil
+	normJobLabels := make([]string, 0, len(jobLabels))
+	seenJob := make(map[string]struct{}, len(jobLabels))
+	for _, raw := range jobLabels {
+		l := strings.ToLower(strings.TrimSpace(raw))
+		if l == "" {
+			continue
+		}
+		if _, exists := seenJob[l]; !exists {
+			seenJob[l] = struct{}{}
+			normJobLabels = append(normJobLabels, l)
+		}
 	}
-	labelSet := make(map[string]struct{}, len(jobLabels))
-	for _, l := range jobLabels {
-		labelSet[strings.ToLower(strings.TrimSpace(l))] = struct{}{}
+	if len(normJobLabels) == 0 {
+		return nil
 	}
 
 	var best *domain.RunnerPool
-	bestScore := -1
+	bestExtra := 0
+	bestScoped := false
+	bestSlugHit := false
+
 	for i := range pools {
 		p := &pools[i]
-		if !p.Enabled || len(p.Labels) == 0 {
+		if !p.Enabled {
 			continue
 		}
-		if p.InstallationID != nil && installationID != nil && *p.InstallationID != *installationID {
+		if p.InstallationID != nil {
+			if installationID == nil || *p.InstallationID != *installationID {
+				continue
+			}
+		}
+
+		poolSet := poolLabelSet(p)
+		if len(poolSet) == 0 {
 			continue
 		}
+
 		matchedAll := true
-		for _, pl := range p.Labels {
-			if _, ok := labelSet[strings.ToLower(strings.TrimSpace(pl))]; !ok {
+		for _, jl := range normJobLabels {
+			if _, ok := poolSet[jl]; !ok {
 				matchedAll = false
 				break
 			}
 		}
-		if matchedAll && len(p.Labels) > bestScore {
-			bestScore = len(p.Labels)
+		if !matchedAll {
+			continue
+		}
+
+		scoped := p.InstallationID != nil
+		slugLower := strings.ToLower(strings.TrimSpace(p.Slug))
+		_, slugHit := seenJob[slugLower]
+		if slugLower == "" {
+			slugHit = false
+		}
+		extra := len(poolSet) - len(normJobLabels)
+		if extra < 0 {
+			extra = 0
+		}
+
+		if best == nil || isBetterPoolMatch(p, scoped, slugHit, extra, best, bestScoped, bestSlugHit, bestExtra) {
 			best = p
+			bestScoped = scoped
+			bestSlugHit = slugHit
+			bestExtra = extra
 		}
 	}
 	return best
+}
+
+func poolLabelSet(p *domain.RunnerPool) map[string]struct{} {
+	set := make(map[string]struct{}, len(p.Labels)+4)
+	for _, raw := range p.Labels {
+		if l := strings.ToLower(strings.TrimSpace(raw)); l != "" {
+			set[l] = struct{}{}
+		}
+	}
+	for _, extra := range []string{p.Slug, p.OS, p.Arch, "self-hosted"} {
+		if l := strings.ToLower(strings.TrimSpace(extra)); l != "" {
+			set[l] = struct{}{}
+		}
+	}
+	return set
+}
+
+func isBetterPoolMatch(
+	cand *domain.RunnerPool, candScoped, candSlugHit bool, candExtra int,
+	best *domain.RunnerPool, bestScoped, bestSlugHit bool, bestExtra int,
+) bool {
+	if candScoped != bestScoped {
+		return candScoped
+	}
+	if candSlugHit != bestSlugHit {
+		return candSlugHit
+	}
+	if candExtra != bestExtra {
+		return candExtra < bestExtra
+	}
+	if cand.VCPU != best.VCPU {
+		return cand.VCPU < best.VCPU
+	}
+	return strings.ToLower(cand.Slug) < strings.ToLower(best.Slug)
 }
 
 func matchPatterns(patterns []string, value string) bool {

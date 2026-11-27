@@ -117,12 +117,20 @@ cmd_init() {
     log "Backed up previous env file to ${prev_backup}"
   fi
 
-  local pg_pass sess_secret enc_key wh_secret admin_pass
+  local pg_pass sess_secret enc_key wh_secret admin_pass docker_gid
   pg_pass="$(gen_hex 24)"
   sess_secret="$(gen_base64 36)"
   enc_key="$(gen_base64 32)"
   wh_secret="$(gen_hex 32)"
   admin_pass="$(gen_base64 18)"
+  docker_gid="999"
+  if [[ -S /var/run/docker.sock ]]; then
+    if stat -c '%g' /var/run/docker.sock >/dev/null 2>&1; then
+      docker_gid="$(stat -c '%g' /var/run/docker.sock)"
+    elif stat -f '%g' /var/run/docker.sock >/dev/null 2>&1; then
+      docker_gid="$(stat -f '%g' /var/run/docker.sock)"
+    fi
+  fi
 
   mkdir -p "$(dirname "${ENV_FILE}")" "${BACKUP_DIR_DEFAULT}"
   umask 077
@@ -153,6 +161,9 @@ RUNWAY_GITHUB_WEBHOOK_SECRET=${wh_secret}
 RUNWAY_GITHUB_PRIVATE_KEY_PEM=
 
 RUNWAY_ORCHESTRATOR_PROVIDER=simulated
+RUNWAY_ORCHESTRATOR_DOCKER_SOCKET=/var/run/docker.sock
+RUNWAY_ORCHESTRATOR_DEFAULT_IMAGE=ghcr.io/actions/actions-runner:latest
+DOCKER_GID=${docker_gid}
 RUNWAY_LOGGING_LEVEL=info
 RUNWAY_LOGGING_FORMAT=json
 BACKUP_RETENTION_DAYS=14

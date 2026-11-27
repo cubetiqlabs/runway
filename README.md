@@ -28,6 +28,24 @@ Self-hosted GitHub Actions runner moderator and ephemeral JIT runner control pla
 - **Events**: `workflow_job`, `installation`
 - **Permissions**: `Actions` (Read & write), `Administration` / `Organization self-hosted runners` (Read & write), `Metadata` (Read-only)
 
+## Running Workflows & Docker Provisioner
+
+Target any enabled pool in your workflow using its slug or label subset:
+
+```yaml
+jobs:
+  build:
+    runs-on: runway-ubuntu-4vcpu # or [self-hosted, runway-ubuntu-4vcpu]
+    steps:
+      - uses: actions/checkout@v4
+```
+
+To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml) with your host Docker socket GID (`DOCKER_GID`) or point `RUNWAY_ORCHESTRATOR_DOCKER_SOCKET` at a Docker socket proxy (`tcp://docker-proxy:2375`):
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
+```
+
 ## Operations & Releases
 
 ```sh

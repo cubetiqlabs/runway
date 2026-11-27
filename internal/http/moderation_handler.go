@@ -140,5 +140,5 @@ func (h *ModerationHandler) ListAuditLogs(c fiber.Ctx) error {
 }
 
 func (h *ModerationHandler) SettingsStatus(c fiber.Ctx) error {
-	return c.JSON(h.dashboardSvc.GetSettingsStatus())
+	return c.JSON(h.dashboardSvc.GetSettingsStatus(c.Context()))
 }

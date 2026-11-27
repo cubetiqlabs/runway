@@ -66,6 +66,7 @@ type RunnerRepository interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*Runner, error)
 	GetByName(ctx context.Context, name string) (*Runner, error)
 	List(ctx context.Context, filter RunnerFilter) ([]Runner, int, error)
+	ListActiveByProvider(ctx context.Context, provider string) ([]Runner, error)
 	CountActiveInPool(ctx context.Context, poolID uuid.UUID) (int, error)
 	FindStaleRunners(ctx context.Context, provisioningBefore, heartbeatBefore time.Time) ([]Runner, error)
 }

@@ -18,6 +18,8 @@ func NewSimulatedProvisioner() *SimulatedProvisioner {
 
 func (s *SimulatedProvisioner) Name() string { return "simulated" }
 
+func (s *SimulatedProvisioner) Ping(context.Context) error { return nil }
+
 func (s *SimulatedProvisioner) Provision(_ context.Context, req ProvisionRequest) (*ProvisionResult, error) {
 	ref := "sim-" + req.RunnerID.String()[:12]
 	s.mu.Lock()

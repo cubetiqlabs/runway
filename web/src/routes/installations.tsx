@@ -102,9 +102,19 @@ function InstallationsPage() {
             </div>
             <div>
               <span className="text-muted-foreground block">Orchestrator</span>
-              <span className="font-medium capitalize">
-                {settings.orchestrator_provider} · Default: {settings.moderation_default_action}
-              </span>
+              <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                <span className="font-medium capitalize">
+                  {settings.orchestrator_provider} · Default: {settings.moderation_default_action}
+                </span>
+                <Badge variant={settings.orchestrator_healthy ? "secondary" : "destructive"}>
+                  {settings.orchestrator_healthy ? "Connected" : "Unavailable"}
+                </Badge>
+              </div>
+              {!settings.orchestrator_healthy && settings.orchestrator_error && (
+                <span className="mt-1 block text-[11px] text-destructive break-all">
+                  {settings.orchestrator_error}
+                </span>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -147,7 +157,7 @@ function InstallationsPage() {
           <ResponsiveTable
             id="deliveries-table"
             caption="GitHub webhook delivery log"
-            headers={["Delivery ID", "Event", "Repository", "HMAC", "Status", "Latency"]}
+            headers={["Delivery ID", "Event", "Repository", "HMAC", "Status", "Details", "Latency"]}
             empty={deliveries.length === 0}
             emptyMessage="No webhook deliveries logged yet."
           >
@@ -168,6 +178,13 @@ function InstallationsPage() {
                 </td>
                 <td data-label="Status">
                   <StatusBadge status={d.status} />
+                </td>
+                <td
+                  data-label="Details"
+                  className="max-w-72 truncate text-[11px] text-muted-foreground"
+                  title={d.error_message || undefined}
+                >
+                  {d.error_message || "—"}
                 </td>
                 <td data-label="Latency">{d.processing_ms} ms</td>
               </tr>

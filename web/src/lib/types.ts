@@ -191,6 +191,8 @@ export interface GitHubAppSettingsStatus {
   webhook_secret_set: boolean
   private_key_configured: boolean
   orchestrator_provider: string
+  orchestrator_healthy: boolean
+  orchestrator_error?: string
   moderation_default_action: string
 }
 

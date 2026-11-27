@@ -96,7 +96,7 @@ func TestServerSecurityAndRouting(t *testing.T) {
 	webhookSvc := service.NewWebhookService(cfg, log, nil, nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch)
 	runnerSvc := service.NewRunnerService(cfg, nil, nil, nil, nil, auditRepo, orch)
 	modSvc := service.NewModerationService(nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch)
-	dashSvc := service.NewDashboardService(cfg, nil, auditRepo)
+	dashSvc := service.NewDashboardService(cfg, nil, auditRepo, orch)
 
 	app, err := NewServer(ServerDeps{
 		Config:        cfg,
