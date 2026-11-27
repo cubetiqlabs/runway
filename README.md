@@ -49,8 +49,8 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compos
 For hardware-grade user-space kernel sandboxing via Google **gVisor** (`runsc`), install `runsc` on Linux runner hosts (`RUNWAY_ORCHESTRATOR_SANDBOX_RUNTIME=auto` detects and activates it automatically, or set `gvisor` to require it strictly):
 
 ```sh
-sudo ./scripts/install-gvisor.sh
-# Or pass --install-gvisor --sandbox gvisor when installing runway-agent
+curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-gvisor.sh | sudo sh
+# Or pass --with-gvisor when installing runway-agent (installs prerequisites, Docker if missing, & gVisor)
 ```
 
 _(Default runner pools use `ghcr.io/cubetiqlabs/runway-runner:latest`, preloaded with the Docker CLI, Docker Compose v2, Buildx, `make`, `build-essential`, `gh`, `jq`, and `psql`.)_
@@ -63,6 +63,10 @@ Register an agent token in the Runway console (**Agents -> Register Agent**) and
 # Linux & macOS (systemd / launchd)
 curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.sh | \
   sudo sh -s -- --server https://<your-domain> --token <rwa_...>
+
+# Linux hardened sandbox (auto-installs prerequisites + gVisor runsc + isolated DinD)
+curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.sh | \
+  sudo sh -s -- --server https://<your-domain> --token <rwa_...> --with-gvisor
 ```
 
 ```powershell

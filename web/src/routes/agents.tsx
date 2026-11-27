@@ -166,6 +166,9 @@ function AgentsPage() {
   const unixInstallCmd = issued
     ? `curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.sh | sudo sh -s -- --server ${origin} --token ${issued.token}`
     : ""
+  const gvisorInstallCmd = issued
+    ? `curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.sh | sudo sh -s -- --server ${origin} --token ${issued.token} --with-gvisor`
+    : ""
   const winInstallCmd = issued
     ? `$env:RUNWAY_AGENT_SERVER="${origin}"; $env:RUNWAY_AGENT_TOKEN="${issued.token}"; irm https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.ps1 | iex`
     : ""
@@ -429,6 +432,24 @@ function AgentsPage() {
                 </div>
                 <pre className="overflow-x-auto border border-border bg-muted/50 p-2 font-mono text-[11px] whitespace-pre-wrap break-all">
                   {unixInstallCmd}
+                </pre>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium">Linux Sandboxed Install (gVisor + Isolated DinD)</span>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    onClick={() => void copyText("Linux gVisor command", gvisorInstallCmd)}
+                  >
+                    <HugeiconsIcon icon={Copy01Icon} strokeWidth={2} />
+                    <span>Copy</span>
+                  </Button>
+                </div>
+                <pre className="overflow-x-auto border border-border bg-muted/50 p-2 font-mono text-[11px] whitespace-pre-wrap break-all">
+                  {gvisorInstallCmd}
                 </pre>
               </div>
 
