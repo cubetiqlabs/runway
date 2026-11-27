@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const defaultRunnerImage = "ghcr.io/cubetiqlabs/runway-runner:latest"
+
 const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -n "${DOCKER_HOST:-}" ] && [ -d /home/runner ]; then touch /home/runner/.env 2>/dev/null || true; if ! grep -q '^DOCKER_HOST=' /home/runner/.env 2>/dev/null; then printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> /home/runner/.env 2>/dev/null || true; fi; fi; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
 
 // DockerOptions configures how spawned runner containers access Docker for CI steps.
@@ -128,7 +130,7 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 
 	image := strings.TrimSpace(req.Pool.ContainerImage)
 	if image == "" {
-		image = "ghcr.io/actions/actions-runner:latest"
+		image = defaultRunnerImage
 	}
 
 	vcpu := req.Pool.VCPU

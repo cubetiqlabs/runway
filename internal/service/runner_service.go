@@ -44,11 +44,31 @@ func NewRunnerService(
 	}
 }
 
-// SeedDefaultPools creates initial Blacksmith-style pools on first boot if none exist.
+const legacyBareRunnerImage = "ghcr.io/actions/actions-runner:latest"
+
+// SeedDefaultPools creates initial Blacksmith-style pools on first boot and upgrades legacy bare runner images.
 func (s *RunnerService) SeedDefaultPools(ctx context.Context) error {
 	count, err := s.poolRepo.Count(ctx)
-	if err != nil || count > 0 {
+	if err != nil {
 		return err
+	}
+	if count > 0 {
+		targetImage := strings.TrimSpace(s.cfg.Orchestrator.DefaultImage)
+		if targetImage != "" && targetImage != legacyBareRunnerImage {
+			pools, _, listErr := s.poolRepo.List(ctx, domain.PageParams{Limit: 200, Offset: 0})
+			if listErr != nil {
+				return listErr
+			}
+			for i := range pools {
+				if pools[i].ContainerImage == legacyBareRunnerImage {
+					pools[i].ContainerImage = targetImage
+					if upErr := s.poolRepo.Update(ctx, &pools[i]); upErr != nil {
+						return upErr
+					}
+				}
+			}
+		}
+		return nil
 	}
 
 	defaults := []domain.RunnerPool{

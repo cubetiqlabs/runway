@@ -65,7 +65,7 @@ const EMPTY_FORM: PoolFormState = {
   disk_gb: "40",
   max_concurrency: "10",
   provider: "simulated",
-  container_image: "ghcr.io/actions/actions-runner:latest",
+  container_image: "ghcr.io/cubetiqlabs/runway-runner:latest",
   enabled: true,
 }
 

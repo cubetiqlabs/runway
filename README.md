@@ -46,7 +46,7 @@ To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker
 docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
 ```
 
-_(Ensure your runner pool image includes the Docker CLI, e.g. `catthehacker/ubuntu:runner-22.04` or a custom `ghcr.io/actions/actions-runner` image with `docker-cli`.)_
+_(Default runner pools use `ghcr.io/cubetiqlabs/runway-runner:latest`, preloaded with the Docker CLI, Docker Compose v2, Buildx, `make`, `build-essential`, `gh`, and `jq`.)_
 
 ## Distributed Agents (`runway-agent`)
 

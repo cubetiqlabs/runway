@@ -172,7 +172,7 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("orchestrator.provider", "simulated")
 	v.SetDefault("orchestrator.docker_socket", "/var/run/docker.sock")
-	v.SetDefault("orchestrator.default_image", "ghcr.io/actions/actions-runner:latest")
+	v.SetDefault("orchestrator.default_image", "ghcr.io/cubetiqlabs/runway-runner:latest")
 	v.SetDefault("orchestrator.runner_docker_host", "")
 	v.SetDefault("orchestrator.runner_network", "")
 	v.SetDefault("orchestrator.runner_mount_docker_socket", false)

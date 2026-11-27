@@ -164,7 +164,7 @@ type RunnerPoolModel struct {
 	IdleTimeoutSec int                `gorm:"not null;default:300"`
 	RunnerGroupID  int64              `gorm:"type:bigint;not null;default:1"`
 	Provider       string             `gorm:"type:text;not null;default:'simulated'"`
-	ContainerImage string             `gorm:"type:text;not null;default:'ghcr.io/actions/actions-runner:latest'"`
+	ContainerImage string             `gorm:"type:text;not null;default:'ghcr.io/cubetiqlabs/runway-runner:latest'"`
 	Enabled        bool               `gorm:"index;not null;default:true"`
 	CreatedAt      time.Time          `gorm:"not null;default:now()"`
 	UpdatedAt      time.Time          `gorm:"not null;default:now()"`
