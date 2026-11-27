@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { createFileRoute } from "@tanstack/react-router"
+import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { RefreshIcon, ViewIcon } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { CategoryBarChart } from "@/components/ui/chart"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Dialog,
@@ -16,8 +18,9 @@ import {
 } from "@/components/ui/dialog"
 import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
 import { StatusBadge } from "@/components/status-badge"
-import { api } from "@/lib/api"
-import type { EventRecord, EventSummary } from "@/lib/types"
+import { eventsQueryOptions, eventSummaryQueryOptions } from "@/lib/query"
+import { useAppSelector } from "@/lib/store"
+import type { EventRecord } from "@/lib/types"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/events")({
@@ -25,10 +28,7 @@ export const Route = createFileRoute("/events")({
 })
 
 function EventsPage() {
-  const [events, setEvents] = useState<EventRecord[]>([])
-  const [total, setTotal] = useState(0)
-  const [summary, setSummary] = useState<EventSummary | null>(null)
-  const [loading, setLoading] = useState(true)
+  const livePolling = useAppSelector((s) => s.livePolling)
 
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
@@ -38,38 +38,51 @@ function EventsPage() {
   const [windowRange, setWindowRange] = useState("24h")
   const [sortBy, setSortBy] = useState("occurred_at")
   const [sortDir, setSortDir] = useState<SortDirection>("desc")
-
   const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const [evRes, sumRes] = await Promise.all([
-        api.listEvents({
-          limit: pageSize,
-          page,
-          category,
-          severity,
-          window: windowRange,
-          search: search.trim() || undefined,
-          sort_by: sortBy,
-          sort_dir: sortDir,
-        }),
-        api.eventSummary(windowRange),
-      ])
-      setEvents(evRes.items)
-      setTotal(evRes.total)
-      setSummary(sumRes)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load EventStore")
-    } finally {
-      setLoading(false)
-    }
-  }, [page, pageSize, category, severity, windowRange, search, sortBy, sortDir])
+  const queryParams = useMemo(
+    () => ({
+      limit: pageSize,
+      page,
+      category,
+      severity,
+      window: windowRange,
+      search: search.trim() || undefined,
+      sort_by: sortBy,
+      sort_dir: sortDir,
+    }),
+    [pageSize, page, category, severity, windowRange, search, sortBy, sortDir]
+  )
+
+  const eventsQuery = useQuery({
+    ...eventsQueryOptions(queryParams),
+    placeholderData: keepPreviousData,
+    refetchInterval: livePolling ? 15_000 : false,
+  })
+
+  const summaryQuery = useQuery({
+    ...eventSummaryQueryOptions(windowRange),
+    placeholderData: keepPreviousData,
+    refetchInterval: livePolling ? 15_000 : false,
+  })
 
   useEffect(() => {
-    void load()
-  }, [load])
+    if (eventsQuery.error) {
+      toast.error(
+        eventsQuery.error instanceof Error ? eventsQuery.error.message : "Failed to load EventStore"
+      )
+    }
+  }, [eventsQuery.error])
+
+  const summary = summaryQuery.data
+
+  const categoryChartData = useMemo(() => {
+    if (!summary?.by_category) return []
+    return Object.entries(summary.by_category).map(([cat, count]) => ({
+      category: cat.replace("_", " "),
+      value: count,
+    }))
+  }, [summary?.by_category])
 
   const columns: DataTableColumn<EventRecord>[] = useMemo(
     () => [
@@ -127,6 +140,7 @@ function EventsPage() {
         id: "duration_ms",
         header: "Duration",
         sortable: true,
+        sortType: "number",
         defaultVisible: false,
         cell: (ev) => (
           <span className="font-mono text-[11px] text-muted-foreground">
@@ -168,7 +182,13 @@ function EventsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Select value={windowRange} onValueChange={(v) => { setPage(1); setWindowRange(v || "24h") }}>
+          <Select
+            value={windowRange}
+            onValueChange={(v) => {
+              setPage(1)
+              setWindowRange(v || "24h")
+            }}
+          >
             <SelectTrigger aria-label="Event time window" className="h-8 w-28 text-xs">
               <SelectValue />
             </SelectTrigger>
@@ -179,71 +199,107 @@ function EventsPage() {
               <SelectItem value="168h">Last 7d</SelectItem>
             </SelectContent>
           </Select>
-          <Button type="button" variant="outline" size="sm" onClick={() => void load()}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={eventsQuery.isFetching || summaryQuery.isFetching}
+            onClick={() => {
+              void eventsQuery.refetch()
+              void summaryQuery.refetch()
+            }}
+          >
             <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
-            <span>Refresh</span>
+            <span>{eventsQuery.isFetching ? "Refreshing..." : "Refresh"}</span>
           </Button>
         </div>
       </div>
 
       {summary && (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Card>
-            <CardHeader className="pb-1">
-              <CardDescription>Storage Backend</CardDescription>
-              <CardTitle className="text-xl font-bold capitalize">{summary.driver}</CardTitle>
-            </CardHeader>
-            <CardContent className="text-[11px] text-muted-foreground">
-              Total in window: {summary.total_events.toLocaleString()}
-            </CardContent>
-          </Card>
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Card>
+              <CardHeader className="pb-1">
+                <CardDescription>Storage Backend</CardDescription>
+                <CardTitle className="text-xl font-bold capitalize">{summary.driver}</CardTitle>
+              </CardHeader>
+              <CardContent className="text-[11px] text-muted-foreground">
+                Total in window: {summary.total_events.toLocaleString()}
+              </CardContent>
+            </Card>
 
-          <Card>
-            <CardHeader className="pb-1">
-              <CardDescription>Webhooks &amp; Audits</CardDescription>
-              <CardTitle className="text-xl font-bold">
-                {((summary.by_category?.webhook ?? 0) + (summary.by_category?.audit ?? 0)).toLocaleString()}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-[11px] text-muted-foreground">
-              {summary.by_category?.webhook ?? 0} webhooks · {summary.by_category?.audit ?? 0} audits
-            </CardContent>
-          </Card>
+            <Card>
+              <CardHeader className="pb-1">
+                <CardDescription>Webhooks &amp; Audits</CardDescription>
+                <CardTitle className="text-xl font-bold">
+                  {(
+                    (summary.by_category?.webhook ?? 0) + (summary.by_category?.audit ?? 0)
+                  ).toLocaleString()}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="text-[11px] text-muted-foreground">
+                {summary.by_category?.webhook ?? 0} webhooks · {summary.by_category?.audit ?? 0}{" "}
+                audits
+              </CardContent>
+            </Card>
 
-          <Card>
-            <CardHeader className="pb-1">
-              <CardDescription>Runner Logs &amp; Metrics</CardDescription>
-              <CardTitle className="text-xl font-bold">
-                {((summary.by_category?.runner_log ?? 0) + (summary.by_category?.agent_metric ?? 0)).toLocaleString()}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-[11px] text-muted-foreground">
-              {summary.by_category?.runner_log ?? 0} logs · {summary.by_category?.agent_metric ?? 0} metrics
-            </CardContent>
-          </Card>
+            <Card>
+              <CardHeader className="pb-1">
+                <CardDescription>Runner Logs &amp; Metrics</CardDescription>
+                <CardTitle className="text-xl font-bold">
+                  {(
+                    (summary.by_category?.runner_log ?? 0) +
+                    (summary.by_category?.agent_metric ?? 0)
+                  ).toLocaleString()}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="text-[11px] text-muted-foreground">
+                {summary.by_category?.runner_log ?? 0} logs ·{" "}
+                {summary.by_category?.agent_metric ?? 0} metrics
+              </CardContent>
+            </Card>
 
-          <Card>
-            <CardHeader className="pb-1">
-              <CardDescription>Ingestion Pipeline</CardDescription>
-              <CardTitle className="text-xl font-bold">
-                {summary.ingestion.flushed.toLocaleString()} flushed
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-[11px] text-muted-foreground">
-              Queue {summary.ingestion.queue_depth}/{summary.ingestion.buffer_capacity} ·{" "}
-              {summary.ingestion.dropped} dropped · {summary.by_severity?.error ?? 0} errors
-            </CardContent>
-          </Card>
+            <Card>
+              <CardHeader className="pb-1">
+                <CardDescription>Ingestion Pipeline</CardDescription>
+                <CardTitle className="text-xl font-bold">
+                  {summary.ingestion.flushed.toLocaleString()} flushed
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="text-[11px] text-muted-foreground">
+                Queue {summary.ingestion.queue_depth}/{summary.ingestion.buffer_capacity} ·{" "}
+                {summary.ingestion.dropped} dropped · {summary.by_severity?.error ?? 0} errors
+              </CardContent>
+            </Card>
+          </div>
+
+          {categoryChartData.length > 0 && (
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle>Event Volume by Category</CardTitle>
+                <CardDescription>Distribution across streams for window {windowRange}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <CategoryBarChart
+                  data={categoryChartData}
+                  ariaLabel="Event volume by category bar chart"
+                  color="var(--chart-3)"
+                  height={165}
+                />
+              </CardContent>
+            </Card>
+          )}
         </div>
       )}
 
       <DataTable
         id="events-table"
         caption="EventStore unified event stream"
-        data={events}
+        data={eventsQuery.data?.items ?? []}
         columns={columns}
         getRowId={(ev) => ev.id}
-        loading={loading}
+        loading={eventsQuery.isPending}
+        fetching={eventsQuery.isFetching && !eventsQuery.isPending}
         emptyMessage="No events match the current filters."
         searchValue={search}
         onSearchChange={(val) => {
@@ -255,6 +311,7 @@ function EventsPage() {
           {
             id: "category",
             label: "Category",
+            searchable: true,
             value: category,
             onChange: (v) => {
               setPage(1)
@@ -273,6 +330,7 @@ function EventsPage() {
           {
             id: "severity",
             label: "Severity",
+            searchable: true,
             value: severity,
             onChange: (v) => {
               setPage(1)
@@ -302,7 +360,7 @@ function EventsPage() {
         pagination={{
           page,
           pageSize,
-          total,
+          total: eventsQuery.data?.total ?? 0,
           onPageChange: setPage,
           onPageSizeChange: (n) => {
             setPage(1)
@@ -316,7 +374,8 @@ function EventsPage() {
           <DialogHeader>
             <DialogTitle className="font-mono text-sm">{selectedEvent?.event_type}</DialogTitle>
             <DialogDescription>
-              {selectedEvent?.category} · {selectedEvent ? new Date(selectedEvent.occurred_at).toLocaleString() : ""}
+              {selectedEvent?.category} ·{" "}
+              {selectedEvent ? new Date(selectedEvent.occurred_at).toLocaleString() : ""}
             </DialogDescription>
           </DialogHeader>
           {selectedEvent && (
@@ -334,7 +393,9 @@ function EventsPage() {
                 </div>
                 <div>
                   <span className="text-muted-foreground block">Correlation ID</span>
-                  <span className="font-mono break-all">{selectedEvent.correlation_id || "—"}</span>
+                  <span className="font-mono break-all">
+                    {selectedEvent.correlation_id || "—"}
+                  </span>
                 </div>
                 <div>
                   <span className="text-muted-foreground block">Repository / IP</span>

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { createFileRoute } from "@tanstack/react-router"
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { RefreshIcon } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
@@ -9,7 +10,15 @@ import { DataTable, type DataTableColumn, type SortDirection } from "@/component
 import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
 import { api } from "@/lib/api"
-import type { AuditLog, GitHubAppSettingsStatus, Installation, WebhookDelivery } from "@/lib/types"
+import {
+  auditLogsQueryOptions,
+  deliveriesQueryOptions,
+  installationsQueryOptions,
+  queryKeys,
+  settingsStatusQueryOptions,
+} from "@/lib/query"
+import { useAppSelector } from "@/lib/store"
+import type { AuditLog, Installation, WebhookDelivery } from "@/lib/types"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/installations")({
@@ -17,13 +26,10 @@ export const Route = createFileRoute("/installations")({
 })
 
 function InstallationsPage() {
-  const [settings, setSettings] = useState<GitHubAppSettingsStatus | null>(null)
-  const [syncing, setSyncing] = useState(false)
+  const queryClient = useQueryClient()
+  const livePolling = useAppSelector((s) => s.livePolling)
 
   // Installations state
-  const [installations, setInstallations] = useState<Installation[]>([])
-  const [instTotal, setInstTotal] = useState(0)
-  const [instLoading, setInstLoading] = useState(true)
   const [instPage, setInstPage] = useState(1)
   const [instPageSize, setInstPageSize] = useState(25)
   const [instSearch, setInstSearch] = useState("")
@@ -31,9 +37,6 @@ function InstallationsPage() {
   const [instSortDir, setInstSortDir] = useState<SortDirection>("desc")
 
   // Webhook deliveries state
-  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([])
-  const [delTotal, setDelTotal] = useState(0)
-  const [delLoading, setDelLoading] = useState(true)
   const [delPage, setDelPage] = useState(1)
   const [delPageSize, setDelPageSize] = useState(25)
   const [delSearch, setDelSearch] = useState("")
@@ -42,110 +45,91 @@ function InstallationsPage() {
   const [delSortDir, setDelSortDir] = useState<SortDirection>("desc")
 
   // Audit logs state
-  const [audits, setAudits] = useState<AuditLog[]>([])
-  const [audTotal, setAudTotal] = useState(0)
-  const [audLoading, setAudLoading] = useState(true)
   const [audPage, setAudPage] = useState(1)
   const [audPageSize, setAudPageSize] = useState(25)
   const [audSearch, setAudSearch] = useState("")
   const [audSortBy, setAudSortBy] = useState("created_at")
   const [audSortDir, setAudSortDir] = useState<SortDirection>("desc")
 
-  const loadSettings = useCallback(async () => {
-    try {
-      const res = await api.settingsStatus()
-      setSettings(res)
-    } catch {
-      // handled in list loaders
-    }
-  }, [])
+  const settingsQuery = useQuery({
+    ...settingsStatusQueryOptions(),
+    refetchInterval: livePolling ? 15_000 : false,
+  })
 
-  const loadInstallations = useCallback(async () => {
-    setInstLoading(true)
-    try {
-      const res = await api.listInstallations({
-        limit: instPageSize,
-        page: instPage,
-        search: instSearch.trim() || undefined,
-        sort_by: instSortBy,
-        sort_dir: instSortDir,
-      })
-      setInstallations(res.items)
-      setInstTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load installations")
-    } finally {
-      setInstLoading(false)
-    }
-  }, [instPage, instPageSize, instSearch, instSortBy, instSortDir])
+  const instQuery = useQuery({
+    ...installationsQueryOptions({
+      limit: instPageSize,
+      page: instPage,
+      search: instSearch.trim() || undefined,
+      sort_by: instSortBy,
+      sort_dir: instSortDir,
+    }),
+    placeholderData: keepPreviousData,
+  })
 
-  const loadDeliveries = useCallback(async () => {
-    setDelLoading(true)
-    try {
-      const res = await api.listDeliveries({
-        limit: delPageSize,
-        page: delPage,
-        status: delStatus,
-        search: delSearch.trim() || undefined,
-        sort_by: delSortBy,
-        sort_dir: delSortDir,
-      })
-      setDeliveries(res.items)
-      setDelTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load webhook deliveries")
-    } finally {
-      setDelLoading(false)
-    }
-  }, [delPage, delPageSize, delStatus, delSearch, delSortBy, delSortDir])
+  const delQuery = useQuery({
+    ...deliveriesQueryOptions({
+      limit: delPageSize,
+      page: delPage,
+      status: delStatus,
+      search: delSearch.trim() || undefined,
+      sort_by: delSortBy,
+      sort_dir: delSortDir,
+    }),
+    placeholderData: keepPreviousData,
+    refetchInterval: livePolling ? 15_000 : false,
+  })
 
-  const loadAudits = useCallback(async () => {
-    setAudLoading(true)
-    try {
-      const res = await api.listAuditLogs({
-        limit: audPageSize,
-        page: audPage,
-        search: audSearch.trim() || undefined,
-        sort_by: audSortBy,
-        sort_dir: audSortDir,
-      })
-      setAudits(res.items)
-      setAudTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load audit logs")
-    } finally {
-      setAudLoading(false)
-    }
-  }, [audPage, audPageSize, audSearch, audSortBy, audSortDir])
+  const audQuery = useQuery({
+    ...auditLogsQueryOptions({
+      limit: audPageSize,
+      page: audPage,
+      search: audSearch.trim() || undefined,
+      sort_by: audSortBy,
+      sort_dir: audSortDir,
+    }),
+    placeholderData: keepPreviousData,
+  })
 
   useEffect(() => {
-    void loadSettings()
-  }, [loadSettings])
+    if (instQuery.error) {
+      toast.error(
+        instQuery.error instanceof Error ? instQuery.error.message : "Failed to load installations"
+      )
+    }
+  }, [instQuery.error])
 
   useEffect(() => {
-    void loadInstallations()
-  }, [loadInstallations])
+    if (delQuery.error) {
+      toast.error(
+        delQuery.error instanceof Error
+          ? delQuery.error.message
+          : "Failed to load webhook deliveries"
+      )
+    }
+  }, [delQuery.error])
 
   useEffect(() => {
-    void loadDeliveries()
-  }, [loadDeliveries])
+    if (audQuery.error) {
+      toast.error(
+        audQuery.error instanceof Error ? audQuery.error.message : "Failed to load audit logs"
+      )
+    }
+  }, [audQuery.error])
 
-  useEffect(() => {
-    void loadAudits()
-  }, [loadAudits])
-
-  const handleSync = async () => {
-    setSyncing(true)
-    try {
-      const res = await api.syncInstallations()
+  const syncMutation = useMutation({
+    mutationFn: () => api.syncInstallations(),
+    onSuccess: (res) => {
       toast.success(`Synced ${res.synced} installations from GitHub`)
-      void loadInstallations()
-    } catch (err) {
+      void queryClient.invalidateQueries({ queryKey: ["installations"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Sync failed")
-    } finally {
-      setSyncing(false)
-    }
-  }
+    },
+  })
+
+  const settings = settingsQuery.data
 
   const instColumns: DataTableColumn<Installation>[] = useMemo(
     () => [
@@ -153,6 +137,7 @@ function InstallationsPage() {
         id: "id",
         header: "Installation ID",
         sortable: true,
+        sortType: "number",
         cell: (inst) => <span className="font-mono">{inst.id}</span>,
       },
       {
@@ -237,6 +222,7 @@ function InstallationsPage() {
         id: "processing_ms",
         header: "Latency",
         sortable: true,
+        sortType: "number",
         cell: (d) => <span className="font-mono text-[11px]">{d.processing_ms} ms</span>,
       },
       {
@@ -298,6 +284,10 @@ function InstallationsPage() {
     []
   )
 
+  const instTotal = instQuery.data?.total ?? 0
+  const delTotal = delQuery.data?.total ?? 0
+  const audTotal = audQuery.data?.total ?? 0
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -308,9 +298,15 @@ function InstallationsPage() {
             immutable audit events.
           </p>
         </div>
-        <Button type="button" variant="outline" size="sm" disabled={syncing} onClick={() => void handleSync()}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={syncMutation.isPending}
+          onClick={() => syncMutation.mutate()}
+        >
           <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
-          <span>{syncing ? "Syncing..." : "Sync Installations"}</span>
+          <span>{syncMutation.isPending ? "Syncing..." : "Sync Installations"}</span>
         </Button>
       </div>
 
@@ -437,10 +433,11 @@ function InstallationsPage() {
           <DataTable
             id="installations-table"
             caption="GitHub App installations"
-            data={installations}
+            data={instQuery.data?.items ?? []}
             columns={instColumns}
             getRowId={(inst) => String(inst.id)}
-            loading={instLoading}
+            loading={instQuery.isPending}
+            fetching={instQuery.isFetching && !instQuery.isPending}
             emptyMessage="No GitHub App installations recorded yet."
             searchValue={instSearch}
             onSearchChange={(val) => {
@@ -472,10 +469,11 @@ function InstallationsPage() {
           <DataTable
             id="deliveries-table"
             caption="GitHub webhook delivery log"
-            data={deliveries}
+            data={delQuery.data?.items ?? []}
             columns={delColumns}
             getRowId={(d) => d.delivery_id}
-            loading={delLoading}
+            loading={delQuery.isPending}
+            fetching={delQuery.isFetching && !delQuery.isPending}
             emptyMessage="No webhook deliveries logged yet."
             searchValue={delSearch}
             onSearchChange={(val) => {
@@ -487,6 +485,7 @@ function InstallationsPage() {
               {
                 id: "status",
                 label: "Status",
+                searchable: true,
                 value: delStatus,
                 onChange: (v) => {
                   setDelPage(1)
@@ -529,10 +528,11 @@ function InstallationsPage() {
           <DataTable
             id="audit-table"
             caption="Immutable control plane audit logs"
-            data={audits}
+            data={audQuery.data?.items ?? []}
             columns={auditColumns}
             getRowId={(a) => String(a.id)}
-            loading={audLoading}
+            loading={audQuery.isPending}
+            fetching={audQuery.isFetching && !audQuery.isPending}
             emptyMessage="No audit log entries yet."
             searchValue={audSearch}
             onSearchChange={(val) => {

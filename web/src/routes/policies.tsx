@@ -1,12 +1,14 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { createFileRoute } from "@tanstack/react-router"
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useForm } from "@tanstack/react-form"
+import { z } from "zod"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { Add01Icon, Edit02Icon, Delete02Icon, PlayIcon } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
+import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Dialog,
   DialogContent,
@@ -26,9 +28,11 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
+import { SearchableCombobox, type ComboboxOption } from "@/components/searchable-combobox"
 import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
 import { api } from "@/lib/api"
+import { policiesQueryOptions } from "@/lib/query"
 import type { ModerationPolicy, PolicyAction, RunnerPool } from "@/lib/types"
 import { toast } from "sonner"
 
@@ -36,22 +40,35 @@ export const Route = createFileRoute("/policies")({
   component: PoliciesPage,
 })
 
-interface PolicyFormState {
-  id?: string
-  name: string
-  description: string
-  priority: string
-  action: PolicyAction
-  enabled: boolean
-  repoPatterns: string
-  branchPatterns: string
-  actorPatterns: string
-  labelPatterns: string
-  block_fork_prs: boolean
-  max_concurrent_per_repo: string
-}
+const ACTION_OPTIONS: ComboboxOption[] = [
+  { value: "allow", label: "Allow", description: "Auto-approve and dispatch immediately" },
+  {
+    value: "require_approval",
+    label: "Require Approval",
+    description: "Hold in moderation queue for operator review",
+  },
+  { value: "deny", label: "Deny", description: "Reject workflow job before provisioning" },
+]
 
-const EMPTY_POLICY: PolicyFormState = {
+const policyFormSchema = z.object({
+  id: z.string(),
+  name: z.string().trim().min(1, "Policy name is required."),
+  description: z.string(),
+  priority: z.string(),
+  action: z.enum(["allow", "deny", "require_approval"]),
+  enabled: z.boolean(),
+  repoPatterns: z.string(),
+  branchPatterns: z.string(),
+  actorPatterns: z.string(),
+  labelPatterns: z.string(),
+  block_fork_prs: z.boolean(),
+  max_concurrent_per_repo: z.string(),
+})
+
+type PolicyFormValues = z.infer<typeof policyFormSchema>
+
+const EMPTY_POLICY: PolicyFormValues = {
+  id: "",
   name: "",
   description: "",
   priority: "50",
@@ -65,6 +82,14 @@ const EMPTY_POLICY: PolicyFormState = {
   max_concurrent_per_repo: "",
 }
 
+const simFormSchema = z.object({
+  repo_full_name: z.string().trim().min(1, "Repository is required."),
+  head_branch: z.string().trim().min(1, "Branch is required."),
+  actor: z.string().trim().min(1, "Actor is required."),
+  labels: z.string(),
+  is_fork_pr: z.boolean(),
+})
+
 function splitPatterns(raw: string): string[] {
   return raw
     .split(",")
@@ -73,9 +98,7 @@ function splitPatterns(raw: string): string[] {
 }
 
 function PoliciesPage() {
-  const [policies, setPolicies] = useState<ModerationPolicy[]>([])
-  const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(true)
+  const queryClient = useQueryClient()
 
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
@@ -86,52 +109,152 @@ function PoliciesPage() {
   const [sortDir, setSortDir] = useState<SortDirection>("asc")
 
   const [dialogOpen, setDialogOpen] = useState(false)
-  const [form, setForm] = useState<PolicyFormState>(EMPTY_POLICY)
+  const [editingId, setEditingId] = useState("")
   const [deleteTarget, setDeleteTarget] = useState<ModerationPolicy | null>(null)
 
   const [simOpen, setSimOpen] = useState(false)
-  const [simRepo, setSimRepo] = useState("cubetiq/api")
-  const [simBranch, setSimBranch] = useState("main")
-  const [simActor, setSimActor] = useState("octocat")
-  const [simLabels, setSimLabels] = useState("self-hosted, linux, x64, runway-ubuntu-4vcpu")
-  const [simFork, setSimFork] = useState(false)
   const [simResult, setSimResult] = useState<{
     decision: { action: PolicyAction; policy_name: string; reason: string }
     matched_pool: RunnerPool | null
   } | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await api.listPolicies({
-        limit: pageSize,
-        page,
-        search: search.trim() || undefined,
-        action: actionFilter,
-        enabled: enabledFilter,
-        sort_by: sortBy,
-        sort_dir: sortDir,
-      })
-      setPolicies(res.items)
-      setTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load policies")
-    } finally {
-      setLoading(false)
-    }
-  }, [page, pageSize, search, actionFilter, enabledFilter, sortBy, sortDir])
+  const queryParams = useMemo(
+    () => ({
+      limit: pageSize,
+      page,
+      search: search.trim() || undefined,
+      action: actionFilter,
+      enabled: enabledFilter,
+      sort_by: sortBy,
+      sort_dir: sortDir,
+    }),
+    [pageSize, page, search, actionFilter, enabledFilter, sortBy, sortDir]
+  )
+
+  const policiesQuery = useQuery({
+    ...policiesQueryOptions(queryParams),
+    placeholderData: keepPreviousData,
+  })
 
   useEffect(() => {
-    void load()
-  }, [load])
+    if (policiesQuery.error) {
+      toast.error(
+        policiesQuery.error instanceof Error
+          ? policiesQuery.error.message
+          : "Failed to load policies"
+      )
+    }
+  }, [policiesQuery.error])
+
+  const saveMutation = useMutation({
+    mutationFn: ({ id, payload }: { id?: string; payload: Partial<ModerationPolicy> }) =>
+      id ? api.updatePolicy(id, payload) : api.createPolicy(payload),
+    onSuccess: (_res, vars) => {
+      toast.success(vars.id ? "Policy updated" : "Policy created")
+      setDialogOpen(false)
+      void queryClient.invalidateQueries({ queryKey: ["policies"] })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Failed to save policy")
+    },
+  })
+
+  const toggleMutation = useMutation({
+    mutationFn: ({ policy, enabled }: { policy: ModerationPolicy; enabled: boolean }) =>
+      api.updatePolicy(policy.id, { ...policy, enabled }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["policies"] })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Failed to toggle policy")
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => api.deletePolicy(id),
+    onSuccess: () => {
+      toast.success(`Deleted policy ${deleteTarget?.name ?? ""}`)
+      setDeleteTarget(null)
+      void queryClient.invalidateQueries({ queryKey: ["policies"] })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Failed to delete policy")
+    },
+  })
+
+  const simulateMutation = useMutation({
+    mutationFn: (payload: {
+      repo_full_name: string
+      head_branch: string
+      actor: string
+      labels: string[]
+      is_fork_pr: boolean
+    }) => api.simulatePolicy(payload),
+    onSuccess: (res) => {
+      setSimResult(res)
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Simulation failed")
+    },
+  })
+
+  const policyForm = useForm({
+    defaultValues: EMPTY_POLICY,
+    validators: {
+      onSubmit: policyFormSchema,
+    },
+    onSubmit: async ({ value }) => {
+      const maxConc = value.max_concurrent_per_repo.trim()
+        ? Number(value.max_concurrent_per_repo.trim())
+        : null
+      const payload: Partial<ModerationPolicy> = {
+        name: value.name.trim(),
+        description: value.description.trim(),
+        priority: Number(value.priority) || 100,
+        action: value.action as PolicyAction,
+        enabled: value.enabled,
+        repo_patterns: splitPatterns(value.repoPatterns),
+        branch_patterns: splitPatterns(value.branchPatterns),
+        actor_patterns: splitPatterns(value.actorPatterns),
+        label_patterns: splitPatterns(value.labelPatterns),
+        block_fork_prs: value.block_fork_prs,
+        max_concurrent_per_repo: maxConc,
+      }
+      await saveMutation.mutateAsync({ id: value.id || undefined, payload })
+    },
+  })
+
+  const simForm = useForm({
+    defaultValues: {
+      repo_full_name: "cubetiq/api",
+      head_branch: "main",
+      actor: "octocat",
+      labels: "self-hosted, linux, x64, runway-ubuntu-4vcpu",
+      is_fork_pr: false,
+    },
+    validators: {
+      onSubmit: simFormSchema,
+    },
+    onSubmit: async ({ value }) => {
+      await simulateMutation.mutateAsync({
+        repo_full_name: value.repo_full_name.trim(),
+        head_branch: value.head_branch.trim(),
+        actor: value.actor.trim(),
+        labels: splitPatterns(value.labels),
+        is_fork_pr: value.is_fork_pr,
+      })
+    },
+  })
 
   const openCreate = () => {
-    setForm(EMPTY_POLICY)
+    setEditingId("")
+    policyForm.reset(EMPTY_POLICY)
     setDialogOpen(true)
   }
 
   const openEdit = (p: ModerationPolicy) => {
-    setForm({
+    setEditingId(p.id)
+    policyForm.reset({
       id: p.id,
       name: p.name,
       description: p.description,
@@ -148,77 +271,13 @@ function PoliciesPage() {
     setDialogOpen(true)
   }
 
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!form.name.trim()) {
-      toast.error("Policy name is required")
-      return
-    }
-    const maxConc = form.max_concurrent_per_repo.trim()
-      ? Number(form.max_concurrent_per_repo.trim())
-      : null
-    const payload: Partial<ModerationPolicy> = {
-      name: form.name.trim(),
-      description: form.description.trim(),
-      priority: Number(form.priority) || 100,
-      action: form.action,
-      enabled: form.enabled,
-      repo_patterns: splitPatterns(form.repoPatterns),
-      branch_patterns: splitPatterns(form.branchPatterns),
-      actor_patterns: splitPatterns(form.actorPatterns),
-      label_patterns: splitPatterns(form.labelPatterns),
-      block_fork_prs: form.block_fork_prs,
-      max_concurrent_per_repo: maxConc,
-    }
-    try {
-      if (form.id) {
-        await api.updatePolicy(form.id, payload)
-        toast.success("Policy updated")
-      } else {
-        await api.createPolicy(payload)
-        toast.success("Policy created")
-      }
-      setDialogOpen(false)
-      void load()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to save policy")
-    }
-  }
-
-  const handleSimulate = async (e: React.FormEvent) => {
-    e.preventDefault()
-    try {
-      const res = await api.simulatePolicy({
-        repo_full_name: simRepo.trim(),
-        head_branch: simBranch.trim(),
-        actor: simActor.trim(),
-        labels: splitPatterns(simLabels),
-        is_fork_pr: simFork,
-      })
-      setSimResult(res)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Simulation failed")
-    }
-  }
-
-  const confirmDelete = async () => {
-    if (!deleteTarget) return
-    try {
-      await api.deletePolicy(deleteTarget.id)
-      toast.success(`Deleted policy ${deleteTarget.name}`)
-      setDeleteTarget(null)
-      void load()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to delete policy")
-    }
-  }
-
   const columns: DataTableColumn<ModerationPolicy>[] = useMemo(
     () => [
       {
         id: "priority",
         header: "Priority",
         sortable: true,
+        sortType: "number",
         cell: (p) => <span className="font-mono font-semibold">{p.priority}</span>,
       },
       {
@@ -279,9 +338,8 @@ function PoliciesPage() {
         cell: (p) => (
           <Switch
             checked={p.enabled}
-            onCheckedChange={(checked) =>
-              void api.updatePolicy(p.id, { ...p, enabled: checked }).then(() => load())
-            }
+            disabled={toggleMutation.isPending}
+            onCheckedChange={(checked) => toggleMutation.mutate({ policy: p, enabled: checked })}
             aria-label={`Toggle ${p.name}`}
           />
         ),
@@ -309,7 +367,7 @@ function PoliciesPage() {
         ),
       },
     ],
-    [load]
+    [toggleMutation]
   )
 
   return (
@@ -337,10 +395,11 @@ function PoliciesPage() {
       <DataTable
         id="policies-table"
         caption="Runner moderation policies ordered by priority"
-        data={policies}
+        data={policiesQuery.data?.items ?? []}
         columns={columns}
         getRowId={(p) => p.id}
-        loading={loading}
+        loading={policiesQuery.isPending}
+        fetching={policiesQuery.isFetching && !policiesQuery.isPending}
         emptyMessage="No moderation policies match this filter."
         searchValue={search}
         onSearchChange={(val) => {
@@ -352,6 +411,7 @@ function PoliciesPage() {
           {
             id: "action",
             label: "Action",
+            searchable: true,
             value: actionFilter,
             onChange: (v) => {
               setPage(1)
@@ -395,7 +455,7 @@ function PoliciesPage() {
         pagination={{
           page,
           pageSize,
-          total,
+          total: policiesQuery.data?.total ?? 0,
           onPageChange: setPage,
           onPageSizeChange: (n) => {
             setPage(1)
@@ -408,134 +468,184 @@ function PoliciesPage() {
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="sm:max-w-lg max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>{form.id ? "Edit Policy" : "Create Moderation Policy"}</DialogTitle>
+            <DialogTitle>{editingId ? "Edit Policy" : "Create Moderation Policy"}</DialogTitle>
             <DialogDescription>
               Lower priority numbers evaluate first. First matching policy determines job fate.
             </DialogDescription>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-3">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              void policyForm.handleSubmit()
+            }}
+            className="space-y-3"
+          >
             <div className="grid gap-3 sm:grid-cols-3">
-              <div className="space-y-1 sm:col-span-2">
-                <Label htmlFor="pol-name">Policy Name</Label>
-                <Input
-                  id="pol-name"
-                  required
-                  value={form.name}
-                  onChange={(e) => setForm({ ...form, name: e.target.value })}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="pol-priority">Priority</Label>
-                <Input
-                  id="pol-priority"
-                  inputMode="numeric"
-                  value={form.priority}
-                  onChange={(e) => setForm({ ...form, priority: e.target.value })}
-                />
-              </div>
+              <policyForm.Field name="name">
+                {(field) => {
+                  const invalid =
+                    (field.state.meta.isTouched || policyForm.state.submissionAttempts > 0) &&
+                    !field.state.meta.isValid
+                  return (
+                    <Field data-invalid={invalid} className="sm:col-span-2">
+                      <FieldLabel htmlFor="pol-name">Policy Name</FieldLabel>
+                      <Input
+                        id="pol-name"
+                        required
+                        aria-invalid={invalid ? "true" : "false"}
+                        aria-describedby={invalid ? "pol-name-err" : undefined}
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={(e) => field.handleChange(e.target.value)}
+                      />
+                      {invalid && <FieldError id="pol-name-err" errors={field.state.meta.errors} />}
+                    </Field>
+                  )
+                }}
+              </policyForm.Field>
+              <policyForm.Field name="priority">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-priority">Priority</FieldLabel>
+                    <Input
+                      id="pol-priority"
+                      inputMode="numeric"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <Label htmlFor="pol-action">Action</Label>
-                <Select
-                  value={form.action}
-                  onValueChange={(v) =>
-                    setForm({ ...form, action: (v as PolicyAction) || "allow" })
-                  }
-                >
-                  <SelectTrigger id="pol-action" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="allow">Allow</SelectItem>
-                    <SelectItem value="require_approval">Require Approval</SelectItem>
-                    <SelectItem value="deny">Deny</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="pol-cap">Max Concurrent / Repo</Label>
-                <Input
-                  id="pol-cap"
-                  inputMode="numeric"
-                  placeholder="Unlimited"
-                  value={form.max_concurrent_per_repo}
-                  onChange={(e) => setForm({ ...form, max_concurrent_per_repo: e.target.value })}
-                />
-              </div>
+              <policyForm.Field name="action">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-action">Action</FieldLabel>
+                    <SearchableCombobox
+                      id="pol-action"
+                      ariaLabel="Policy Action"
+                      options={ACTION_OPTIONS}
+                      value={field.state.value}
+                      onValueChange={(v) => field.handleChange((v as PolicyAction) || "allow")}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
+              <policyForm.Field name="max_concurrent_per_repo">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-cap">Max Concurrent / Repo</FieldLabel>
+                    <Input
+                      id="pol-cap"
+                      inputMode="numeric"
+                      placeholder="Unlimited"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <Label htmlFor="pol-repos">Repo Patterns (glob)</Label>
-                <Input
-                  id="pol-repos"
-                  value={form.repoPatterns}
-                  onChange={(e) => setForm({ ...form, repoPatterns: e.target.value })}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="pol-branches">Branch Patterns</Label>
-                <Input
-                  id="pol-branches"
-                  value={form.branchPatterns}
-                  onChange={(e) => setForm({ ...form, branchPatterns: e.target.value })}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
+              <policyForm.Field name="repoPatterns">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-repos">Repo Patterns (glob)</FieldLabel>
+                    <Input
+                      id="pol-repos"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
+              <policyForm.Field name="branchPatterns">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-branches">Branch Patterns</FieldLabel>
+                    <Input
+                      id="pol-branches"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <Label htmlFor="pol-actors">Actor Patterns</Label>
-                <Input
-                  id="pol-actors"
-                  value={form.actorPatterns}
-                  onChange={(e) => setForm({ ...form, actorPatterns: e.target.value })}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="pol-labels">Label Patterns</Label>
-                <Input
-                  id="pol-labels"
-                  value={form.labelPatterns}
-                  onChange={(e) => setForm({ ...form, labelPatterns: e.target.value })}
-                  placeholder="Optional"
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
+              <policyForm.Field name="actorPatterns">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-actors">Actor Patterns</FieldLabel>
+                    <Input
+                      id="pol-actors"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
+              <policyForm.Field name="labelPatterns">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="pol-labels">Label Patterns</FieldLabel>
+                    <Input
+                      id="pol-labels"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      placeholder="Optional"
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </policyForm.Field>
             </div>
 
-            <div className="flex items-center justify-between border border-border p-3">
-              <div>
-                <Label htmlFor="pol-fork">Block Fork Pull Requests</Label>
-                <p className="text-[11px] text-muted-foreground">
-                  Deny jobs triggered from external repository forks before provisioning.
-                </p>
-              </div>
-              <Switch
-                id="pol-fork"
-                checked={form.block_fork_prs}
-                onCheckedChange={(checked) => setForm({ ...form, block_fork_prs: checked })}
-              />
-            </div>
+            <policyForm.Field name="block_fork_prs">
+              {(field) => (
+                <div className="flex items-center justify-between border border-border p-3">
+                  <div>
+                    <FieldLabel htmlFor="pol-fork">Block Fork Pull Requests</FieldLabel>
+                    <p className="text-[11px] text-muted-foreground">
+                      Deny jobs triggered from external repository forks before provisioning.
+                    </p>
+                  </div>
+                  <Switch
+                    id="pol-fork"
+                    checked={field.state.value}
+                    onCheckedChange={(checked) => field.handleChange(checked)}
+                  />
+                </div>
+              )}
+            </policyForm.Field>
 
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>
                 Cancel
               </Button>
-              <Button type="submit">Save Policy</Button>
+              <policyForm.Subscribe selector={(state) => state.isSubmitting}>
+                {(isSubmitting) => (
+                  <Button type="submit" disabled={isSubmitting || saveMutation.isPending}>
+                    {isSubmitting || saveMutation.isPending ? "Saving..." : "Save Policy"}
+                  </Button>
+                )}
+              </policyForm.Subscribe>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -551,59 +661,90 @@ function PoliciesPage() {
               live policies and runner pools.
             </DialogDescription>
           </DialogHeader>
-          <form onSubmit={handleSimulate} className="space-y-3">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              void simForm.handleSubmit()
+            }}
+            className="space-y-3"
+          >
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <Label htmlFor="sim-repo">Repository</Label>
-                <Input
-                  id="sim-repo"
-                  value={simRepo}
-                  onChange={(e) => setSimRepo(e.target.value)}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="sim-branch">Head Branch</Label>
-                <Input
-                  id="sim-branch"
-                  value={simBranch}
-                  onChange={(e) => setSimBranch(e.target.value)}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
+              <simForm.Field name="repo_full_name">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="sim-repo">Repository</FieldLabel>
+                    <Input
+                      id="sim-repo"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </simForm.Field>
+              <simForm.Field name="head_branch">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="sim-branch">Head Branch</FieldLabel>
+                    <Input
+                      id="sim-branch"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </simForm.Field>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <Label htmlFor="sim-actor">Actor</Label>
-                <Input
-                  id="sim-actor"
-                  value={simActor}
-                  onChange={(e) => setSimActor(e.target.value)}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </div>
-              <div className="space-y-1 flex items-end justify-between border border-border px-3 py-2">
-                <Label htmlFor="sim-fork">Fork PR?</Label>
-                <Switch id="sim-fork" checked={simFork} onCheckedChange={setSimFork} />
-              </div>
+              <simForm.Field name="actor">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="sim-actor">Actor</FieldLabel>
+                    <Input
+                      id="sim-actor"
+                      value={field.state.value}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                    />
+                  </Field>
+                )}
+              </simForm.Field>
+              <simForm.Field name="is_fork_pr">
+                {(field) => (
+                  <div className="flex items-end justify-between border border-border px-3 py-2">
+                    <FieldLabel htmlFor="sim-fork">Fork PR?</FieldLabel>
+                    <Switch
+                      id="sim-fork"
+                      checked={field.state.value}
+                      onCheckedChange={(checked) => field.handleChange(checked)}
+                    />
+                  </div>
+                )}
+              </simForm.Field>
             </div>
-            <div className="space-y-1">
-              <Label htmlFor="sim-labels">Job Labels</Label>
-              <Input
-                id="sim-labels"
-                value={simLabels}
-                onChange={(e) => setSimLabels(e.target.value)}
-                autoCorrect="off"
-                autoCapitalize="none"
-                spellCheck={false}
-              />
-            </div>
+            <simForm.Field name="labels">
+              {(field) => (
+                <Field>
+                  <FieldLabel htmlFor="sim-labels">Job Labels</FieldLabel>
+                  <Input
+                    id="sim-labels"
+                    value={field.state.value}
+                    onChange={(e) => field.handleChange(e.target.value)}
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                  />
+                </Field>
+              )}
+            </simForm.Field>
 
             {simResult && (
               <div className="border border-border bg-muted/40 p-3 space-y-1.5 text-xs">
@@ -623,7 +764,9 @@ function PoliciesPage() {
               <Button type="button" variant="outline" onClick={() => setSimOpen(false)}>
                 Close
               </Button>
-              <Button type="submit">Run Simulation</Button>
+              <Button type="submit" disabled={simulateMutation.isPending}>
+                {simulateMutation.isPending ? "Simulating..." : "Run Simulation"}
+              </Button>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -639,7 +782,10 @@ function PoliciesPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={() => void confirmDelete()}>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget.id)}
+            >
               Delete Policy
             </AlertDialogAction>
           </AlertDialogFooter>
