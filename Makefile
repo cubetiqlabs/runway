@@ -1,6 +1,7 @@
-.PHONY: dev-api dev-web build-web embed-web build test vet docker-build up down deploy-init deploy backup restore release
+.PHONY: dev-api dev-web build-web embed-web build build-agent test vet docker-build up down deploy-init deploy backup restore release
 
 BINARY := bin/server
+AGENT_BINARY := bin/runway-agent
 
 dev-api:
 	go run ./cmd/server
@@ -17,6 +18,9 @@ embed-web: build-web
 
 build: embed-web
 	CGO_ENABLED=0 go build -trimpath -tags netgo,osusergo -ldflags="-s -w" -o $(BINARY) ./cmd/server
+
+build-agent:
+	CGO_ENABLED=0 go build -trimpath -tags netgo,osusergo -ldflags="-s -w" -o $(AGENT_BINARY) ./cmd/agent
 
 vet:
 	go vet ./cmd/... ./internal/...

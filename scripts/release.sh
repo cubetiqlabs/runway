@@ -76,7 +76,7 @@ if [[ "${NO_VERIFY}" != "true" ]]; then
   log "Running pre-release verification..."
   go vet ./cmd/... ./internal/...
   go test -race ./cmd/... ./internal/...
-  bash -n scripts/deploy.sh scripts/release.sh
+  bash -n scripts/deploy.sh scripts/release.sh scripts/install-agent.sh
 fi
 
 if [[ "${SKIP_COMMIT}" != "true" ]]; then

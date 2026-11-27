@@ -29,6 +29,8 @@ func Models() []any {
 		&WorkflowJobModel{},
 		&WebhookDeliveryModel{},
 		&AuditLogModel{},
+		&AgentModel{},
+		&AgentTaskModel{},
 	}
 }
 
@@ -410,5 +412,111 @@ func (m AuditLogModel) toDomain() domain.AuditLog {
 		Metadata:     nonEmptyJSON(m.Metadata),
 		IPAddress:    m.IPAddress,
 		CreatedAt:    m.CreatedAt,
+	}
+}
+
+type AgentModel struct {
+	ID              uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	Name            string           `gorm:"type:text;uniqueIndex;not null"`
+	TokenPrefix     string           `gorm:"type:text;not null"`
+	TokenHash       string           `gorm:"type:text;uniqueIndex;not null"`
+	OS              string           `gorm:"column:os;type:text;not null;default:'linux'"`
+	Arch            string           `gorm:"column:arch;type:text;not null;default:'x64'"`
+	Runtime         string           `gorm:"type:text;not null;default:'native'"`
+	Labels          pq.StringArray   `gorm:"type:text[];not null;default:'{}'"`
+	PoolID          *uuid.UUID       `gorm:"type:uuid;index"`
+	Pool            *RunnerPoolModel `gorm:"foreignKey:PoolID;references:ID;constraint:OnDelete:SET NULL"`
+	PoolName        string           `gorm:"->;-:migration"`
+	Version         string           `gorm:"type:text;not null;default:'dev'"`
+	Hostname        string           `gorm:"type:text;not null;default:''"`
+	CPUCount        int              `gorm:"column:cpu_count;not null;default:0"`
+	MemoryMB        int              `gorm:"column:memory_mb;not null;default:0"`
+	MaxConcurrency  int              `gorm:"not null;default:2"`
+	ActiveJobs      int              `gorm:"not null;default:0"`
+	Status          string           `gorm:"type:text;index;not null;default:'offline'"`
+	LastHeartbeatAt *time.Time
+	CreatedAt       time.Time `gorm:"not null;default:now()"`
+	UpdatedAt       time.Time `gorm:"not null;default:now()"`
+}
+
+func (AgentModel) TableName() string { return "agents" }
+
+func (m AgentModel) toDomain() domain.Agent {
+	return domain.Agent{
+		ID:              m.ID,
+		Name:            m.Name,
+		TokenPrefix:     m.TokenPrefix,
+		TokenHash:       m.TokenHash,
+		OS:              m.OS,
+		Arch:            m.Arch,
+		Runtime:         m.Runtime,
+		Labels:          nonNilSlice([]string(m.Labels)),
+		PoolID:          m.PoolID,
+		PoolName:        m.PoolName,
+		Version:         m.Version,
+		Hostname:        m.Hostname,
+		CPUCount:        m.CPUCount,
+		MemoryMB:        m.MemoryMB,
+		MaxConcurrency:  m.MaxConcurrency,
+		ActiveJobs:      m.ActiveJobs,
+		Status:          domain.AgentStatus(m.Status),
+		LastHeartbeatAt: m.LastHeartbeatAt,
+		CreatedAt:       m.CreatedAt,
+		UpdatedAt:       m.UpdatedAt,
+	}
+}
+
+type AgentTaskModel struct {
+	ID                        uuid.UUID         `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	AgentID                   *uuid.UUID        `gorm:"type:uuid;index"`
+	Agent                     *AgentModel       `gorm:"foreignKey:AgentID;references:ID;constraint:OnDelete:SET NULL"`
+	RunnerID                  uuid.UUID         `gorm:"type:uuid;index;not null"`
+	PoolID                    *uuid.UUID        `gorm:"type:uuid;index"`
+	JobID                     uuid.UUID         `gorm:"type:uuid;index;not null"`
+	GitHubJobID               int64             `gorm:"column:github_job_id;type:bigint;not null"`
+	RepoFullName              string            `gorm:"type:text;not null;default:''"`
+	RunnerName                string            `gorm:"type:text;not null"`
+	PoolSlug                  string            `gorm:"type:text;not null;default:''"`
+	OS                        string            `gorm:"column:os;type:text;not null;default:'linux'"`
+	Arch                      string            `gorm:"column:arch;type:text;not null;default:'x64'"`
+	Labels                    pq.StringArray    `gorm:"type:text[];not null;default:'{}'"`
+	ContainerImage            string            `gorm:"type:text;not null;default:''"`
+	VCPU                      int               `gorm:"column:vcpu;not null;default:4"`
+	MemoryMB                  int               `gorm:"column:memory_mb;not null;default:8192"`
+	EncodedJITConfigEncrypted []byte            `gorm:"column:encoded_jit_config_encrypted;type:bytea"`
+	Status                    string            `gorm:"type:text;index;not null;default:'pending'"`
+	ErrorMessage              string            `gorm:"type:text;not null;default:''"`
+	ClaimedAt                 *time.Time
+	CompletedAt               *time.Time
+	CreatedAt                 time.Time `gorm:"index;not null;default:now()"`
+	UpdatedAt                 time.Time `gorm:"not null;default:now()"`
+}
+
+func (AgentTaskModel) TableName() string { return "agent_tasks" }
+
+func (m AgentTaskModel) toDomain() domain.AgentTask {
+	return domain.AgentTask{
+		ID:                        m.ID,
+		AgentID:                   m.AgentID,
+		RunnerID:                  m.RunnerID,
+		PoolID:                    m.PoolID,
+		JobID:                     m.JobID,
+		GitHubJobID:               m.GitHubJobID,
+		RepoFullName:              m.RepoFullName,
+		RunnerName:                m.RunnerName,
+		PoolSlug:                  m.PoolSlug,
+		OS:                        m.OS,
+		Arch:                      m.Arch,
+		Labels:                    nonNilSlice([]string(m.Labels)),
+		ContainerImage:            m.ContainerImage,
+		VCPU:                      m.VCPU,
+		MemoryMB:                  m.MemoryMB,
+		EncodedJITConfigEncrypted: m.EncodedJITConfigEncrypted,
+		Status:                    domain.AgentTaskStatus(m.Status),
+		ErrorMessage:              m.ErrorMessage,
+		ClaimedAt:                 m.ClaimedAt,
+		CompletedAt:               m.CompletedAt,
+		CreatedAt:                 m.CreatedAt,
+		UpdatedAt:                 m.UpdatedAt,
 	}
 }

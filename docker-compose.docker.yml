@@ -1,10 +1,60 @@
-# Optional overlay for provisioning ephemeral Docker runner containers on the host:
+# Overlay for provisioning ephemeral Docker runner containers securely via Docker Socket Proxy:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
-# Or set RUNWAY_ORCHESTRATOR_DOCKER_SOCKET=tcp://docker-proxy:2375 without mounting the socket directly.
+# Runs tecnativa/docker-socket-proxy so Runway stays non-root without host DOCKER_GID permission errors.
+
+networks:
+  docker-proxy-net:
+    driver: bridge
 
 services:
-  runway:
-    group_add:
-      - "${DOCKER_GID:-999}"
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: runway-docker-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      PING: "1"
+      VERSION: "1"
+      POST: "1"
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      ALLOW_RESTARTS: "0"
+      AUTH: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      DISTRIBUTION: "0"
+      EXEC: "0"
+      NETWORKS: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      VOLUMES: "0"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-proxy-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  runway:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      docker-proxy:
+        condition: service_started
+    networks:
+      - default
+      - docker-proxy-net
+    environment:
+      RUNWAY_ORCHESTRATOR_DOCKER_SOCKET: ${DOCKER_PROXY_URL:-tcp://docker-proxy:2375}

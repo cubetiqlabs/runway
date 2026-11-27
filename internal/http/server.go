@@ -26,14 +26,15 @@ import (
 type ReadinessChecker func(ctx context.Context) error
 
 type ServerDeps struct {
-	Config       *config.Config
-	Log          *zap.Logger
-	ReadyCheck   ReadinessChecker
-	AuthSvc      *service.AuthService
-	WebhookSvc   *service.WebhookService
-	RunnerSvc    *service.RunnerService
+	Config        *config.Config
+	Log           *zap.Logger
+	ReadyCheck    ReadinessChecker
+	AuthSvc       *service.AuthService
+	WebhookSvc    *service.WebhookService
+	RunnerSvc     *service.RunnerService
 	ModerationSvc *service.ModerationService
-	DashboardSvc *service.DashboardService
+	DashboardSvc  *service.DashboardService
+	AgentSvc      *service.AgentService
 }
 
 // NewServer constructs and wires the GoFiber v3 application, security middlewares, API routes, and embedded SPA.
@@ -116,6 +117,18 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 	api := app.Group("/api/v1")
 	api.Post("/auth/login", loginLimiter, authHandler.Login)
 
+	// Distributed runway-agent worker protocol (Bearer rwa_... token auth, no CSRF cookie).
+	// Registered before `protected` so user authMiddleware does not intercept agent bearer tokens.
+	agentHandler := NewAgentHandler(deps.AgentSvc)
+	agentLimiter := limiter.New(limiter.Config{
+		Max:        600,
+		Expiration: time.Minute,
+	})
+	agentGroup := api.Group("/agent", agentLimiter, agentAuthMiddleware(deps.AgentSvc))
+	agentGroup.Post("/heartbeat", agentHandler.Heartbeat)
+	agentGroup.Post("/claim", agentHandler.ClaimTask)
+	agentGroup.Post("/tasks/:id/complete", agentHandler.CompleteTask)
+
 	// Protected API group
 	protected := api.Group("", authMiddleware(deps.AuthSvc))
 	protected.Post("/auth/logout", authHandler.Logout)
@@ -157,6 +170,12 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 	protected.Get("/webhooks/deliveries", modHandler.ListDeliveries)
 	protected.Get("/audit-logs", modHandler.ListAuditLogs)
 	protected.Get("/settings/github-app", modHandler.SettingsStatus)
+
+	protected.Get("/agents", agentHandler.ListAgents)
+	protected.Post("/agents", canOperate, agentHandler.RegisterAgent)
+	protected.Post("/agents/:id/drain", canOperate, agentHandler.DrainAgent)
+	protected.Post("/agents/:id/rotate-token", canOperate, agentHandler.RotateToken)
+	protected.Delete("/agents/:id", adminOnly, agentHandler.DeleteAgent)
 
 	// Never fall through to SPA HTML for unknown API or webhook routes.
 	app.All("/api/*", func(c fiber.Ctx) error {

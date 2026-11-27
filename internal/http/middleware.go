@@ -16,6 +16,7 @@ const (
 	sessionCookieName = "runway_session"
 	ctxUserKey        = "runway_user"
 	ctxSessionKey     = "runway_session"
+	ctxAgentKey       = "runway_agent"
 )
 
 func zapLoggerMiddleware(log *zap.Logger) fiber.Handler {
@@ -104,4 +105,28 @@ func currentUser(c fiber.Ctx) *domain.User {
 func currentSession(c fiber.Ctx) *domain.Session {
 	s, _ := c.Locals(ctxSessionKey).(*domain.Session)
 	return s
+}
+
+func agentAuthMiddleware(agentSvc *service.AgentService) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		if agentSvc == nil {
+			return domain.ErrUnauthorized
+		}
+		authHeader := strings.TrimSpace(c.Get("Authorization"))
+		if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			return domain.ErrUnauthorized
+		}
+		rawBearer := strings.TrimSpace(authHeader[7:])
+		agent, err := agentSvc.AuthenticateAgent(c.Context(), rawBearer)
+		if err != nil {
+			return domain.ErrUnauthorized
+		}
+		c.Locals(ctxAgentKey, agent)
+		return c.Next()
+	}
+}
+
+func currentAgent(c fiber.Ctx) *domain.Agent {
+	a, _ := c.Locals(ctxAgentKey).(*domain.Agent)
+	return a
 }

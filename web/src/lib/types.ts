@@ -39,7 +39,7 @@ export interface RunnerPool {
   max_concurrency: number
   idle_timeout_sec: number
   runner_group_id: number
-  provider: "docker" | "simulated"
+  provider: "docker" | "simulated" | "agent"
   container_image: string
   enabled: boolean
   created_at: string
@@ -199,4 +199,33 @@ export interface GitHubAppSettingsStatus {
 export interface PageResponse<T> {
   items: T[]
   total: number
+}
+
+export type AgentStatus = "online" | "draining" | "offline"
+
+export interface Agent {
+  id: string
+  name: string
+  token_prefix: string
+  os: string
+  arch: string
+  runtime: string
+  labels: string[]
+  pool_id?: string | null
+  pool_name?: string
+  version: string
+  hostname: string
+  cpu_count: number
+  memory_mb: number
+  max_concurrency: number
+  active_jobs: number
+  status: AgentStatus
+  last_heartbeat_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface RegisterAgentResponse {
+  agent: Agent
+  token: string
 }

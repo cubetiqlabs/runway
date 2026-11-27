@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cubetiqlabs/runway/internal/config"
+	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/database"
 	"github.com/cubetiqlabs/runway/internal/github"
 	apphttp "github.com/cubetiqlabs/runway/internal/http"
@@ -78,9 +79,15 @@ func main() {
 	jobRepo := repository.NewJobRepo(db)
 	policyRepo := repository.NewPolicyRepo(db)
 	auditRepo := repository.NewAuditRepo(db)
+	agentRepo := repository.NewAgentRepo(db)
+
+	encKey, err := crypto.ParseKey32(cfg.Security.EncryptionKey)
+	if err != nil {
+		log.Fatal("failed to parse encryption key", zap.Error(err))
+	}
 
 	engine := moderation.NewEngine(cfg.Moderation.DefaultAction)
-	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, runnerRepo, jobRepo, auditRepo)
+	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, runnerRepo, jobRepo, auditRepo, agentRepo, encKey)
 	orch.Start(ctx)
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
@@ -109,6 +116,7 @@ func main() {
 
 	webhookSvc := service.NewWebhookService(cfg, log, ghClient, instRepo, poolRepo, policyRepo, jobRepo, runnerRepo, auditRepo, engine, orch)
 	dashboardSvc := service.NewDashboardService(cfg, ghClient, auditRepo, orch)
+	agentSvc := service.NewAgentService(log, agentRepo, runnerRepo, jobRepo, auditRepo, poolRepo, encKey)
 
 	app, err := apphttp.NewServer(apphttp.ServerDeps{
 		Config:        cfg,
@@ -119,6 +127,7 @@ func main() {
 		RunnerSvc:     runnerSvc,
 		ModerationSvc: modSvc,
 		DashboardSvc:  dashboardSvc,
+		AgentSvc:      agentSvc,
 	})
 	if err != nil {
 		log.Fatal("failed to initialize HTTP server", zap.Error(err))

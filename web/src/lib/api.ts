@@ -1,4 +1,5 @@
 import type {
+  Agent,
   AuditLog,
   DashboardOverview,
   GitHubAppSettingsStatus,
@@ -6,6 +7,7 @@ import type {
   ModerationPolicy,
   PageResponse,
   PolicyAction,
+  RegisterAgentResponse,
   Runner,
   RunnerPool,
   User,
@@ -159,4 +161,24 @@ export const api = {
     request<PageResponse<WebhookDelivery>>("/api/v1/webhooks/deliveries?limit=50"),
   listAuditLogs: () => request<PageResponse<AuditLog>>("/api/v1/audit-logs?limit=50"),
   settingsStatus: () => request<GitHubAppSettingsStatus>("/api/v1/settings/github-app"),
+
+  listAgents: () => request<PageResponse<Agent>>("/api/v1/agents?limit=50"),
+  registerAgent: (payload: {
+    name: string
+    os: string
+    arch: string
+    runtime: string
+    labels: string[]
+    pool_id?: string | null
+    max_concurrency: number
+  }) =>
+    request<RegisterAgentResponse>("/api/v1/agents", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  drainAgent: (id: string) => request<Agent>(`/api/v1/agents/${id}/drain`, { method: "POST" }),
+  rotateAgentToken: (id: string) =>
+    request<RegisterAgentResponse>(`/api/v1/agents/${id}/rotate-token`, { method: "POST" }),
+  deleteAgent: (id: string) =>
+    request<{ ok: boolean }>(`/api/v1/agents/${id}`, { method: "DELETE" }),
 }

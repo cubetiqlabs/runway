@@ -7,6 +7,8 @@ BACKUP_DIR_DEFAULT="${BACKUP_DIR:-${ROOT_DIR}/backups}"
 LOCK_DIR="/tmp/runway-deploy.lock"
 COMPOSE_BASE="${ROOT_DIR}/docker-compose.yml"
 COMPOSE_PROD="${ROOT_DIR}/docker-compose.prod.yml"
+COMPOSE_DOCKER="${ROOT_DIR}/docker-compose.docker.yml"
+DOCKER_OVERLAY_ENABLED="${DOCKER_OVERLAY_ENABLED:-false}"
 
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
@@ -40,14 +42,30 @@ gen_base64() {
   fi
 }
 
+should_enable_docker_overlay() {
+  if [[ "${DOCKER_OVERLAY_ENABLED}" == "true" ]]; then
+    return 0
+  fi
+  if [[ "${RUNWAY_ORCHESTRATOR_PROVIDER:-}" == "docker" ]]; then
+    local sock="${RUNWAY_ORCHESTRATOR_DOCKER_SOCKET:-}"
+    if [[ -z "${sock}" || "${sock}" == "/var/run/docker.sock" || "${sock}" == "tcp://docker-proxy:2375" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 compose_cmd() {
   local prod_mode="${1:-false}"
   shift
+  local files=(-f "${COMPOSE_BASE}")
   if [[ "${prod_mode}" == "true" ]]; then
-    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_BASE}" -f "${COMPOSE_PROD}" "$@"
-  else
-    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_BASE}" "$@"
+    files+=(-f "${COMPOSE_PROD}")
   fi
+  if should_enable_docker_overlay && [[ -f "${COMPOSE_DOCKER}" ]]; then
+    files+=(-f "${COMPOSE_DOCKER}")
+  fi
+  docker compose --env-file "${ENV_FILE}" "${files[@]}" "$@"
 }
 
 load_env() {
@@ -161,9 +179,8 @@ RUNWAY_GITHUB_WEBHOOK_SECRET=${wh_secret}
 RUNWAY_GITHUB_PRIVATE_KEY_PEM=
 
 RUNWAY_ORCHESTRATOR_PROVIDER=simulated
-RUNWAY_ORCHESTRATOR_DOCKER_SOCKET=/var/run/docker.sock
+RUNWAY_ORCHESTRATOR_DOCKER_SOCKET=tcp://docker-proxy:2375
 RUNWAY_ORCHESTRATOR_DEFAULT_IMAGE=ghcr.io/actions/actions-runner:latest
-DOCKER_GID=${docker_gid}
 RUNWAY_LOGGING_LEVEL=info
 RUNWAY_LOGGING_FORMAT=json
 BACKUP_RETENTION_DAYS=14
@@ -293,6 +310,7 @@ cmd_deploy() {
       --mode) mode="${2:-}"; shift 2 ;;
       --branch) branch="${2:-}"; shift 2 ;;
       --prod) prod_mode="true"; shift ;;
+      --docker) DOCKER_OVERLAY_ENABLED="true"; shift ;;
       --skip-backup) skip_backup="true"; shift ;;
       *) err "Unknown option for deploy: $1" ;;
     esac
@@ -359,6 +377,7 @@ cmd_auto_deploy() {
       --mode) mode="${2:-}"; shift 2 ;;
       --branch) branch="${2:-}"; shift 2 ;;
       --prod) prod_mode="true"; shift ;;
+      --docker) DOCKER_OVERLAY_ENABLED="true"; shift ;;
       *) shift ;;
     esac
   done
@@ -396,6 +415,7 @@ cmd_install_cron() {
   local backup_schedule="0 3 * * *"
   local mode="pull"
   local prod_flag=""
+  local docker_flag=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -403,6 +423,7 @@ cmd_install_cron() {
       --backup-schedule) backup_schedule="${2:-}"; shift 2 ;;
       --mode) mode="${2:-}"; shift 2 ;;
       --prod) prod_flag="--prod"; shift ;;
+      --docker) docker_flag="--docker"; shift ;;
       *) err "Unknown option for install-cron: $1" ;;
     esac
   done
@@ -410,7 +431,7 @@ cmd_install_cron() {
   local log_dir="${ROOT_DIR}/logs"
   mkdir -p "${log_dir}"
   local marker="# runway-managed"
-  local deploy_line="${interval} cd ${ROOT_DIR} && ./scripts/deploy.sh auto-deploy --mode ${mode} ${prod_flag} >> ${log_dir}/deploy.log 2>&1 ${marker}"
+  local deploy_line="${interval} cd ${ROOT_DIR} && ./scripts/deploy.sh auto-deploy --mode ${mode} ${prod_flag} ${docker_flag} >> ${log_dir}/deploy.log 2>&1 ${marker}"
   local backup_line="${backup_schedule} cd ${ROOT_DIR} && ./scripts/deploy.sh backup >> ${log_dir}/backup.log 2>&1 ${marker}"
 
   local current filtered

@@ -15,6 +15,7 @@ import (
 
 type ProvisionRequest struct {
 	RunnerID         uuid.UUID
+	JobID            uuid.UUID
 	RunnerName       string
 	Pool             domain.RunnerPool
 	EncodedJITConfig string
@@ -23,8 +24,9 @@ type ProvisionRequest struct {
 }
 
 type ProvisionResult struct {
-	ProviderRef string
-	HostInfo    json.RawMessage
+	ProviderRef   string
+	InitialStatus domain.RunnerStatus
+	HostInfo      json.RawMessage
 }
 
 type Provisioner interface {
@@ -50,6 +52,7 @@ type Orchestrator struct {
 	runnerRepo   domain.RunnerRepository
 	jobRepo      domain.JobRepository
 	auditRepo    domain.AuditRepository
+	agentRepo    domain.AgentRepository
 	provisioners map[string]Provisioner
 
 	queue chan dispatchTask
@@ -62,10 +65,15 @@ func NewOrchestrator(
 	runnerRepo domain.RunnerRepository,
 	jobRepo domain.JobRepository,
 	auditRepo domain.AuditRepository,
+	agentRepo domain.AgentRepository,
+	encKey []byte,
 ) *Orchestrator {
 	provs := map[string]Provisioner{
 		"simulated": NewSimulatedProvisioner(),
 		"docker":    NewDockerProvisioner(cfg.DockerSocket),
+	}
+	if agentRepo != nil {
+		provs["agent"] = NewAgentProvisioner(agentRepo, encKey)
 	}
 	return &Orchestrator{
 		cfg:          cfg,
@@ -73,6 +81,7 @@ func NewOrchestrator(
 		runnerRepo:   runnerRepo,
 		jobRepo:      jobRepo,
 		auditRepo:    auditRepo,
+		agentRepo:    agentRepo,
 		provisioners: provs,
 		queue:        make(chan dispatchTask, cfg.QueueSize),
 	}
@@ -169,6 +178,7 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 
 	res, err := prov.Provision(provCtx, ProvisionRequest{
 		RunnerID:         rn.ID,
+		JobID:            task.job.ID,
 		RunnerName:       runnerName,
 		Pool:             task.pool,
 		EncodedJITConfig: task.encodedJITConfig,
@@ -199,7 +209,11 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 		return
 	}
 
-	_ = o.runnerRepo.UpdateStatus(provCtx, rn.ID, domain.RunnerOnline, task.githubRunnerID, res.ProviderRef, &task.job.GitHubJobID)
+	initialStatus := res.InitialStatus
+	if initialStatus == "" {
+		initialStatus = domain.RunnerOnline
+	}
+	_ = o.runnerRepo.UpdateStatus(provCtx, rn.ID, initialStatus, task.githubRunnerID, res.ProviderRef, &task.job.GitHubJobID)
 	_ = o.auditRepo.AppendAuditLog(provCtx, &domain.AuditLog{
 		ActorLabel:   "orchestrator",
 		Action:       "runner.provisioned",
@@ -270,6 +284,29 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 		}
 		_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
 		o.log.Info("reconciled exited docker runner", zap.String("runner", rn.Name))
+	}
+
+	if o.agentRepo != nil {
+		if marked, err := o.agentRepo.MarkStaleOffline(ctx, now.Add(-2*time.Minute)); err != nil {
+			o.log.Warn("reconcile mark stale agents failed", zap.Error(err))
+		} else if marked > 0 {
+			o.log.Info("marked stale agents offline", zap.Int64("count", marked))
+		}
+
+		expired, err := o.agentRepo.ExpirePendingTasks(ctx, now.Add(-o.cfg.ProvisionTimeout))
+		if err != nil {
+			o.log.Warn("reconcile expire pending agent tasks failed", zap.Error(err))
+		} else {
+			for _, task := range expired {
+				_ = o.runnerRepo.UpdateStatus(ctx, task.RunnerID, domain.RunnerOffline, nil, "", nil)
+				if o.jobRepo != nil {
+					if job, getErr := o.jobRepo.GetByID(ctx, task.JobID); getErr == nil {
+						_ = o.jobRepo.UpdateModerationAndRunner(ctx, job.ID, domain.JobQueued, job.ModerationDecision, "Provisioning timed out: no online runway-agent claimed the task", job.ModeratedBy, job.MatchedPoolID, &task.RunnerID)
+					}
+				}
+				o.log.Warn("expired unclaimed agent task", zap.String("runner", task.RunnerName), zap.Int64("github_job_id", task.GitHubJobID))
+			}
+		}
 	}
 }
 

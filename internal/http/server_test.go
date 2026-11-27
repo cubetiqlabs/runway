@@ -92,7 +92,7 @@ func TestServerSecurityAndRouting(t *testing.T) {
 	log := zap.NewNop()
 	auditRepo := &stubAuditRepo{}
 	authSvc := service.NewAuthService(cfg, log, &stubAuthRepo{}, auditRepo)
-	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, nil, nil, auditRepo)
+	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, nil, nil, auditRepo, nil, nil)
 	webhookSvc := service.NewWebhookService(cfg, log, nil, nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch)
 	runnerSvc := service.NewRunnerService(cfg, nil, nil, nil, nil, auditRepo, orch)
 	modSvc := service.NewModerationService(nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch)
@@ -118,10 +118,18 @@ func TestServerSecurityAndRouting(t *testing.T) {
 		t.Fatalf("expected 200 on /healthz, got %v %v", resp, err)
 	}
 
-	// 2. Protected API rejects unauthenticated access
+	// 2. Protected API rejects unauthenticated access (including agents & agent worker heartbeat)
 	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/overview", nil))
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 on unauthenticated protected endpoint, got %d %v", resp.StatusCode, err)
+	}
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil))
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /api/v1/agents, got %d %v", resp.StatusCode, err)
+	}
+	resp, err = app.Test(httptest.NewRequest(http.MethodPost, "/api/v1/agent/heartbeat", nil))
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /api/v1/agent/heartbeat, got %d %v", resp.StatusCode, err)
 	}
 
 	// 3. Unknown API route outside v1 auth returns JSON 404 (not SPA HTML), and unauthenticated v1 returns 401

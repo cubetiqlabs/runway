@@ -99,3 +99,24 @@ type AuditRepository interface {
 	ListAuditLogs(ctx context.Context, page PageParams) ([]AuditLog, int, error)
 	GetDashboardOverview(ctx context.Context) (*DashboardOverview, error)
 }
+
+type AgentRepository interface {
+	Create(ctx context.Context, agent *Agent) error
+	GetByID(ctx context.Context, id uuid.UUID) (*Agent, error)
+	GetByTokenHash(ctx context.Context, tokenHash string) (*Agent, error)
+	List(ctx context.Context, page PageParams) ([]Agent, int, error)
+	CountOnline(ctx context.Context) (int, error)
+	UpdateHeartbeat(ctx context.Context, agent *Agent) error
+	UpdateStatus(ctx context.Context, id uuid.UUID, status AgentStatus) error
+	UpdateToken(ctx context.Context, id uuid.UUID, prefix, tokenHash string) error
+	Delete(ctx context.Context, id uuid.UUID) error
+	MarkStaleOffline(ctx context.Context, before time.Time) (int64, error)
+	CreateTask(ctx context.Context, task *AgentTask) error
+	GetTaskByID(ctx context.Context, id uuid.UUID) (*AgentTask, error)
+	ClaimNextTask(ctx context.Context, agent *Agent) (*AgentTask, error)
+	CompleteTask(ctx context.Context, taskID, agentID uuid.UUID, status AgentTaskStatus, errMsg string) (*AgentTask, error)
+	CancelTasksByRunner(ctx context.Context, runnerID uuid.UUID) error
+	CancelTaskByID(ctx context.Context, taskID uuid.UUID) error
+	ListCancelledTaskIDsForAgent(ctx context.Context, agentID uuid.UUID) ([]uuid.UUID, error)
+	ExpirePendingTasks(ctx context.Context, before time.Time) ([]AgentTask, error)
+}

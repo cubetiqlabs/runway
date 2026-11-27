@@ -40,11 +40,29 @@ jobs:
       - uses: actions/checkout@v4
 ```
 
-To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml) with your host Docker socket GID (`DOCKER_GID`) or point `RUNWAY_ORCHESTRATOR_DOCKER_SOCKET` at a Docker socket proxy (`tcp://docker-proxy:2375`):
+To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml), which routes API calls through a hardened `docker-socket-proxy` (automatically included by `./scripts/deploy.sh` when `RUNWAY_ORCHESTRATOR_PROVIDER=docker`):
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
 ```
+
+## Distributed Agents (`runway-agent`)
+
+Register an agent token in the Runway console (**Agents -> Register Agent**) and deploy `runway-agent` on any Linux, macOS, or Windows host (with automatic background updates enabled by default):
+
+```sh
+# Linux & macOS (systemd / launchd)
+curl -fsSL https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.sh | \
+  sudo sh -s -- --server https://<your-domain> --token <rwa_...>
+```
+
+```powershell
+# Windows PowerShell (Scheduled Task)
+$env:RUNWAY_AGENT_SERVER="https://<your-domain>"; $env:RUNWAY_AGENT_TOKEN="<rwa_...>"
+irm https://raw.githubusercontent.com/cubetiqlabs/runway/main/scripts/install-agent.ps1 | iex
+```
+
+Run `runway-agent update` to upgrade manually, or `--no-auto-update` to disable background updates.
 
 ## Operations & Releases
 

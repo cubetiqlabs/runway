@@ -247,7 +247,7 @@ func (c *Config) validateAndNormalize() error {
 	}
 
 	switch c.Orchestrator.Provider {
-	case "simulated", "docker":
+	case "simulated", "docker", "agent":
 	default:
 		return fmt.Errorf("invalid orchestrator.provider %q", c.Orchestrator.Provider)
 	}

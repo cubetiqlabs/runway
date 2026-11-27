@@ -239,3 +239,70 @@ type DashboardOverview struct {
 	RecentJobs        []WorkflowJob     `json:"recent_jobs"`
 	RecentDeliveries  []WebhookDelivery `json:"recent_deliveries"`
 }
+
+type AgentStatus string
+
+const (
+	AgentOnline   AgentStatus = "online"
+	AgentDraining AgentStatus = "draining"
+	AgentOffline  AgentStatus = "offline"
+)
+
+type Agent struct {
+	ID              uuid.UUID   `json:"id"`
+	Name            string      `json:"name"`
+	TokenPrefix     string      `json:"token_prefix"`
+	TokenHash       string      `json:"-"`
+	OS              string      `json:"os"`
+	Arch            string      `json:"arch"`
+	Runtime         string      `json:"runtime"`
+	Labels          []string    `json:"labels"`
+	PoolID          *uuid.UUID  `json:"pool_id,omitempty"`
+	PoolName        string      `json:"pool_name,omitempty"`
+	Version         string      `json:"version"`
+	Hostname        string      `json:"hostname"`
+	CPUCount        int         `json:"cpu_count"`
+	MemoryMB        int         `json:"memory_mb"`
+	MaxConcurrency  int         `json:"max_concurrency"`
+	ActiveJobs      int         `json:"active_jobs"`
+	Status          AgentStatus `json:"status"`
+	LastHeartbeatAt *time.Time  `json:"last_heartbeat_at,omitempty"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
+}
+
+type AgentTaskStatus string
+
+const (
+	AgentTaskPending   AgentTaskStatus = "pending"
+	AgentTaskClaimed   AgentTaskStatus = "claimed"
+	AgentTaskRunning   AgentTaskStatus = "running"
+	AgentTaskCompleted AgentTaskStatus = "completed"
+	AgentTaskFailed    AgentTaskStatus = "failed"
+	AgentTaskCancelled AgentTaskStatus = "cancelled"
+)
+
+type AgentTask struct {
+	ID                        uuid.UUID       `json:"id"`
+	AgentID                   *uuid.UUID      `json:"agent_id,omitempty"`
+	RunnerID                  uuid.UUID       `json:"runner_id"`
+	PoolID                    *uuid.UUID      `json:"pool_id,omitempty"`
+	JobID                     uuid.UUID       `json:"job_id"`
+	GitHubJobID               int64           `json:"github_job_id"`
+	RepoFullName              string          `json:"repo_full_name"`
+	RunnerName                string          `json:"runner_name"`
+	PoolSlug                  string          `json:"pool_slug"`
+	OS                        string          `json:"os"`
+	Arch                      string          `json:"arch"`
+	Labels                    []string        `json:"labels"`
+	ContainerImage            string          `json:"container_image"`
+	VCPU                      int             `json:"vcpu"`
+	MemoryMB                  int             `json:"memory_mb"`
+	EncodedJITConfigEncrypted []byte          `json:"-"`
+	Status                    AgentTaskStatus `json:"status"`
+	ErrorMessage              string          `json:"error_message"`
+	ClaimedAt                 *time.Time      `json:"claimed_at,omitempty"`
+	CompletedAt               *time.Time      `json:"completed_at,omitempty"`
+	CreatedAt                 time.Time       `json:"created_at"`
+	UpdatedAt                 time.Time       `json:"updated_at"`
+}

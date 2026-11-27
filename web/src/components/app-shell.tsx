@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils"
 const NAV_ITEMS = [
   { to: "/", label: "Overview", icon: DashboardSquare02Icon },
   { to: "/runners", label: "Runners", icon: ServerStack02Icon },
+  { to: "/agents", label: "Agents", icon: ComputerIcon },
   { to: "/pools", label: "Runner Pools", icon: Layers01Icon },
   { to: "/jobs", label: "Job Moderation", icon: WorkflowSquare06Icon },
   { to: "/policies", label: "Policies", icon: Shield01Icon },

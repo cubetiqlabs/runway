@@ -48,7 +48,7 @@ interface PoolFormState {
   memory_mb: string
   disk_gb: string
   max_concurrency: string
-  provider: "simulated" | "docker"
+  provider: "simulated" | "docker" | "agent"
   container_image: string
   enabled: boolean
 }
@@ -257,8 +257,8 @@ function PoolsPage() {
           <DialogHeader>
             <DialogTitle>{form.id ? "Edit Runner Pool" : "Create Runner Pool"}</DialogTitle>
             <DialogDescription>
-              Jobs whose GitHub Actions <code className="font-mono">runs-on</code> labels contain
-              all labels below will route to this pool.
+              Jobs whose GitHub Actions <code className="font-mono">runs-on</code> labels are a subset
+              of this pool&apos;s labels and slug will route here.
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleSave} className="space-y-3">
@@ -351,11 +351,45 @@ function PoolsPage() {
 
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1">
+                <Label htmlFor="pool-os">OS</Label>
+                <Select value={form.os} onValueChange={(v) => setForm({ ...form, os: v || "linux" })}>
+                  <SelectTrigger id="pool-os" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="linux">Linux</SelectItem>
+                    <SelectItem value="macos">macOS</SelectItem>
+                    <SelectItem value="windows">Windows</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="pool-arch">Architecture</Label>
+                <Select
+                  value={form.arch}
+                  onValueChange={(v) => setForm({ ...form, arch: v || "x64" })}
+                >
+                  <SelectTrigger id="pool-arch" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="x64">x64 (amd64)</SelectItem>
+                    <SelectItem value="arm64">arm64</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
                 <Label htmlFor="pool-provider">Provider</Label>
                 <Select
                   value={form.provider}
                   onValueChange={(v) =>
-                    setForm({ ...form, provider: (v as "simulated" | "docker") || "simulated" })
+                    setForm({
+                      ...form,
+                      provider: (v as "simulated" | "docker" | "agent") || "simulated",
+                    })
                   }
                 >
                   <SelectTrigger id="pool-provider" className="w-full">
@@ -364,6 +398,7 @@ function PoolsPage() {
                   <SelectContent>
                     <SelectItem value="simulated">Simulated</SelectItem>
                     <SelectItem value="docker">Docker Engine</SelectItem>
+                    <SelectItem value="agent">Runway Agent (Remote Host)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
