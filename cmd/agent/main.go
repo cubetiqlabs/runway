@@ -54,8 +54,12 @@ func runWorker(args []string) int {
 	server := fs.String("server", "", "Runway control plane URL (e.g. https://runway.cubis.tech)")
 	token := fs.String("token", "", "Agent registration token (rwa_...)")
 	rt := fs.String("runtime", "", "Execution runtime: auto, native, or docker")
+	sandbox := fs.String("sandbox", "", "OCI sandbox runtime for Docker runners: auto, gvisor (runsc), or runc")
 	dockerSock := fs.String("docker-socket", "", "Docker socket path or tcp:// endpoint")
-	runnerDockerHost := fs.String("runner-docker-host", "", "DOCKER_HOST injected into runner containers (e.g. tcp://runner-dind:2375)")
+	isolatedDinD := fs.Bool("isolated-dind", false, "Run an isolated per-job DinD sidecar to avoid port conflicts (default: true)")
+	noIsolatedDinD := fs.Bool("no-isolated-dind", false, "Disable isolated per-job DinD sidecars")
+	dindImage := fs.String("dind-image", "", "Docker-in-Docker sidecar image (default: docker:dind)")
+	runnerDockerHost := fs.String("runner-docker-host", "", "DOCKER_HOST injected into runner containers (disables isolated DinD)")
 	runnerNetwork := fs.String("runner-network", "", "Docker NetworkMode for spawned runner containers")
 	mountDockerSock := fs.Bool("mount-docker-socket", false, "Bind mount /var/run/docker.sock into spawned runner containers")
 	noMountDockerSock := fs.Bool("no-mount-docker-socket", false, "Disable automatic docker.sock bind mounting into runner containers")
@@ -86,8 +90,22 @@ func runWorker(args []string) int {
 	if *rt != "" {
 		cfg.Runtime = *rt
 	}
+	if *sandbox != "" {
+		cfg.SandboxRuntime = *sandbox
+	}
 	if *dockerSock != "" {
 		cfg.DockerSocket = *dockerSock
+	}
+	if *isolatedDinD {
+		cfg.IsolatedDinD = true
+		cfg.IsolatedDinDSet = true
+	}
+	if *noIsolatedDinD {
+		cfg.IsolatedDinD = false
+		cfg.IsolatedDinDSet = true
+	}
+	if *dindImage != "" {
+		cfg.DinDImage = *dindImage
 	}
 	if *runnerDockerHost != "" {
 		cfg.RunnerDockerHost = *runnerDockerHost
@@ -232,10 +250,14 @@ Flags (run):
   --server <url>             Runway control plane URL (RUNWAY_AGENT_SERVER)
   --token <rwa_...>          Agent bearer token (RUNWAY_AGENT_TOKEN)
   --runtime <mode>           auto | native | docker (RUNWAY_AGENT_RUNTIME)
+  --sandbox <mode>           OCI sandbox runtime: auto | gvisor | runsc | runc (RUNWAY_AGENT_SANDBOX)
   --docker-socket <addr>     Docker socket or tcp:// endpoint (RUNWAY_AGENT_DOCKER_SOCKET)
-  --mount-docker-socket      Mount /var/run/docker.sock into Docker runners
-  --no-mount-docker-socket   Disable automatic docker.sock mounting
-  --runner-docker-host <u>   DOCKER_HOST inside Docker runners
+  --isolated-dind            Per-job isolated DinD sidecar & network (default: true)
+  --no-isolated-dind         Disable isolated DinD sidecars
+  --dind-image <image>       DinD sidecar image (default: docker:dind)
+  --mount-docker-socket      Mount /var/run/docker.sock into runners (disables isolated DinD)
+  --no-mount-docker-socket   Disable docker.sock mounting
+  --runner-docker-host <u>   External DOCKER_HOST inside runners (disables isolated DinD)
   --runner-network <net>     NetworkMode for Docker runners
   --runner-docker-gid <gid>  Host docker GID for GroupAdd
   --work-dir <path>          Working cache & job directory (RUNWAY_AGENT_WORK_DIR)

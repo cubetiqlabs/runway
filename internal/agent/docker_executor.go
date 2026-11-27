@@ -43,15 +43,18 @@ func (e *DockerExecutor) Execute(ctx context.Context, task *TaskPayload) error {
 		return err
 	}
 
+	defer func() {
+		termCtx, termCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = e.prov.Terminate(termCtx, res.ProviderRef)
+		termCancel()
+	}()
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			termCtx, termCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			_ = e.prov.Terminate(termCtx, res.ProviderRef)
-			termCancel()
 			return fmt.Errorf("runner cancelled: %w", ctx.Err())
 		case <-ticker.C:
 			healthy, healthErr := e.prov.Healthy(ctx, res.ProviderRef)

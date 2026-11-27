@@ -15,30 +15,36 @@ type Config struct {
 	ServerURL            string
 	Token                string
 	Runtime              string // auto | native | docker
+	SandboxRuntime       string // auto | gvisor | runsc | runc | none | <custom>
 	DockerSocket         string
 	RunnerDockerHost     string
 	RunnerNetwork        string
 	MountDockerSocket    bool
 	MountDockerSocketSet bool
+	IsolatedDinD         bool
+	IsolatedDinDSet      bool
+	DinDImage            string
 	RunnerDockerGID      string
 	WorkDir              string
 	LogDir               string
-	Concurrency       int
-	Labels            []string
-	PollInterval      time.Duration
-	HeartbeatInterval time.Duration
-	AutoUpdate        bool
-	UpdateInterval    time.Duration
-	UpdateRepo        string
-	RunnerVersion     string
-	Version           string
+	Concurrency          int
+	Labels               []string
+	PollInterval         time.Duration
+	HeartbeatInterval    time.Duration
+	AutoUpdate           bool
+	UpdateInterval       time.Duration
+	UpdateRepo           string
+	RunnerVersion        string
+	Version              string
 }
 
 func DefaultConfig(version string) Config {
 	wd := defaultWorkDir()
 	return Config{
 		Runtime:           "auto",
+		SandboxRuntime:    "auto",
 		DockerSocket:      defaultDockerSocket(),
+		DinDImage:         "docker:dind",
 		WorkDir:           wd,
 		LogDir:            DefaultLogDir(wd),
 		Concurrency:       2,
@@ -66,6 +72,9 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNTIME")); v != "" {
 		c.Runtime = strings.ToLower(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_SANDBOX")); v != "" {
+		c.SandboxRuntime = strings.ToLower(v)
+	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_DOCKER_SOCKET")); v != "" {
 		c.DockerSocket = v
 	}
@@ -78,6 +87,13 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_MOUNT_DOCKER_SOCKET")); v != "" {
 		c.MountDockerSocket = strings.EqualFold(v, "true") || v == "1"
 		c.MountDockerSocketSet = true
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_ISOLATED_DIND")); v != "" {
+		c.IsolatedDinD = !strings.EqualFold(v, "false") && v != "0"
+		c.IsolatedDinDSet = true
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_DIND_IMAGE")); v != "" {
+		c.DinDImage = v
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_DOCKER_GID")); v != "" {
 		c.RunnerDockerGID = v
@@ -234,27 +250,47 @@ func IsLocalUnixSocket(dockerHost string) bool {
 	return h == "" || strings.HasPrefix(h, "/") || strings.HasPrefix(h, "unix://")
 }
 
-// ResolveDockerOptions resolves Docker access inside spawned runner containers, auto-mounting the local Unix Docker socket when appropriate.
+// ResolveDockerOptions resolves Docker and sandbox isolation options for spawned runner containers.
+// Isolated per-job DinD is enabled by default whenever neither an external RunnerDockerHost nor
+// explicit host docker.sock mounting is configured, eliminating port collisions and host socket exposure.
 func ResolveDockerOptions(cfg Config) orchestrator.DockerOptions {
 	mountSock := cfg.MountDockerSocket
+	isolatedDinD := cfg.IsolatedDinD
+	if strings.TrimSpace(cfg.RunnerDockerHost) == "" {
+		if mountSock {
+			isolatedDinD = false
+		} else if !cfg.IsolatedDinDSet {
+			isolatedDinD = true
+		}
+	} else {
+		isolatedDinD = false
+	}
+
 	gid := strings.TrimSpace(cfg.RunnerDockerGID)
-	if strings.TrimSpace(cfg.RunnerDockerHost) == "" && IsLocalUnixSocket(cfg.DockerSocket) {
-		if !cfg.MountDockerSocketSet {
-			mountSock = true
+	if mountSock && gid == "" && IsLocalUnixSocket(cfg.DockerSocket) {
+		sockPath := strings.TrimPrefix(strings.TrimSpace(cfg.DockerSocket), "unix://")
+		if sockPath == "" {
+			sockPath = "/var/run/docker.sock"
 		}
-		if mountSock && gid == "" {
-			sockPath := strings.TrimPrefix(strings.TrimSpace(cfg.DockerSocket), "unix://")
-			if sockPath == "" {
-				sockPath = "/var/run/docker.sock"
-			}
-			gid = detectSocketGID(sockPath)
-		}
+		gid = detectSocketGID(sockPath)
+	}
+
+	sandboxRT := strings.TrimSpace(cfg.SandboxRuntime)
+	if sandboxRT == "" {
+		sandboxRT = "auto"
+	}
+	dindImg := strings.TrimSpace(cfg.DinDImage)
+	if dindImg == "" {
+		dindImg = "docker:dind"
 	}
 	return orchestrator.DockerOptions{
 		RunnerDockerHost:  cfg.RunnerDockerHost,
 		RunnerNetwork:     cfg.RunnerNetwork,
 		MountDockerSocket: mountSock,
 		RunnerDockerGID:   gid,
+		SandboxRuntime:    sandboxRT,
+		IsolatedDinD:      isolatedDinD,
+		DinDImage:         dindImg,
 	}
 }
 

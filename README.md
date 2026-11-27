@@ -40,13 +40,20 @@ jobs:
       - uses: actions/checkout@v4
 ```
 
-To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml). It pairs `docker-socket-proxy` (zero host `DOCKER_GID` issues) with an isolated `docker:dind` sidecar (`runner-dind`) so workflow `docker build` / `docker run` steps work out of the box (automatically included by `./scripts/deploy.sh` when `RUNWAY_ORCHESTRATOR_PROVIDER=docker`):
+To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml). It pairs `docker-socket-proxy` (zero host `DOCKER_GID` issues) with per-job isolated `docker:dind` sandboxes so concurrent workflows and `services:` containers (`5432`, `6379`, etc.) never collide on ports (automatically included by `./scripts/deploy.sh` when `RUNWAY_ORCHESTRATOR_PROVIDER=docker`):
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
 ```
 
-_(Default runner pools use `ghcr.io/cubetiqlabs/runway-runner:latest`, preloaded with the Docker CLI, Docker Compose v2, Buildx, `make`, `build-essential`, `gh`, and `jq`.)_
+For hardware-grade user-space kernel sandboxing via Google **gVisor** (`runsc`), install `runsc` on Linux runner hosts (`RUNWAY_ORCHESTRATOR_SANDBOX_RUNTIME=auto` detects and activates it automatically, or set `gvisor` to require it strictly):
+
+```sh
+sudo ./scripts/install-gvisor.sh
+# Or pass --install-gvisor --sandbox gvisor when installing runway-agent
+```
+
+_(Default runner pools use `ghcr.io/cubetiqlabs/runway-runner:latest`, preloaded with the Docker CLI, Docker Compose v2, Buildx, `make`, `build-essential`, `gh`, `jq`, and `psql`.)_
 
 ## Distributed Agents (`runway-agent`)
 

@@ -92,6 +92,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		zap.String("os", NormalizeOS()),
 		zap.String("arch", NormalizeArch()),
 		zap.String("runtime", a.runtime),
+		zap.String("sandbox_runtime", a.dockerOpts.SandboxRuntime),
+		zap.Bool("isolated_dind", a.dockerOpts.IsolatedDinD),
 		zap.Int("concurrency", a.cfg.Concurrency),
 		zap.String("work_dir", a.cfg.WorkDir),
 		zap.String("log_dir", a.cfg.LogDir),

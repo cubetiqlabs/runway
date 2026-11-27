@@ -6,7 +6,10 @@ VERSION="${RUNWAY_AGENT_VERSION:-latest}"
 SERVER="${RUNWAY_AGENT_SERVER:-}"
 TOKEN="${RUNWAY_AGENT_TOKEN:-}"
 RUNTIME="${RUNWAY_AGENT_RUNTIME:-auto}"
+SANDBOX="${RUNWAY_AGENT_SANDBOX:-auto}"
 DOCKER_SOCKET="${RUNWAY_AGENT_DOCKER_SOCKET:-/var/run/docker.sock}"
+ISOLATED_DIND="${RUNWAY_AGENT_ISOLATED_DIND:-true}"
+INSTALL_GVISOR="false"
 CONCURRENCY="${RUNWAY_AGENT_CONCURRENCY:-2}"
 LABELS="${RUNWAY_AGENT_LABELS:-}"
 AUTO_UPDATE="${RUNWAY_AGENT_AUTO_UPDATE:-true}"
@@ -27,6 +30,9 @@ Options:
   --server <url>        Runway control plane URL
   --token <rwa_...>     Agent registration token
   --runtime <mode>      auto | native | docker (default: auto)
+  --sandbox <mode>      auto | gvisor | runsc | runc (default: auto)
+  --no-isolated-dind    Disable per-job isolated DinD sidecars
+  --install-gvisor      Install Google gVisor (runsc) on Linux before starting
   --docker-socket <p>   Docker socket or tcp:// endpoint (default: /var/run/docker.sock)
   --concurrency <n>     Max concurrent jobs (default: 2)
   --labels <a,b>        Comma-separated host labels
@@ -40,10 +46,13 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --server)         SERVER="${2:-}"; shift 2 ;;
-    --token)          TOKEN="${2:-}"; shift 2 ;;
-    --runtime)        RUNTIME="${2:-}"; shift 2 ;;
-    --docker-socket)  DOCKER_SOCKET="${2:-}"; shift 2 ;;
+    --server)           SERVER="${2:-}"; shift 2 ;;
+    --token)            TOKEN="${2:-}"; shift 2 ;;
+    --runtime)          RUNTIME="${2:-}"; shift 2 ;;
+    --sandbox)          SANDBOX="${2:-}"; shift 2 ;;
+    --no-isolated-dind) ISOLATED_DIND="false"; shift ;;
+    --install-gvisor)   INSTALL_GVISOR="true"; shift ;;
+    --docker-socket)    DOCKER_SOCKET="${2:-}"; shift 2 ;;
     --concurrency)    CONCURRENCY="${2:-}"; shift 2 ;;
     --labels)         LABELS="${2:-}"; shift 2 ;;
     --version)        VERSION="${2:-}"; shift 2 ;;
@@ -152,11 +161,21 @@ mkdir -p "${BIN_DIR}" "${CONF_DIR}" "${WORK_DIR}" "${LOG_DIR}"
 tar -xzf "${TMP_DIR}/${ASSET_NAME}" -C "${TMP_DIR}"
 install -m 0755 "${TMP_DIR}/runway-agent" "${BIN_PATH}"
 
+if [[ "${INSTALL_GVISOR}" == "true" ]]; then
+  if [[ "${GOOS}" != "linux" ]] || [[ "$(id -u)" -ne 0 ]]; then
+    err "--install-gvisor requires running as root on Linux."
+  fi
+  log "Installing gVisor (runsc) sandbox runtime..."
+  curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/install-gvisor.sh" | bash
+fi
+
 umask 077
 cat >"${ENV_FILE}" <<EOF
 RUNWAY_AGENT_SERVER=${SERVER}
 RUNWAY_AGENT_TOKEN=${TOKEN}
 RUNWAY_AGENT_RUNTIME=${RUNTIME}
+RUNWAY_AGENT_SANDBOX=${SANDBOX}
+RUNWAY_AGENT_ISOLATED_DIND=${ISOLATED_DIND}
 RUNWAY_AGENT_DOCKER_SOCKET=${DOCKER_SOCKET}
 RUNWAY_AGENT_WORK_DIR=${WORK_DIR}
 RUNWAY_AGENT_LOG_DIR=${LOG_DIR}

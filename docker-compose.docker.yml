@@ -1,16 +1,11 @@
 # Overlay for provisioning ephemeral Docker runner containers securely via Docker Socket Proxy,
-# with an isolated Docker-in-Docker (DinD) sidecar so CI workflow Docker steps work out of the box:
+# with per-job isolated Docker-in-Docker (DinD) sidecars and automatic gVisor (runsc) sandboxing
+# so concurrent workflow jobs and services (PostgreSQL/Redis/ports) never collide:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
 
 networks:
   docker-proxy-net:
     driver: bridge
-  runner-dind-net:
-    name: ${RUNWAY_RUNNER_NETWORK:-runway-runner-net}
-    driver: bridge
-
-volumes:
-  dind-storage:
 
 services:
   docker-proxy:
@@ -21,8 +16,10 @@ services:
       CONTAINERS: "1"
       IMAGES: "1"
       INFO: "1"
+      NETWORKS: "1"
       PING: "1"
       VERSION: "1"
+      VOLUMES: "1"
       POST: "1"
       ALLOW_START: "1"
       ALLOW_STOP: "1"
@@ -33,7 +30,6 @@ services:
       CONFIGS: "0"
       DISTRIBUTION: "0"
       EXEC: "0"
-      NETWORKS: "0"
       NODES: "0"
       PLUGINS: "0"
       SECRETS: "0"
@@ -42,7 +38,6 @@ services:
       SWARM: "0"
       SYSTEM: "0"
       TASKS: "0"
-      VOLUMES: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -53,41 +48,17 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  runner-dind:
-    image: ${RUNWAY_DIND_IMAGE:-docker:dind}
-    container_name: runway-runner-dind
-    restart: unless-stopped
-    privileged: true
-    environment:
-      DOCKER_TLS_CERTDIR: ""
-    volumes:
-      - dind-storage:/var/lib/docker
-    networks:
-      - runner-dind-net
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD-SHELL", "docker -H tcp://127.0.0.1:2375 info >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
   runway:
     depends_on:
       postgres:
         condition: service_healthy
       docker-proxy:
         condition: service_started
-      runner-dind:
-        condition: service_healthy
     networks:
       - default
       - docker-proxy-net
     environment:
       RUNWAY_ORCHESTRATOR_DOCKER_SOCKET: ${DOCKER_PROXY_URL:-tcp://docker-proxy:2375}
-      RUNWAY_ORCHESTRATOR_RUNNER_DOCKER_HOST: ${RUNWAY_ORCHESTRATOR_RUNNER_DOCKER_HOST:-tcp://runner-dind:2375}
-      RUNWAY_ORCHESTRATOR_RUNNER_NETWORK: ${RUNWAY_RUNNER_NETWORK:-runway-runner-net}
+      RUNWAY_ORCHESTRATOR_SANDBOX_RUNTIME: ${RUNWAY_ORCHESTRATOR_SANDBOX_RUNTIME:-auto}
+      RUNWAY_ORCHESTRATOR_RUNNER_ISOLATED_DIND: ${RUNWAY_ORCHESTRATOR_RUNNER_ISOLATED_DIND:-true}
+      RUNWAY_ORCHESTRATOR_DIND_IMAGE: ${RUNWAY_DIND_IMAGE:-docker:dind}

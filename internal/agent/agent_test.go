@@ -128,24 +128,34 @@ func TestResolveDockerOptionsAndLogFile(t *testing.T) {
 	cfg := DefaultConfig("1.0.0")
 	cfg.DockerSocket = "/var/run/docker.sock"
 	opts := ResolveDockerOptions(cfg)
-	if !opts.MountDockerSocket {
-		t.Fatal("expected MountDockerSocket to auto-enable for local unix socket")
+	if !opts.IsolatedDinD || opts.MountDockerSocket || opts.SandboxRuntime != "auto" {
+		t.Fatalf("expected secure defaults (IsolatedDinD=true, MountDockerSocket=false, SandboxRuntime=auto), got %+v", opts)
 	}
 
-	// Explicit opt-out must be respected.
-	cfg.MountDockerSocket = false
+	// Explicit --no-isolated-dind disables per-job sidecar.
+	cfg.IsolatedDinD = false
+	cfg.IsolatedDinDSet = true
+	opts = ResolveDockerOptions(cfg)
+	if opts.IsolatedDinD || opts.MountDockerSocket {
+		t.Fatalf("expected IsolatedDinD=false and MountDockerSocket=false, got %+v", opts)
+	}
+
+	// Explicit host socket mount opt-in disables isolated DinD.
+	cfg.IsolatedDinDSet = false
+	cfg.MountDockerSocket = true
 	cfg.MountDockerSocketSet = true
 	opts = ResolveDockerOptions(cfg)
-	if opts.MountDockerSocket {
-		t.Fatal("expected MountDockerSocket to stay false when explicitly disabled")
+	if !opts.MountDockerSocket || opts.IsolatedDinD {
+		t.Fatalf("expected MountDockerSocket=true and IsolatedDinD=false, got %+v", opts)
 	}
 
-	// DinD RunnerDockerHost must suppress unix socket mounting.
+	// External DinD RunnerDockerHost disables isolated DinD and socket mounting.
+	cfg.MountDockerSocket = false
 	cfg.MountDockerSocketSet = false
 	cfg.RunnerDockerHost = "tcp://runner-dind:2375"
 	opts = ResolveDockerOptions(cfg)
-	if opts.MountDockerSocket || opts.RunnerDockerHost != "tcp://runner-dind:2375" {
-		t.Fatalf("unexpected DinD docker options: %+v", opts)
+	if opts.MountDockerSocket || opts.IsolatedDinD || opts.RunnerDockerHost != "tcp://runner-dind:2375" {
+		t.Fatalf("unexpected external DinD docker options: %+v", opts)
 	}
 
 	if !IsLocalUnixSocket("unix:///var/run/docker.sock") || IsLocalUnixSocket("tcp://127.0.0.1:2375") {

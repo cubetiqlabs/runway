@@ -33,6 +33,7 @@ RUN set -eux; \
       openssh-client \
       python3 \
       python3-pip \
+      postgresql-client \
       wget \
       file \
       patch; \
@@ -54,8 +55,8 @@ RUN set -eux; \
       docker-compose-plugin \
       gh \
       nodejs; \
-    mkdir -p /opt/hostedtoolcache; \
-    chown -R runner:runner /opt/hostedtoolcache; \
+    mkdir -p /opt/hostedtoolcache /home/runner/_work; \
+    chown -R runner:runner /opt/hostedtoolcache /home/runner/_work; \
     git lfs install --system; \
     make --version; \
     node --version; \
@@ -65,7 +66,11 @@ RUN set -eux; \
     docker buildx version; \
     gh --version; \
     jq --version; \
+    psql --version; \
     rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0755 portfwd.py /usr/local/bin/runway-portfwd
+RUN python3 -m py_compile /usr/local/bin/runway-portfwd
 
 USER runner
 WORKDIR /home/runner

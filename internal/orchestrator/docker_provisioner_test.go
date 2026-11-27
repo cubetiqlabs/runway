@@ -317,3 +317,209 @@ func TestDockerProvisionerTerminateStatuses(t *testing.T) {
 		t.Fatal("expected Terminate to fail on HTTP 500")
 	}
 }
+
+func TestDockerProvisionerIsolatedDinDRuncPod(t *testing.T) {
+	var createdVolume string
+	var deletes []string
+	creates := make(map[string]map[string]any)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"NCPU":     4,
+				"MemTotal": int64(8) * 1024 * 1024 * 1024,
+				"Runtimes": map[string]any{"runc": map[string]any{}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/volumes/create":
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			createdVolume, _ = req["Name"].(string)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Name": createdVolume})
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
+			name := r.URL.Query().Get("name")
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			creates[name] = req
+			id := "id-" + name
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Id": id})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"State": map[string]any{"Running": true}})
+		case r.Method == http.MethodDelete:
+			deletes = append(deletes, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Docker API request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	runnerID := uuid.New()
+	prov := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		IsolatedDinD:   true,
+		SandboxRuntime: "auto",
+	})
+	res, err := prov.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         runnerID,
+		RunnerName:       "runner-iso-runc",
+		EncodedJITConfig: "jit-secret",
+		Pool:             domain.RunnerPool{Slug: "pool", VCPU: 2, MemoryMB: 2048},
+	})
+	if err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+	if !strings.HasPrefix(res.ProviderRef, "pod:") {
+		t.Fatalf("expected pod:... ProviderRef, got %q", res.ProviderRef)
+	}
+	if createdVolume == "" {
+		t.Fatal("expected per-job volume creation")
+	}
+
+	runnerReq := creates["runner-iso-runc"]
+	if runnerReq == nil {
+		t.Fatal("expected runner container create payload")
+	}
+	hc := runnerReq["HostConfig"].(map[string]any)
+	if !strings.HasPrefix(hc["NetworkMode"].(string), "container:id-runway-dind-") {
+		t.Fatalf("expected runner NetworkMode attached to DinD sidecar, got %v", hc["NetworkMode"])
+	}
+	if int64(hc["MemorySwap"].(float64)) != int64(2048)*1024*1024 {
+		t.Fatalf("expected MemorySwap locked equal to Memory, got %v", hc["MemorySwap"])
+	}
+	var envList []string
+	for _, e := range runnerReq["Env"].([]any) {
+		envList = append(envList, e.(string))
+	}
+	if !containsString(envList, "DOCKER_HOST=tcp://127.0.0.1:2375") {
+		t.Fatalf("expected DOCKER_HOST=tcp://127.0.0.1:2375, got %v", envList)
+	}
+
+	healthy, err := prov.Healthy(context.Background(), res.ProviderRef)
+	if err != nil || !healthy {
+		t.Fatalf("expected Healthy=true, got healthy=%v err=%v", healthy, err)
+	}
+	if err := prov.Terminate(context.Background(), res.ProviderRef); err != nil {
+		t.Fatalf("Terminate failed: %v", err)
+	}
+	joined := strings.Join(deletes, ",")
+	if !strings.Contains(joined, "/containers/id-runner-iso-runc") || !strings.Contains(joined, "/containers/id-runway-dind-") || !strings.Contains(joined, "/volumes/"+createdVolume) {
+		t.Fatalf("expected runner, sidecar, and volume deleted, got %v", deletes)
+	}
+}
+
+func TestDockerProvisionerIsolatedDinDGVisorSandbox(t *testing.T) {
+	var createdNetwork string
+	var deletes []string
+	creates := make(map[string]map[string]any)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"NCPU":     4,
+				"MemTotal": int64(8) * 1024 * 1024 * 1024,
+				"Runtimes": map[string]any{"runc": map[string]any{}, "runsc": map[string]any{}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/volumes/create":
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Name": req["Name"]})
+		case r.Method == http.MethodPost && r.URL.Path == "/networks/create":
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			createdNetwork, _ = req["Name"].(string)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "net-" + createdNetwork})
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
+			name := r.URL.Query().Get("name")
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			creates[name] = req
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "id-" + name})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			deletes = append(deletes, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Docker API request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	prov := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		IsolatedDinD:   true,
+		SandboxRuntime: "auto",
+	})
+	res, err := prov.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-gvisor-1",
+		EncodedJITConfig: "jit-secret",
+		Pool:             domain.RunnerPool{Slug: "pool", VCPU: 2, MemoryMB: 2048},
+	})
+	if err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+	if createdNetwork == "" {
+		t.Fatal("expected dedicated per-job bridge network for gVisor")
+	}
+
+	runnerReq := creates["runner-gvisor-1"]
+	hc := runnerReq["HostConfig"].(map[string]any)
+	if hc["Runtime"] != "runsc" || hc["NetworkMode"] != createdNetwork {
+		t.Fatalf("expected Runtime=runsc and NetworkMode=%s, got Runtime=%v NetworkMode=%v", createdNetwork, hc["Runtime"], hc["NetworkMode"])
+	}
+	var envList []string
+	for _, e := range runnerReq["Env"].([]any) {
+		envList = append(envList, e.(string))
+	}
+	if !containsString(envList, "DOCKER_HOST=tcp://dind:2375") || !containsString(envList, "RUNWAY_DIND_PORT_PROXY=1") {
+		t.Fatalf("expected DOCKER_HOST=tcp://dind:2375 and RUNWAY_DIND_PORT_PROXY=1, got %v", envList)
+	}
+
+	if err := prov.Terminate(context.Background(), res.ProviderRef); err != nil {
+		t.Fatalf("Terminate failed: %v", err)
+	}
+	joined := strings.Join(deletes, ",")
+	if !strings.Contains(joined, "/networks/net-"+createdNetwork) {
+		t.Fatalf("expected per-job network deleted on Terminate, got %v", deletes)
+	}
+}
+
+func TestDockerProvisionerStrictGVisorFailsWhenUnavailable(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/info" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"NCPU":     4,
+				"MemTotal": int64(8) * 1024 * 1024 * 1024,
+				"Runtimes": map[string]any{"runc": map[string]any{}},
+			})
+			return
+		}
+		t.Fatalf("expected no resource creation when strict runsc unavailable, got %s %s", r.Method, r.URL.Path)
+	}))
+	defer ts.Close()
+
+	prov := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		IsolatedDinD:   true,
+		SandboxRuntime: "gvisor",
+	})
+	_, err := prov.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-strict-fail",
+		EncodedJITConfig: "jit-secret",
+		Pool:             domain.RunnerPool{Slug: "pool", VCPU: 2, MemoryMB: 1024},
+	})
+	if err == nil || !strings.Contains(err.Error(), "runsc") {
+		t.Fatalf("expected error mentioning runsc when strict gvisor unavailable, got %v", err)
+	}
+}

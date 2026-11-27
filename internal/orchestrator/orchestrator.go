@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +82,9 @@ func NewOrchestrator(
 			RunnerNetwork:     cfg.RunnerNetwork,
 			MountDockerSocket: cfg.RunnerMountDockerSocket,
 			RunnerDockerGID:   cfg.RunnerDockerGID,
+			SandboxRuntime:    cfg.SandboxRuntime,
+			IsolatedDinD:      cfg.RunnerIsolatedDinD,
+			DinDImage:         cfg.DinDImage,
 		}),
 	}
 	if agentRepo != nil {
@@ -256,7 +260,7 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 		checkCtx, cancelCheck := context.WithTimeout(baseCtx, 5*time.Second)
 		healthy, healthErr := prov.Healthy(checkCtx, ref)
 		cancelCheck()
-		if healthErr == nil && !healthy {
+		if healthErr == nil && !healthy && !strings.HasPrefix(ref, "pod:") {
 			return
 		}
 
@@ -452,6 +456,7 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 				if healthErr != nil || healthy {
 					continue
 				}
+				_ = dockerProv.Terminate(ctx, rn.ProviderRef)
 				_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
 				o.requeueLostRunnerJob(ctx, &rn, fmt.Sprintf("Runner %s exited before starting job; requeued", rn.Name))
 				o.notifySlotFreed()

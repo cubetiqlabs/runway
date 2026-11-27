@@ -80,18 +80,21 @@ type ModerationConfig struct {
 }
 
 type OrchestratorConfig struct {
-	Provider               string        `mapstructure:"provider"` // simulated | docker | agent
-	DockerSocket           string        `mapstructure:"docker_socket"`
-	DefaultImage           string        `mapstructure:"default_image"`
-	RunnerDockerHost       string        `mapstructure:"runner_docker_host"`
-	RunnerNetwork          string        `mapstructure:"runner_network"`
-	RunnerMountDockerSocket bool         `mapstructure:"runner_mount_docker_socket"`
-	RunnerDockerGID        string        `mapstructure:"runner_docker_gid"`
-	WorkerCount            int           `mapstructure:"worker_count"`
-	QueueSize              int           `mapstructure:"queue_size"`
-	ReconcileInterval      time.Duration `mapstructure:"reconcile_interval"`
-	ProvisionTimeout       time.Duration `mapstructure:"provision_timeout"`
-	StaleHeartbeatTTL      time.Duration `mapstructure:"stale_heartbeat_ttl"`
+	Provider                string        `mapstructure:"provider"` // simulated | docker | agent
+	DockerSocket            string        `mapstructure:"docker_socket"`
+	DefaultImage            string        `mapstructure:"default_image"`
+	SandboxRuntime          string        `mapstructure:"sandbox_runtime"` // auto | gvisor | runsc | runc | none | <custom>
+	RunnerIsolatedDinD      bool          `mapstructure:"runner_isolated_dind"`
+	DinDImage               string        `mapstructure:"dind_image"`
+	RunnerDockerHost        string        `mapstructure:"runner_docker_host"`
+	RunnerNetwork           string        `mapstructure:"runner_network"`
+	RunnerMountDockerSocket bool          `mapstructure:"runner_mount_docker_socket"`
+	RunnerDockerGID         string        `mapstructure:"runner_docker_gid"`
+	WorkerCount             int           `mapstructure:"worker_count"`
+	QueueSize               int           `mapstructure:"queue_size"`
+	ReconcileInterval       time.Duration `mapstructure:"reconcile_interval"`
+	ProvisionTimeout        time.Duration `mapstructure:"provision_timeout"`
+	StaleHeartbeatTTL       time.Duration `mapstructure:"stale_heartbeat_ttl"`
 }
 
 type LoggingConfig struct {
@@ -173,6 +176,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("orchestrator.provider", "simulated")
 	v.SetDefault("orchestrator.docker_socket", "/var/run/docker.sock")
 	v.SetDefault("orchestrator.default_image", "ghcr.io/cubetiqlabs/runway-runner:latest")
+	v.SetDefault("orchestrator.sandbox_runtime", "auto")
+	v.SetDefault("orchestrator.runner_isolated_dind", false)
+	v.SetDefault("orchestrator.dind_image", "docker:dind")
 	v.SetDefault("orchestrator.runner_docker_host", "")
 	v.SetDefault("orchestrator.runner_network", "")
 	v.SetDefault("orchestrator.runner_mount_docker_socket", false)
@@ -206,6 +212,7 @@ func bindEnvKeys(v *viper.Viper) {
 		"admin.email", "admin.password", "admin.name",
 		"moderation.default_action",
 		"orchestrator.provider", "orchestrator.docker_socket", "orchestrator.default_image",
+		"orchestrator.sandbox_runtime", "orchestrator.runner_isolated_dind", "orchestrator.dind_image",
 		"orchestrator.runner_docker_host", "orchestrator.runner_network",
 		"orchestrator.runner_mount_docker_socket", "orchestrator.runner_docker_gid",
 		"orchestrator.worker_count", "orchestrator.queue_size",
