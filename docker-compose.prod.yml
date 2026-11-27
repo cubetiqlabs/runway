@@ -1,9 +1,21 @@
 # Production overlay:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --wait
+
+networks:
+  traefik-net:
+    external: true
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${INTERNAL_SUBNET:-10.10.230.0/24}
+
 services:
   postgres:
     restart: always
     ports: []
+    networks:
+      - internal
     deploy:
       resources:
         limits:
@@ -11,6 +23,10 @@ services:
 
   runway:
     restart: always
+    ports: []
+    networks:
+      - traefik-net
+      - internal
     environment:
       RUNWAY_APP_ENVIRONMENT: production
       RUNWAY_SECURITY_COOKIE_SECURE: ${RUNWAY_SECURITY_COOKIE_SECURE:-true}

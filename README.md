@@ -19,7 +19,7 @@ Self-hosted GitHub Actions runner moderator and ephemeral JIT runner control pla
    ```sh
    ./scripts/deploy.sh deploy --mode pull --prod
    ```
-   *(Use `--mode build` to build the `scratch` container locally.)*
+   _(Use `--mode build` to build the `scratch` container locally.)_
 
 ## GitHub App Setup
 
@@ -50,3 +50,7 @@ RUNWAY_DATABASE_URL="postgres://runway:runway_dev_password@localhost:5432/runway
 make dev-web   # http://localhost:3000 proxied to :8080
 make build     # compile embedded SPA + bin/server
 ```
+
+### Contributors
+
+- Sambo Chea <sombochea@cubis.tech>
