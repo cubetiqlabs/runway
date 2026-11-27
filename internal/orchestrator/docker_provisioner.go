@@ -31,6 +31,7 @@ type DockerOptions struct {
 	RunnerNetwork     string
 	MountDockerSocket bool
 	RunnerDockerGID   string
+	RunnerDNS         []string
 	SandboxRuntime    string // auto | gvisor | runsc | runc | none | <custom>
 	IsolatedDinD      bool   // spin up an isolated per-job docker:dind sidecar to eliminate port collisions
 	DinDImage         string
@@ -284,6 +285,9 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		hostConfig["Runtime"] = sandboxRuntime
 	}
 
+	isGVisor := strings.EqualFold(sandboxRuntime, "runsc")
+	dnsServers := d.resolveDNS(sandboxRuntime)
+
 	var pod dockerPodRef
 	var binds []string
 
@@ -316,44 +320,25 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 			"Memory":     memBytes,
 			"MemorySwap": memBytes,
 		}
+		if len(dnsServers) > 0 {
+			sidecarHostConfig["Dns"] = dnsServers
+		}
 		if pod.volumeName != "" {
 			sidecarHostConfig["Binds"] = []string{pod.volumeName + ":/home/runner/_work"}
 		}
 
 		sidecarCmd := []string{"--host=tcp://127.0.0.1:2375", "--tls=false"}
+		if isGVisor {
+			sidecarCmd[0] = "--host=tcp://0.0.0.0:2375"
+			// Default bridge avoids Docker's embedded 127.0.0.11 DNS iptables DNAT, which gVisor cannot route.
+			sidecarHostConfig["NetworkMode"] = "bridge"
+		}
 		sidecarPayload := map[string]any{
 			"Image":      dindImage,
 			"Cmd":        sidecarCmd,
 			"Env":        []string{"DOCKER_TLS_CERTDIR="},
 			"Labels":     managedLabels,
 			"HostConfig": sidecarHostConfig,
-		}
-
-		useBridgeNet := strings.EqualFold(sandboxRuntime, "runsc")
-		var netName string
-		var dindHost string
-		if useBridgeNet {
-			netID, netErr := d.createNetwork(ctx, "runway-net-"+shortID, managedLabels)
-			if netErr == nil && netID != "" {
-				pod.networkID = netID
-				netName = "runway-net-" + shortID
-				dindHost = "dind"
-				sidecarPayload["NetworkingConfig"] = map[string]any{
-					"EndpointsConfig": map[string]any{
-						netName: map[string]any{
-							"Aliases": []string{"dind"},
-						},
-					},
-				}
-			} else if isDockerForbiddenOrUnsupported(netErr) && strings.TrimSpace(d.opts.RunnerNetwork) != "" {
-				netName = strings.TrimSpace(d.opts.RunnerNetwork)
-				dindHost = sidecarName
-			} else {
-				_ = d.Terminate(context.Background(), formatProviderRef(pod))
-				return nil, netErr
-			}
-			sidecarCmd[0] = "--host=tcp://0.0.0.0:2375"
-			sidecarHostConfig["NetworkMode"] = netName
 		}
 
 		sidecarID, sidecarErr := d.createAndStartContainer(ctx, sidecarName, dindImage, sidecarPayload)
@@ -363,10 +348,19 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		}
 		pod.sidecarID = sidecarID
 
-		if useBridgeNet {
-			hostConfig["NetworkMode"] = netName
+		if isGVisor {
+			dindIP, ipErr := d.inspectContainerIP(ctx, sidecarID, "bridge")
+			if ipErr != nil {
+				_ = d.Terminate(context.Background(), formatProviderRef(pod))
+				return nil, fmt.Errorf("resolve isolated dind bridge IP: %w", ipErr)
+			}
+			hostConfig["NetworkMode"] = "bridge"
+			if len(dnsServers) > 0 {
+				hostConfig["Dns"] = dnsServers
+			}
+			hostConfig["ExtraHosts"] = []string{"dind:" + dindIP}
 			env = append(env,
-				"DOCKER_HOST=tcp://"+dindHost+":2375",
+				"DOCKER_HOST=tcp://"+dindIP+":2375",
 				"RUNWAY_DIND_PORT_PROXY=1",
 			)
 		} else {
@@ -385,6 +379,11 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		}
 		if netName := strings.TrimSpace(d.opts.RunnerNetwork); netName != "" {
 			hostConfig["NetworkMode"] = netName
+		} else if isGVisor {
+			hostConfig["NetworkMode"] = "bridge"
+		}
+		if len(dnsServers) > 0 {
+			hostConfig["Dns"] = dnsServers
 		}
 	}
 
@@ -423,6 +422,9 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		"sandbox_runtime": effectiveRuntime,
 		"isolated_dind":   pod.sidecarID != "",
 	}
+	if len(dnsServers) > 0 {
+		hostInfoMap["runner_dns"] = dnsServers
+	}
 	if pod.sidecarID != "" {
 		hostInfoMap["sidecar_id"] = pod.sidecarID
 	}
@@ -442,6 +444,60 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		ProviderRef: formatProviderRef(pod),
 		HostInfo:    hostInfoBytes,
 	}, nil
+}
+
+func (d *DockerProvisioner) resolveDNS(sandboxRuntime string) []string {
+	out := make([]string, 0, len(d.opts.RunnerDNS)+2)
+	for _, raw := range d.opts.RunnerDNS {
+		if s := strings.TrimSpace(raw); s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 && strings.EqualFold(sandboxRuntime, "runsc") {
+		out = append(out, "1.1.1.1", "8.8.8.8")
+	}
+	return out
+}
+
+func (d *DockerProvisioner) inspectContainerIP(ctx context.Context, containerID, networkName string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/containers/%s/json", d.baseURL, url.PathEscape(containerID)), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("docker inspect container IP: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("docker inspect container IP failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var inspect struct {
+		NetworkSettings struct {
+			IPAddress string `json:"IPAddress"`
+			Networks  map[string]struct {
+				IPAddress string `json:"IPAddress"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&inspect); err != nil {
+		return "", err
+	}
+	if networkName != "" {
+		if nw, ok := inspect.NetworkSettings.Networks[networkName]; ok && strings.TrimSpace(nw.IPAddress) != "" {
+			return strings.TrimSpace(nw.IPAddress), nil
+		}
+	}
+	if ip := strings.TrimSpace(inspect.NetworkSettings.IPAddress); ip != "" {
+		return ip, nil
+	}
+	for _, nw := range inspect.NetworkSettings.Networks {
+		if ip := strings.TrimSpace(nw.IPAddress); ip != "" {
+			return ip, nil
+		}
+	}
+	return "", fmt.Errorf("docker container %s returned empty IP address", containerID)
 }
 
 func (d *DockerProvisioner) createAndStartContainer(ctx context.Context, name, image string, payload map[string]any) (string, error) {

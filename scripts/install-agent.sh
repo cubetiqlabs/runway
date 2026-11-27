@@ -10,6 +10,7 @@ RUNTIME_SET="false"
 SANDBOX="${RUNWAY_AGENT_SANDBOX:-auto}"
 SANDBOX_SET="false"
 DOCKER_SOCKET="${RUNWAY_AGENT_DOCKER_SOCKET:-/var/run/docker.sock}"
+RUNNER_DNS="${RUNWAY_AGENT_RUNNER_DNS:-}"
 ISOLATED_DIND="${RUNWAY_AGENT_ISOLATED_DIND:-true}"
 WITH_GVISOR="false"
 CONCURRENCY="${RUNWAY_AGENT_CONCURRENCY:-2}"
@@ -40,6 +41,7 @@ Options:
   --sandbox <mode>      auto | gvisor | runsc | runc (default: auto, or gvisor with --with-gvisor)
   --no-isolated-dind    Disable per-job isolated DinD sidecars
   --docker-socket <p>   Docker socket or tcp:// endpoint (default: /var/run/docker.sock)
+  --runner-dns <a,b>    Comma-separated DNS servers (default for gVisor: 1.1.1.1,8.8.8.8)
   --concurrency <n>     Max concurrent jobs (default: 2)
   --labels <a,b>        Comma-separated host labels
   --version <tag>       Release tag or 'latest' (default: latest)
@@ -60,6 +62,7 @@ while [ "$#" -gt 0 ]; do
     --with-gvisor|--install-gvisor)
                         WITH_GVISOR="true"; shift ;;
     --docker-socket)    DOCKER_SOCKET="${2:-}"; shift 2 ;;
+    --runner-dns)       RUNNER_DNS="${2:-}"; shift 2 ;;
     --concurrency)      CONCURRENCY="${2:-}"; shift 2 ;;
     --labels)           LABELS="${2:-}"; shift 2 ;;
     --version)          VERSION="${2:-}"; shift 2 ;;
@@ -204,6 +207,7 @@ RUNWAY_AGENT_RUNTIME=${RUNTIME}
 RUNWAY_AGENT_SANDBOX=${SANDBOX}
 RUNWAY_AGENT_ISOLATED_DIND=${ISOLATED_DIND}
 RUNWAY_AGENT_DOCKER_SOCKET=${DOCKER_SOCKET}
+RUNWAY_AGENT_RUNNER_DNS=${RUNNER_DNS}
 RUNWAY_AGENT_WORK_DIR=${WORK_DIR}
 RUNWAY_AGENT_LOG_DIR=${LOG_DIR}
 RUNWAY_AGENT_CONCURRENCY=${CONCURRENCY}

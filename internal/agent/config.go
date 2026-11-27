@@ -25,6 +25,7 @@ type Config struct {
 	IsolatedDinDSet      bool
 	DinDImage            string
 	RunnerDockerGID      string
+	RunnerDNS            []string
 	WorkDir              string
 	LogDir               string
 	Concurrency          int
@@ -97,6 +98,9 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_DOCKER_GID")); v != "" {
 		c.RunnerDockerGID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_DNS")); v != "" {
+		c.RunnerDNS = splitLabels(v)
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_WORK_DIR")); v != "" {
 		c.WorkDir = v
@@ -288,6 +292,7 @@ func ResolveDockerOptions(cfg Config) orchestrator.DockerOptions {
 		RunnerNetwork:     cfg.RunnerNetwork,
 		MountDockerSocket: mountSock,
 		RunnerDockerGID:   gid,
+		RunnerDNS:         cfg.RunnerDNS,
 		SandboxRuntime:    sandboxRT,
 		IsolatedDinD:      isolatedDinD,
 		DinDImage:         dindImg,

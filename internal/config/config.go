@@ -90,6 +90,7 @@ type OrchestratorConfig struct {
 	RunnerNetwork           string        `mapstructure:"runner_network"`
 	RunnerMountDockerSocket bool          `mapstructure:"runner_mount_docker_socket"`
 	RunnerDockerGID         string        `mapstructure:"runner_docker_gid"`
+	RunnerDNS               []string      `mapstructure:"runner_dns"`
 	WorkerCount             int           `mapstructure:"worker_count"`
 	QueueSize               int           `mapstructure:"queue_size"`
 	ReconcileInterval       time.Duration `mapstructure:"reconcile_interval"`
@@ -183,6 +184,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("orchestrator.runner_network", "")
 	v.SetDefault("orchestrator.runner_mount_docker_socket", false)
 	v.SetDefault("orchestrator.runner_docker_gid", "")
+	v.SetDefault("orchestrator.runner_dns", []string{})
 	v.SetDefault("orchestrator.worker_count", 4)
 	v.SetDefault("orchestrator.queue_size", 128)
 	v.SetDefault("orchestrator.reconcile_interval", "30s")
@@ -215,6 +217,7 @@ func bindEnvKeys(v *viper.Viper) {
 		"orchestrator.sandbox_runtime", "orchestrator.runner_isolated_dind", "orchestrator.dind_image",
 		"orchestrator.runner_docker_host", "orchestrator.runner_network",
 		"orchestrator.runner_mount_docker_socket", "orchestrator.runner_docker_gid",
+		"orchestrator.runner_dns",
 		"orchestrator.worker_count", "orchestrator.queue_size",
 		"orchestrator.reconcile_interval", "orchestrator.provision_timeout",
 		"orchestrator.stale_heartbeat_ttl",
@@ -226,6 +229,17 @@ func bindEnvKeys(v *viper.Viper) {
 }
 
 func (c *Config) validateAndNormalize() error {
+	if len(c.Orchestrator.RunnerDNS) > 0 {
+		normalized := make([]string, 0, len(c.Orchestrator.RunnerDNS))
+		for _, item := range c.Orchestrator.RunnerDNS {
+			for _, part := range strings.Split(item, ",") {
+				if s := strings.TrimSpace(part); s != "" {
+					normalized = append(normalized, s)
+				}
+			}
+		}
+		c.Orchestrator.RunnerDNS = normalized
+	}
 	c.App.Environment = strings.ToLower(strings.TrimSpace(c.App.Environment))
 	if c.App.Environment != "development" && c.App.Environment != "production" {
 		return fmt.Errorf("invalid app.environment %q: must be 'development' or 'production'", c.App.Environment)

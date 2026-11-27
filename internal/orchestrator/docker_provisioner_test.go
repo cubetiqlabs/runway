@@ -413,7 +413,6 @@ func TestDockerProvisionerIsolatedDinDRuncPod(t *testing.T) {
 }
 
 func TestDockerProvisionerIsolatedDinDGVisorSandbox(t *testing.T) {
-	var createdNetwork string
 	var deletes []string
 	creates := make(map[string]map[string]any)
 
@@ -431,12 +430,6 @@ func TestDockerProvisionerIsolatedDinDGVisorSandbox(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"Name": req["Name"]})
-		case r.Method == http.MethodPost && r.URL.Path == "/networks/create":
-			var req map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			createdNetwork, _ = req["Name"].(string)
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "net-" + createdNetwork})
 		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
 			name := r.URL.Query().Get("name")
 			var req map[string]any
@@ -444,6 +437,16 @@ func TestDockerProvisionerIsolatedDinDGVisorSandbox(t *testing.T) {
 			creates[name] = req
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "id-" + name})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/containers/id-runway-dind-") && strings.HasSuffix(r.URL.Path, "/json"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"State": map[string]any{"Running": true},
+				"NetworkSettings": map[string]any{
+					"IPAddress": "172.17.0.9",
+					"Networks": map[string]any{
+						"bridge": map[string]any{"IPAddress": "172.17.0.9"},
+					},
+				},
+			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodDelete:
@@ -468,29 +471,60 @@ func TestDockerProvisionerIsolatedDinDGVisorSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
-	if createdNetwork == "" {
-		t.Fatal("expected dedicated per-job bridge network for gVisor")
-	}
 
 	runnerReq := creates["runner-gvisor-1"]
 	hc := runnerReq["HostConfig"].(map[string]any)
-	if hc["Runtime"] != "runsc" || hc["NetworkMode"] != createdNetwork {
-		t.Fatalf("expected Runtime=runsc and NetworkMode=%s, got Runtime=%v NetworkMode=%v", createdNetwork, hc["Runtime"], hc["NetworkMode"])
+	if hc["Runtime"] != "runsc" || hc["NetworkMode"] != "bridge" {
+		t.Fatalf("expected Runtime=runsc and NetworkMode=bridge, got Runtime=%v NetworkMode=%v", hc["Runtime"], hc["NetworkMode"])
+	}
+	var dnsList []string
+	for _, d := range hc["Dns"].([]any) {
+		dnsList = append(dnsList, d.(string))
+	}
+	if len(dnsList) != 2 || dnsList[0] != "1.1.1.1" || dnsList[1] != "8.8.8.8" {
+		t.Fatalf("expected default gVisor Dns [1.1.1.1 8.8.8.8], got %v", dnsList)
+	}
+	var hosts []string
+	for _, h := range hc["ExtraHosts"].([]any) {
+		hosts = append(hosts, h.(string))
+	}
+	if !containsString(hosts, "dind:172.17.0.9") {
+		t.Fatalf("expected ExtraHosts [dind:172.17.0.9], got %v", hosts)
 	}
 	var envList []string
 	for _, e := range runnerReq["Env"].([]any) {
 		envList = append(envList, e.(string))
 	}
-	if !containsString(envList, "DOCKER_HOST=tcp://dind:2375") || !containsString(envList, "RUNWAY_DIND_PORT_PROXY=1") {
-		t.Fatalf("expected DOCKER_HOST=tcp://dind:2375 and RUNWAY_DIND_PORT_PROXY=1, got %v", envList)
+	if !containsString(envList, "DOCKER_HOST=tcp://172.17.0.9:2375") || !containsString(envList, "RUNWAY_DIND_PORT_PROXY=1") {
+		t.Fatalf("expected DOCKER_HOST=tcp://172.17.0.9:2375 and RUNWAY_DIND_PORT_PROXY=1, got %v", envList)
 	}
 
 	if err := prov.Terminate(context.Background(), res.ProviderRef); err != nil {
 		t.Fatalf("Terminate failed: %v", err)
 	}
 	joined := strings.Join(deletes, ",")
-	if !strings.Contains(joined, "/networks/net-"+createdNetwork) {
-		t.Fatalf("expected per-job network deleted on Terminate, got %v", deletes)
+	if !strings.Contains(joined, "/containers/id-runner-gvisor-1") || !strings.Contains(joined, "/containers/id-runway-dind-") {
+		t.Fatalf("expected runner and sidecar deleted on Terminate, got %v", deletes)
+	}
+
+	// Verify explicit RunnerDNS override is honored.
+	provCustomDNS := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		IsolatedDinD:   true,
+		SandboxRuntime: "gvisor",
+		RunnerDNS:      []string{"10.0.0.53"},
+	})
+	if _, err := provCustomDNS.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-gvisor-custom-dns",
+		EncodedJITConfig: "jit-secret",
+		Pool:             domain.RunnerPool{Slug: "pool", VCPU: 2, MemoryMB: 2048},
+	}); err != nil {
+		t.Fatalf("Provision with custom DNS failed: %v", err)
+	}
+	customHC := creates["runner-gvisor-custom-dns"]["HostConfig"].(map[string]any)
+	customDNS := customHC["Dns"].([]any)
+	if len(customDNS) != 1 || customDNS[0].(string) != "10.0.0.53" {
+		t.Fatalf("expected custom RunnerDNS [10.0.0.53], got %v", customDNS)
 	}
 }
 

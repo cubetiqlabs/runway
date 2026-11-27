@@ -82,6 +82,7 @@ func NewOrchestrator(
 			RunnerNetwork:     cfg.RunnerNetwork,
 			MountDockerSocket: cfg.RunnerMountDockerSocket,
 			RunnerDockerGID:   cfg.RunnerDockerGID,
+			RunnerDNS:         cfg.RunnerDNS,
 			SandboxRuntime:    cfg.SandboxRuntime,
 			IsolatedDinD:      cfg.RunnerIsolatedDinD,
 			DinDImage:         cfg.DinDImage,

@@ -64,6 +64,7 @@ func runWorker(args []string) int {
 	mountDockerSock := fs.Bool("mount-docker-socket", false, "Bind mount /var/run/docker.sock into spawned runner containers")
 	noMountDockerSock := fs.Bool("no-mount-docker-socket", false, "Disable automatic docker.sock bind mounting into runner containers")
 	runnerDockerGID := fs.String("runner-docker-gid", "", "Optional host docker GID passed as GroupAdd when mounting docker.sock")
+	runnerDNS := fs.String("runner-dns", "", "Comma-separated DNS servers for runner containers (default for gVisor: 1.1.1.1,8.8.8.8)")
 	workDir := fs.String("work-dir", "", "Working directory for runner cache and ephemeral jobs")
 	logDir := fs.String("log-dir", "", "Directory for persistent agent.log output")
 	concurrency := fs.Int("concurrency", 0, "Maximum concurrent runner jobs on this host")
@@ -123,6 +124,14 @@ func runWorker(args []string) int {
 	}
 	if *runnerDockerGID != "" {
 		cfg.RunnerDockerGID = *runnerDockerGID
+	}
+	if *runnerDNS != "" {
+		cfg.RunnerDNS = nil
+		for _, p := range strings.Split(*runnerDNS, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				cfg.RunnerDNS = append(cfg.RunnerDNS, s)
+			}
+		}
 	}
 	if *workDir != "" {
 		cfg.WorkDir = *workDir
@@ -260,6 +269,7 @@ Flags (run):
   --runner-docker-host <u>   External DOCKER_HOST inside runners (disables isolated DinD)
   --runner-network <net>     NetworkMode for Docker runners
   --runner-docker-gid <gid>  Host docker GID for GroupAdd
+  --runner-dns <a,b>         Comma-separated DNS servers for runner containers
   --work-dir <path>          Working cache & job directory (RUNWAY_AGENT_WORK_DIR)
   --log-dir <path>           Log directory for agent.log (RUNWAY_AGENT_LOG_DIR)
   --concurrency <n>          Max concurrent runner jobs (RUNWAY_AGENT_CONCURRENCY)

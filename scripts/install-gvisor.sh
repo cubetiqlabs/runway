@@ -142,8 +142,14 @@ validate_daemon_json() {
   fi
 }
 
-log "Registering runsc runtime with Docker Engine (default runtime stays unchanged)..."
-if ! /usr/local/bin/runsc install; then
+RUNSC_ARGS="--net-raw"
+if /usr/local/bin/runsc --help 2>&1 | grep -q -- "--allow-packet-socket-write"; then
+  RUNSC_ARGS="${RUNSC_ARGS} --allow-packet-socket-write"
+fi
+
+log "Registering runsc runtime with Docker Engine (${RUNSC_ARGS}; default runtime stays unchanged)..."
+# shellcheck disable=SC2086
+if ! /usr/local/bin/runsc install -- ${RUNSC_ARGS}; then
   if [ -n "${DAEMON_BAK}" ] && [ -f "${DAEMON_BAK}" ]; then
     cp -a "${DAEMON_BAK}" "${DAEMON_JSON}"
     warn "Restored ${DAEMON_JSON} from backup after runsc install failure."
@@ -194,4 +200,11 @@ if [ "${verified}" = "true" ]; then
 else
   warn "runsc is configured in ${DAEMON_JSON}, but docker info does not show it yet."
   warn "Running containers were left untouched. To activate manually during a maintenance window, run: sudo systemctl restart docker"
+fi
+
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if [ -f /etc/default/ufw ] && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
+    warn "UFW is active with DEFAULT_FORWARD_POLICY=\"DROP\", which can block Docker/gVisor outbound internet."
+    warn "If runners cannot reach external URLs, set DEFAULT_FORWARD_POLICY=\"ACCEPT\" in /etc/default/ufw and run: sudo ufw reload"
+  fi
 fi
