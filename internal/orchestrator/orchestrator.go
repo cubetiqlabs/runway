@@ -55,8 +55,10 @@ type Orchestrator struct {
 	agentRepo    domain.AgentRepository
 	provisioners map[string]Provisioner
 
-	queue chan dispatchTask
-	wg    sync.WaitGroup
+	queue   chan dispatchTask
+	wg      sync.WaitGroup
+	baseMu  sync.RWMutex
+	baseCtx context.Context
 }
 
 func NewOrchestrator(
@@ -89,16 +91,31 @@ func NewOrchestrator(
 		agentRepo:    agentRepo,
 		provisioners: provs,
 		queue:        make(chan dispatchTask, cfg.QueueSize),
+		baseCtx:      context.Background(),
 	}
 }
 
 func (o *Orchestrator) Start(ctx context.Context) {
+	o.baseMu.Lock()
+	o.baseCtx = ctx
+	o.baseMu.Unlock()
+
 	for i := 0; i < o.cfg.WorkerCount; i++ {
 		o.wg.Add(1)
 		go o.worker(ctx, i)
 	}
 	o.wg.Add(1)
 	go o.reconcileLoop(ctx)
+}
+
+func (o *Orchestrator) lifecycleCtx() context.Context {
+	o.baseMu.RLock()
+	ctx := o.baseCtx
+	o.baseMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (o *Orchestrator) Wait() {
@@ -133,6 +150,50 @@ func (o *Orchestrator) TerminateRunner(ctx context.Context, runner *domain.Runne
 		}
 	}
 	return o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil)
+}
+
+// ReleaseCompletedRunner marks an ephemeral runner terminated immediately for webhooks and cleans up exited Docker containers asynchronously without blocking the webhook response.
+func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domain.Runner) error {
+	if err := o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil); err != nil {
+		return err
+	}
+	if runner.ProviderRef == "" {
+		return nil
+	}
+	prov := o.selectProvisioner(runner.Provider)
+	if runner.Provider != "docker" {
+		if err := prov.Terminate(ctx, runner.ProviderRef); err != nil {
+			o.log.Warn("provisioner terminate error", zap.String("runner", runner.Name), zap.Error(err))
+		}
+		return nil
+	}
+
+	ref := runner.ProviderRef
+	name := runner.Name
+	baseCtx := o.lifecycleCtx()
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		select {
+		case <-baseCtx.Done():
+			return
+		case <-time.After(4 * time.Second):
+		}
+
+		checkCtx, cancelCheck := context.WithTimeout(baseCtx, 5*time.Second)
+		healthy, healthErr := prov.Healthy(checkCtx, ref)
+		cancelCheck()
+		if healthErr == nil && !healthy {
+			return
+		}
+
+		termCtx, cancelTerm := context.WithTimeout(baseCtx, 15*time.Second)
+		defer cancelTerm()
+		if err := prov.Terminate(termCtx, ref); err != nil {
+			o.log.Warn("delayed docker runner cleanup failed", zap.String("runner", name), zap.Error(err))
+		}
+	}()
+	return nil
 }
 
 func (o *Orchestrator) worker(ctx context.Context, workerID int) {

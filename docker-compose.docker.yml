@@ -26,7 +26,7 @@ services:
       POST: "1"
       ALLOW_START: "1"
       ALLOW_STOP: "1"
-      ALLOW_RESTARTS: "0"
+      ALLOW_RESTARTS: "1"
       AUTH: "0"
       BUILD: "0"
       COMMIT: "0"

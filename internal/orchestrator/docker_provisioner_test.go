@@ -136,7 +136,7 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 	if len(capturedCreate.Entrypoint) != 2 || capturedCreate.Entrypoint[0] != "/bin/sh" {
 		t.Fatalf("expected /bin/sh -c entrypoint, got %v", capturedCreate.Entrypoint)
 	}
-	if len(capturedCreate.Cmd) != 1 || !strings.Contains(capturedCreate.Cmd[0], "--jitconfig") || !strings.Contains(capturedCreate.Cmd[0], "unset ENCODED_JIT_CONFIG") {
+	if len(capturedCreate.Cmd) != 1 || !strings.Contains(capturedCreate.Cmd[0], "--jitconfig") || !strings.Contains(capturedCreate.Cmd[0], "unset ENCODED_JIT_CONFIG") || !strings.Contains(capturedCreate.Cmd[0], "/home/runner/.env") {
 		t.Fatalf("unexpected runner cmd: %v", capturedCreate.Cmd)
 	}
 	if capturedCreate.HostConfig.NanoCpus != 2_000_000_000 {
@@ -241,4 +241,28 @@ func containsString(items []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestDockerProvisionerTerminateStatuses(t *testing.T) {
+	statusCode := http.StatusNoContent
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(statusCode)
+		if statusCode >= 400 {
+			_, _ = w.Write([]byte(`{"message":"status"}`))
+		}
+	}))
+	defer ts.Close()
+
+	prov := NewDockerProvisioner(ts.URL)
+	for _, code := range []int{http.StatusOK, http.StatusNoContent, http.StatusNotFound, http.StatusConflict} {
+		statusCode = code
+		if err := prov.Terminate(context.Background(), "cid-test"); err != nil {
+			t.Fatalf("expected Terminate to treat HTTP %d as nil, got %v", code, err)
+		}
+	}
+
+	statusCode = http.StatusInternalServerError
+	if err := prov.Terminate(context.Background(), "cid-test"); err == nil {
+		t.Fatal("expected Terminate to fail on HTTP 500")
+	}
 }

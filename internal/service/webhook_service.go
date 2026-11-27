@@ -205,7 +205,7 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 		}
 		if ev.WorkflowJob.RunnerName != "" {
 			if rn, err := s.runnerRepo.GetByName(ctx, ev.WorkflowJob.RunnerName); err == nil && rn.Ephemeral {
-				_ = s.orch.TerminateRunner(ctx, rn)
+				_ = s.orch.ReleaseCompletedRunner(ctx, rn)
 			}
 		}
 		return "processed", "", nil

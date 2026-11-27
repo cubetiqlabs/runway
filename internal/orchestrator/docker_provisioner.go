@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
+const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -n "${DOCKER_HOST:-}" ] && [ -d /home/runner ]; then touch /home/runner/.env 2>/dev/null || true; if ! grep -q '^DOCKER_HOST=' /home/runner/.env 2>/dev/null; then printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> /home/runner/.env 2>/dev/null || true; fi; fi; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
 
 // DockerOptions configures how spawned runner containers access Docker for CI steps.
 type DockerOptions struct {
@@ -231,13 +231,22 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 		return nil, fmt.Errorf("docker start container failed (%d): %s", startResp.StatusCode, strings.TrimSpace(string(startRaw)))
 	}
 
-	hostInfo, _ := json.Marshal(map[string]any{
+	hostInfoMap := map[string]any{
 		"provider":     "docker",
 		"container_id": containerID,
 		"image":        image,
 		"vcpu":         vcpu,
 		"memory_mb":    memBytes / (1024 * 1024),
-	})
+	}
+	if s := strings.TrimSpace(d.opts.RunnerDockerHost); s != "" {
+		hostInfoMap["runner_docker_host"] = s
+	} else if d.opts.MountDockerSocket {
+		hostInfoMap["runner_docker_host"] = "unix:///var/run/docker.sock"
+	}
+	if s := strings.TrimSpace(d.opts.RunnerNetwork); s != "" {
+		hostInfoMap["runner_network"] = s
+	}
+	hostInfo, _ := json.Marshal(hostInfoMap)
 	return &ProvisionResult{ProviderRef: containerID, HostInfo: hostInfo}, nil
 }
 
@@ -366,8 +375,15 @@ func (d *DockerProvisioner) Terminate(ctx context.Context, providerRef string) e
 	if err != nil {
 		return err
 	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
-	return nil
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent, http.StatusNotFound, http.StatusConflict:
+		return nil
+	default:
+		return fmt.Errorf("docker terminate container failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
 }
 
 func (d *DockerProvisioner) Healthy(ctx context.Context, providerRef string) (bool, error) {

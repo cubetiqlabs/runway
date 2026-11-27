@@ -139,6 +139,9 @@ func main() {
 			zap.String("address", cfg.Address()),
 			zap.String("environment", cfg.App.Environment),
 			zap.String("provider", cfg.Orchestrator.Provider),
+			zap.String("docker_socket", cfg.Orchestrator.DockerSocket),
+			zap.String("runner_docker_host", cfg.Orchestrator.RunnerDockerHost),
+			zap.String("runner_network", cfg.Orchestrator.RunnerNetwork),
 			zap.Bool("github_app_configured", ghClient.IsConfigured()),
 		)
 		err := app.Listen(cfg.Address(), fiber.ListenConfig{
