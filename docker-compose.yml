@@ -9,10 +9,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-runway_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-runway}
     volumes:
-      # PostgreSQL 18+ requires mounting /var/lib/postgresql (not /var/lib/postgresql/data)
       - pgdata:/var/lib/postgresql
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
     logging:
       driver: json-file
       options:
