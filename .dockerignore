@@ -1,0 +1,10 @@
+.git
+bin/
+dist/
+web/node_modules
+web/dist
+web/.tanstack
+web/.nitro
+*.log
+.env
+config.yaml

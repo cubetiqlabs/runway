@@ -1,0 +1,13 @@
+bin/
+backups/
+logs/
+.env
+config.yaml
+*.log
+*.pem
+web/node_modules/
+web/dist/
+web/.tanstack/
+web/.output/
+internal/webui/dist/*
+!internal/webui/dist/index.html

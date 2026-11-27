@@ -1,0 +1,22 @@
+# Production overlay:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --wait
+services:
+  postgres:
+    restart: always
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  runway:
+    restart: always
+    environment:
+      RUNWAY_APP_ENVIRONMENT: production
+      RUNWAY_SECURITY_COOKIE_SECURE: ${RUNWAY_SECURITY_COOKIE_SECURE:-true}
+      RUNWAY_SECURITY_COOKIE_SAME_SITE: ${RUNWAY_SECURITY_COOKIE_SAME_SITE:-Strict}
+      RUNWAY_LOGGING_FORMAT: json
+    deploy:
+      resources:
+        limits:
+          memory: 512M

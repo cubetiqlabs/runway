@@ -1,0 +1,382 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/cubetiqlabs/runway/internal/config"
+	"github.com/cubetiqlabs/runway/internal/crypto"
+	"github.com/cubetiqlabs/runway/internal/domain"
+	"github.com/cubetiqlabs/runway/internal/github"
+	"github.com/cubetiqlabs/runway/internal/moderation"
+	"github.com/cubetiqlabs/runway/internal/orchestrator"
+	"go.uber.org/zap"
+)
+
+type WebhookService struct {
+	cfg        *config.Config
+	log        *zap.Logger
+	ghClient   *github.Client
+	instRepo   domain.InstallationRepository
+	poolRepo   domain.PoolRepository
+	policyRepo domain.PolicyRepository
+	jobRepo    domain.JobRepository
+	runnerRepo domain.RunnerRepository
+	auditRepo  domain.AuditRepository
+	engine     *moderation.Engine
+	orch       *orchestrator.Orchestrator
+}
+
+func NewWebhookService(
+	cfg *config.Config,
+	log *zap.Logger,
+	ghClient *github.Client,
+	instRepo domain.InstallationRepository,
+	poolRepo domain.PoolRepository,
+	policyRepo domain.PolicyRepository,
+	jobRepo domain.JobRepository,
+	runnerRepo domain.RunnerRepository,
+	auditRepo domain.AuditRepository,
+	engine *moderation.Engine,
+	orch *orchestrator.Orchestrator,
+) *WebhookService {
+	return &WebhookService{
+		cfg:        cfg,
+		log:        log,
+		ghClient:   ghClient,
+		instRepo:   instRepo,
+		poolRepo:   poolRepo,
+		policyRepo: policyRepo,
+		jobRepo:    jobRepo,
+		runnerRepo: runnerRepo,
+		auditRepo:  auditRepo,
+		engine:     engine,
+		orch:       orch,
+	}
+}
+
+type WebhookInput struct {
+	DeliveryID   string
+	EventName    string
+	Signature256 string
+	RawBody      []byte
+}
+
+func (s *WebhookService) HandleGitHubWebhook(ctx context.Context, in WebhookInput) error {
+	start := time.Now()
+	if strings.TrimSpace(in.DeliveryID) == "" || strings.TrimSpace(in.EventName) == "" {
+		return fmt.Errorf("%w: missing X-GitHub-Delivery or X-GitHub-Event header", domain.ErrValidation)
+	}
+
+	sigValid := true
+	if strings.TrimSpace(s.cfg.GitHub.WebhookSecret) != "" {
+		sigValid = crypto.VerifyGitHubSignature256(in.RawBody, in.Signature256, s.cfg.GitHub.WebhookSecret)
+	} else if s.cfg.IsProduction() {
+		sigValid = false
+	}
+
+	payloadHash := crypto.HashTokenSHA256(string(in.RawBody))
+	delivery := &domain.WebhookDelivery{
+		DeliveryID:     in.DeliveryID,
+		EventName:      in.EventName,
+		SignatureValid: sigValid,
+		Status:         "received",
+		PayloadHash:    payloadHash,
+	}
+
+	var meta struct {
+		Action       string `json:"action"`
+		Installation struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+	}
+	_ = json.Unmarshal(in.RawBody, &meta)
+	delivery.Action = meta.Action
+	delivery.RepoFullName = meta.Repository.FullName
+	if meta.Installation.ID > 0 {
+		id := meta.Installation.ID
+		delivery.InstallationID = &id
+	}
+
+	inserted, err := s.auditRepo.InsertDeliveryIfAbsent(ctx, delivery)
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		// Duplicate delivery (idempotent retry from GitHub)
+		return nil
+	}
+
+	if !sigValid {
+		_ = s.auditRepo.UpdateDeliveryStatus(ctx, in.DeliveryID, "failed", "invalid HMAC-SHA256 signature", int(time.Since(start).Milliseconds()))
+		return domain.ErrUnauthorized
+	}
+
+	var procErr error
+	status := "processed"
+	switch in.EventName {
+	case "ping":
+		status = "processed"
+	case "installation":
+		procErr = s.handleInstallationEvent(ctx, in.RawBody)
+	case "workflow_job":
+		status, procErr = s.handleWorkflowJobEvent(ctx, in.RawBody)
+	default:
+		status = "ignored"
+	}
+
+	ms := int(time.Since(start).Milliseconds())
+	if procErr != nil {
+		_ = s.auditRepo.UpdateDeliveryStatus(ctx, in.DeliveryID, "failed", procErr.Error(), ms)
+		return procErr
+	}
+	_ = s.auditRepo.UpdateDeliveryStatus(ctx, in.DeliveryID, status, "", ms)
+	return nil
+}
+
+func (s *WebhookService) handleInstallationEvent(ctx context.Context, raw []byte) error {
+	var ev github.InstallationEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return fmt.Errorf("%w: invalid installation payload", domain.ErrValidation)
+	}
+	if ev.Action == "deleted" {
+		err := s.instRepo.DeleteByID(ctx, ev.Installation.ID)
+		if err == domain.ErrNotFound {
+			return nil
+		}
+		return err
+	}
+	inst := &domain.Installation{
+		ID:                    ev.Installation.ID,
+		AccountID:             ev.Installation.Account.ID,
+		AccountLogin:          ev.Installation.Account.Login,
+		AccountType:           ev.Installation.Account.Type,
+		TargetType:            ev.Installation.TargetType,
+		RepositoriesSelection: ev.Installation.RepositorySelection,
+		Permissions:           ev.Installation.Permissions,
+		SuspendedAt:           ev.Installation.SuspendedAt,
+	}
+	return s.instRepo.Upsert(ctx, inst)
+}
+
+func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte) (string, error) {
+	var ev github.WorkflowJobEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return "failed", fmt.Errorf("%w: invalid workflow_job payload", domain.ErrValidation)
+	}
+
+	switch ev.Action {
+	case "queued":
+		return s.onJobQueued(ctx, &ev)
+	case "in_progress":
+		now := time.Now().UTC()
+		if ev.WorkflowJob.StartedAt != nil {
+			now = *ev.WorkflowJob.StartedAt
+		}
+		if err := s.jobRepo.UpdateLifecycle(ctx, ev.WorkflowJob.ID, domain.JobInProgress, "", &now, nil); err != nil && err != domain.ErrNotFound {
+			return "failed", err
+		}
+		if ev.WorkflowJob.RunnerName != "" {
+			if rn, err := s.runnerRepo.GetByName(ctx, ev.WorkflowJob.RunnerName); err == nil {
+				_ = s.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerBusy, ev.WorkflowJob.RunnerID, "", &ev.WorkflowJob.ID)
+			}
+		}
+		return "processed", nil
+	case "completed":
+		now := time.Now().UTC()
+		if ev.WorkflowJob.CompletedAt != nil {
+			now = *ev.WorkflowJob.CompletedAt
+		}
+		status := domain.JobCompleted
+		if ev.WorkflowJob.Conclusion == "cancelled" {
+			status = domain.JobCancelled
+		}
+		if err := s.jobRepo.UpdateLifecycle(ctx, ev.WorkflowJob.ID, status, ev.WorkflowJob.Conclusion, nil, &now); err != nil && err != domain.ErrNotFound {
+			return "failed", err
+		}
+		if ev.WorkflowJob.RunnerName != "" {
+			if rn, err := s.runnerRepo.GetByName(ctx, ev.WorkflowJob.RunnerName); err == nil && rn.Ephemeral {
+				_ = s.orch.TerminateRunner(ctx, rn)
+			}
+		}
+		return "processed", nil
+	default:
+		return "ignored", nil
+	}
+}
+
+func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJobEvent) (string, error) {
+	var instID *int64
+	if ev.Installation.ID > 0 {
+		id := ev.Installation.ID
+		instID = &id
+		if _, err := s.instRepo.GetByID(ctx, id); err == domain.ErrNotFound {
+			login := ev.Repository.Owner.Login
+			if login == "" {
+				login = "unknown"
+			}
+			ownerType := ev.Repository.Owner.Type
+			if ownerType == "" {
+				ownerType = "Organization"
+			}
+			_ = s.instRepo.Upsert(ctx, &domain.Installation{
+				ID:                    id,
+				AccountID:             0,
+				AccountLogin:          login,
+				AccountType:           ownerType,
+				TargetType:            ownerType,
+				RepositoriesSelection: "selected",
+			})
+		}
+	}
+
+	pools, err := s.poolRepo.ListEnabled(ctx)
+	if err != nil {
+		return "failed", err
+	}
+	matchedPool := moderation.MatchPool(pools, instID, ev.WorkflowJob.Labels)
+	if matchedPool == nil {
+		// Not targeted at any Runway-managed runner pool; ignore cleanly.
+		return "ignored", nil
+	}
+
+	isForkPR := ev.Repository.Fork
+	if !isForkPR {
+		for _, pr := range ev.PullRequests {
+			if pr.Head.Repo.FullName != "" && pr.Base.Repo.FullName != "" && pr.Head.Repo.FullName != pr.Base.Repo.FullName {
+				isForkPR = true
+				break
+			}
+		}
+	}
+
+	policies, err := s.policyRepo.ListEnabledOrdered(ctx)
+	if err != nil {
+		return "failed", err
+	}
+	activeRepoCount, err := s.jobRepo.CountActiveForRepo(ctx, ev.Repository.FullName)
+	if err != nil {
+		return "failed", err
+	}
+
+	decision := s.engine.Evaluate(policies, moderation.JobContext{
+		InstallationID:     instID,
+		RepoFullName:       ev.Repository.FullName,
+		HeadBranch:         ev.WorkflowJob.HeadBranch,
+		Actor:              ev.Sender.Login,
+		Labels:             ev.WorkflowJob.Labels,
+		IsForkPR:           isForkPR,
+		ActiveRepoJobCount: activeRepoCount,
+	})
+
+	queuedAt := ev.WorkflowJob.CreatedAt
+	if queuedAt.IsZero() {
+		queuedAt = time.Now().UTC()
+	}
+
+	jobStatus := domain.JobQueued
+	switch decision.Action {
+	case domain.ActionDeny:
+		jobStatus = domain.JobRejected
+	case domain.ActionRequireApproval:
+		jobStatus = domain.JobAwaitingApproval
+	case domain.ActionAllow:
+		jobStatus = domain.JobQueued
+	}
+
+	job := &domain.WorkflowJob{
+		GitHubJobID:        ev.WorkflowJob.ID,
+		GitHubRunID:        ev.WorkflowJob.RunID,
+		InstallationID:     instID,
+		RepoFullName:       ev.Repository.FullName,
+		WorkflowName:       ev.WorkflowJob.WorkflowName,
+		JobName:            ev.WorkflowJob.Name,
+		HeadBranch:         ev.WorkflowJob.HeadBranch,
+		HeadSHA:            ev.WorkflowJob.HeadSHA,
+		Actor:              ev.Sender.Login,
+		IsForkPR:           isForkPR,
+		Labels:             ev.WorkflowJob.Labels,
+		Status:             jobStatus,
+		MatchedPoolID:      &matchedPool.ID,
+		MatchedPolicyID:    decision.PolicyID,
+		ModerationDecision: string(decision.Action),
+		ModerationReason:   decision.Reason,
+		QueuedAt:           queuedAt,
+	}
+
+	if err := s.jobRepo.UpsertFromWebhook(ctx, job); err != nil {
+		return "failed", err
+	}
+
+	meta, _ := json.Marshal(map[string]any{
+		"repo":     job.RepoFullName,
+		"decision": decision.Action,
+		"policy":   decision.PolicyName,
+		"pool":     matchedPool.Name,
+	})
+	_ = s.auditRepo.AppendAuditLog(ctx, &domain.AuditLog{
+		ActorLabel:   "moderation-engine",
+		Action:       "job." + string(decision.Action),
+		ResourceType: "workflow_job",
+		ResourceID:   job.ID.String(),
+		Metadata:     meta,
+	})
+
+	if decision.Action == domain.ActionAllow {
+		if err := DispatchProvisionForJob(ctx, s.ghClient, s.runnerRepo, s.orch, job, *matchedPool); err != nil {
+			s.log.Warn("failed to dispatch runner provision for queued job", zap.Error(err), zap.Int64("github_job_id", job.GitHubJobID))
+		}
+	}
+
+	return "processed", nil
+}
+
+// DispatchProvisionForJob enforces pool concurrency, generates GitHub JIT config when configured, and enqueues provisioning.
+func DispatchProvisionForJob(
+	ctx context.Context,
+	ghClient *github.Client,
+	runnerRepo domain.RunnerRepository,
+	orch *orchestrator.Orchestrator,
+	job *domain.WorkflowJob,
+	pool domain.RunnerPool,
+) error {
+	activeInPool, err := runnerRepo.CountActiveInPool(ctx, pool.ID)
+	if err != nil {
+		return err
+	}
+	if activeInPool >= pool.MaxConcurrency {
+		return fmt.Errorf("pool %q reached max_concurrency (%d)", pool.Name, pool.MaxConcurrency)
+	}
+
+	var encodedJIT string
+	var ghRunnerID *int64
+	if ghClient != nil && ghClient.IsConfigured() && job.InstallationID != nil {
+		parts := strings.SplitN(job.RepoFullName, "/", 2)
+		if len(parts) == 2 {
+			req := github.JITConfigRequest{
+				Name:          fmt.Sprintf("runway-%s-%d", pool.Slug, job.GitHubJobID),
+				RunnerGroupID: pool.RunnerGroupID,
+				Labels:        pool.Labels,
+			}
+			res, err := ghClient.GenerateOrgJITConfig(ctx, *job.InstallationID, parts[0], req)
+			if err != nil {
+				res, err = ghClient.GenerateRepoJITConfig(ctx, *job.InstallationID, parts[0], parts[1], req)
+			}
+			if err != nil {
+				return fmt.Errorf("generate github jit config: %w", err)
+			}
+			encodedJIT = res.EncodedJITConfig
+			id := res.Runner.ID
+			ghRunnerID = &id
+		}
+	}
+
+	orch.EnqueueProvision(job, pool, encodedJIT, ghRunnerID)
+	return nil
+}

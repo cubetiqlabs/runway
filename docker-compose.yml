@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: runway-postgres
+    restart: unless-stopped
+    init: true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-runway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-runway_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-runway}
+    volumes:
+      # PostgreSQL 18+ requires mounting /var/lib/postgresql (not /var/lib/postgresql/data)
+      - pgdata:/var/lib/postgresql
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-runway} -d ${POSTGRES_DB:-runway}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  runway:
+    image: ${RUNWAY_IMAGE:-ghcr.io/cubetiqlabs/runway:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${RUNWAY_VERSION:-1.0.0}
+    container_name: runway-app
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUNWAY_APP_ENVIRONMENT: ${RUNWAY_APP_ENVIRONMENT:-development}
+      RUNWAY_SERVER_PORT: "8080"
+      RUNWAY_DATABASE_URL: postgres://${POSTGRES_USER:-runway}:${POSTGRES_PASSWORD:-runway_dev_password}@postgres:5432/${POSTGRES_DB:-runway}?sslmode=disable
+      RUNWAY_SECURITY_SESSION_SECRET: ${RUNWAY_SECURITY_SESSION_SECRET:-change-me-in-production-min-32-characters-long}
+      RUNWAY_SECURITY_ENCRYPTION_KEY: ${RUNWAY_SECURITY_ENCRYPTION_KEY:-change-me-in-production-32-bytes-key}
+      RUNWAY_SECURITY_COOKIE_SECURE: ${RUNWAY_SECURITY_COOKIE_SECURE:-false}
+      RUNWAY_SECURITY_COOKIE_SAME_SITE: ${RUNWAY_SECURITY_COOKIE_SAME_SITE:-Lax}
+      RUNWAY_ADMIN_EMAIL: ${RUNWAY_ADMIN_EMAIL:-admin@runway.local}
+      RUNWAY_ADMIN_PASSWORD: ${RUNWAY_ADMIN_PASSWORD:-RunwayAdmin123!}
+      RUNWAY_GITHUB_APP_ID: ${RUNWAY_GITHUB_APP_ID:-0}
+      RUNWAY_GITHUB_APP_SLUG: ${RUNWAY_GITHUB_APP_SLUG:-runway}
+      RUNWAY_GITHUB_WEBHOOK_SECRET: ${RUNWAY_GITHUB_WEBHOOK_SECRET:-}
+      RUNWAY_GITHUB_PRIVATE_KEY_PEM: ${RUNWAY_GITHUB_PRIVATE_KEY_PEM:-}
+      RUNWAY_ORCHESTRATOR_PROVIDER: ${RUNWAY_ORCHESTRATOR_PROVIDER:-simulated}
+      RUNWAY_LOGGING_LEVEL: ${RUNWAY_LOGGING_LEVEL:-info}
+      RUNWAY_LOGGING_FORMAT: ${RUNWAY_LOGGING_FORMAT:-json}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/server", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pgdata:

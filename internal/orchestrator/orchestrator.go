@@ -1,0 +1,230 @@
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/cubetiqlabs/runway/internal/config"
+	"github.com/cubetiqlabs/runway/internal/domain"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+type ProvisionRequest struct {
+	RunnerID         uuid.UUID
+	RunnerName       string
+	Pool             domain.RunnerPool
+	EncodedJITConfig string
+	GitHubJobID      int64
+	RepoFullName     string
+}
+
+type ProvisionResult struct {
+	ProviderRef string
+	HostInfo    json.RawMessage
+}
+
+type Provisioner interface {
+	Name() string
+	Provision(ctx context.Context, req ProvisionRequest) (*ProvisionResult, error)
+	Terminate(ctx context.Context, providerRef string) error
+	Healthy(ctx context.Context, providerRef string) (bool, error)
+}
+
+type dispatchTask struct {
+	job              *domain.WorkflowJob
+	pool             domain.RunnerPool
+	encodedJITConfig string
+	githubRunnerID   *int64
+}
+
+// Orchestrator manages a bounded worker pool for runner provisioning and periodic reconciliation.
+type Orchestrator struct {
+	cfg          config.OrchestratorConfig
+	log          *zap.Logger
+	runnerRepo   domain.RunnerRepository
+	jobRepo      domain.JobRepository
+	auditRepo    domain.AuditRepository
+	provisioners map[string]Provisioner
+
+	queue chan dispatchTask
+	wg    sync.WaitGroup
+}
+
+func NewOrchestrator(
+	cfg config.OrchestratorConfig,
+	log *zap.Logger,
+	runnerRepo domain.RunnerRepository,
+	jobRepo domain.JobRepository,
+	auditRepo domain.AuditRepository,
+) *Orchestrator {
+	provs := map[string]Provisioner{
+		"simulated": NewSimulatedProvisioner(),
+		"docker":    NewDockerProvisioner(cfg.DockerSocket),
+	}
+	return &Orchestrator{
+		cfg:          cfg,
+		log:          log,
+		runnerRepo:   runnerRepo,
+		jobRepo:      jobRepo,
+		auditRepo:    auditRepo,
+		provisioners: provs,
+		queue:        make(chan dispatchTask, cfg.QueueSize),
+	}
+}
+
+func (o *Orchestrator) Start(ctx context.Context) {
+	for i := 0; i < o.cfg.WorkerCount; i++ {
+		o.wg.Add(1)
+		go o.worker(ctx, i)
+	}
+	o.wg.Add(1)
+	go o.reconcileLoop(ctx)
+}
+
+func (o *Orchestrator) Wait() {
+	o.wg.Wait()
+}
+
+func (o *Orchestrator) EnqueueProvision(job *domain.WorkflowJob, pool domain.RunnerPool, encodedJITConfig string, githubRunnerID *int64) bool {
+	select {
+	case o.queue <- dispatchTask{
+		job:              job,
+		pool:             pool,
+		encodedJITConfig: encodedJITConfig,
+		githubRunnerID:   githubRunnerID,
+	}:
+		return true
+	default:
+		o.log.Warn("orchestrator queue full; dropping provision task", zap.Int64("github_job_id", job.GitHubJobID))
+		return false
+	}
+}
+
+func (o *Orchestrator) TerminateRunner(ctx context.Context, runner *domain.Runner) error {
+	prov := o.selectProvisioner(runner.Provider)
+	if runner.ProviderRef != "" {
+		if err := prov.Terminate(ctx, runner.ProviderRef); err != nil {
+			o.log.Warn("provisioner terminate error", zap.String("runner", runner.Name), zap.Error(err))
+		}
+	}
+	return o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil)
+}
+
+func (o *Orchestrator) worker(ctx context.Context, workerID int) {
+	defer o.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task := <-o.queue:
+			o.handleTask(ctx, workerID, task)
+		}
+	}
+}
+
+func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispatchTask) {
+	provCtx, cancel := context.WithTimeout(ctx, o.cfg.ProvisionTimeout)
+	defer cancel()
+
+	runnerName := fmt.Sprintf("runway-%s-%s", task.pool.Slug, uuid.NewString()[:8])
+	providerName := task.pool.Provider
+	if providerName == "" {
+		providerName = o.cfg.Provider
+	}
+	prov := o.selectProvisioner(providerName)
+
+	now := time.Now().UTC()
+	rn := &domain.Runner{
+		PoolID:          &task.pool.ID,
+		InstallationID:  task.job.InstallationID,
+		GitHubRunnerID:  task.githubRunnerID,
+		Name:            runnerName,
+		Provider:        prov.Name(),
+		Labels:          task.pool.Labels,
+		Status:          domain.RunnerProvisioning,
+		Ephemeral:       true,
+		CurrentJobID:    &task.job.GitHubJobID,
+		LastHeartbeatAt: &now,
+	}
+	if err := o.runnerRepo.Create(provCtx, rn); err != nil {
+		o.log.Error("create runner record failed", zap.Int("worker", workerID), zap.Error(err))
+		return
+	}
+
+	_ = o.jobRepo.UpdateModerationAndRunner(provCtx, task.job.ID, domain.JobProvisioning, task.job.ModerationDecision, task.job.ModerationReason, task.job.ModeratedBy, &task.pool.ID, &rn.ID)
+
+	res, err := prov.Provision(provCtx, ProvisionRequest{
+		RunnerID:         rn.ID,
+		RunnerName:       runnerName,
+		Pool:             task.pool,
+		EncodedJITConfig: task.encodedJITConfig,
+		GitHubJobID:      task.job.GitHubJobID,
+		RepoFullName:     task.job.RepoFullName,
+	})
+	if err != nil {
+		o.log.Error("runner provisioning failed", zap.String("runner", runnerName), zap.Error(err))
+		_ = o.runnerRepo.UpdateStatus(provCtx, rn.ID, domain.RunnerOffline, nil, "", nil)
+		return
+	}
+
+	_ = o.runnerRepo.UpdateStatus(provCtx, rn.ID, domain.RunnerOnline, task.githubRunnerID, res.ProviderRef, &task.job.GitHubJobID)
+	_ = o.auditRepo.AppendAuditLog(provCtx, &domain.AuditLog{
+		ActorLabel:   "orchestrator",
+		Action:       "runner.provisioned",
+		ResourceType: "runner",
+		ResourceID:   rn.ID.String(),
+		Metadata:     res.HostInfo,
+	})
+}
+
+func (o *Orchestrator) reconcileLoop(ctx context.Context) {
+	defer o.wg.Done()
+	ticker := time.NewTicker(o.cfg.ReconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			o.reconcileOnce(ctx)
+		}
+	}
+}
+
+func (o *Orchestrator) reconcileOnce(ctx context.Context) {
+	now := time.Now().UTC()
+	stale, err := o.runnerRepo.FindStaleRunners(
+		ctx,
+		now.Add(-o.cfg.ProvisionTimeout),
+		now.Add(-o.cfg.StaleHeartbeatTTL),
+	)
+	if err != nil {
+		o.log.Warn("reconcile query stale runners failed", zap.Error(err))
+		return
+	}
+	for _, rn := range stale {
+		prov := o.selectProvisioner(rn.Provider)
+		healthy, _ := prov.Healthy(ctx, rn.ProviderRef)
+		if healthy {
+			_ = o.runnerRepo.Heartbeat(ctx, rn.ID)
+			continue
+		}
+		_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerOffline, nil, "", nil)
+		o.log.Info("marked stale runner offline", zap.String("runner", rn.Name))
+	}
+}
+
+func (o *Orchestrator) selectProvisioner(name string) Provisioner {
+	if p, ok := o.provisioners[name]; ok {
+		return p
+	}
+	if p, ok := o.provisioners[o.cfg.Provider]; ok {
+		return p
+	}
+	return o.provisioners["simulated"]
+}
