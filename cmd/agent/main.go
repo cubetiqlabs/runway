@@ -51,6 +51,10 @@ func runWorker(args []string) int {
 	token := fs.String("token", "", "Agent registration token (rwa_...)")
 	rt := fs.String("runtime", "", "Execution runtime: auto, native, or docker")
 	dockerSock := fs.String("docker-socket", "", "Docker socket path or tcp:// endpoint")
+	runnerDockerHost := fs.String("runner-docker-host", "", "DOCKER_HOST injected into runner containers (e.g. tcp://runner-dind:2375)")
+	runnerNetwork := fs.String("runner-network", "", "Docker NetworkMode for spawned runner containers")
+	mountDockerSock := fs.Bool("mount-docker-socket", false, "Bind mount /var/run/docker.sock into spawned runner containers")
+	runnerDockerGID := fs.String("runner-docker-gid", "", "Optional host docker GID passed as GroupAdd when mounting docker.sock")
 	workDir := fs.String("work-dir", "", "Working directory for runner cache and ephemeral jobs")
 	concurrency := fs.Int("concurrency", 0, "Maximum concurrent runner jobs on this host")
 	labels := fs.String("labels", "", "Comma-separated extra labels advertised by this host")
@@ -78,6 +82,18 @@ func runWorker(args []string) int {
 	}
 	if *dockerSock != "" {
 		cfg.DockerSocket = *dockerSock
+	}
+	if *runnerDockerHost != "" {
+		cfg.RunnerDockerHost = *runnerDockerHost
+	}
+	if *runnerNetwork != "" {
+		cfg.RunnerNetwork = *runnerNetwork
+	}
+	if *mountDockerSock {
+		cfg.MountDockerSocket = true
+	}
+	if *runnerDockerGID != "" {
+		cfg.RunnerDockerGID = *runnerDockerGID
 	}
 	if *workDir != "" {
 		cfg.WorkDir = *workDir

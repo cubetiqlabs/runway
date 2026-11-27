@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/orchestrator"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -43,7 +44,12 @@ func New(cfg Config, log *zap.Logger) *Agent {
 	rt := cfg.Runtime
 	var dockerExec *DockerExecutor
 	if rt == "docker" || (rt == "auto" && runtime.GOOS == "linux") {
-		dockerExec = NewDockerExecutor(cfg.DockerSocket)
+		dockerExec = NewDockerExecutor(cfg.DockerSocket, orchestrator.DockerOptions{
+			RunnerDockerHost:  cfg.RunnerDockerHost,
+			RunnerNetwork:     cfg.RunnerNetwork,
+			MountDockerSocket: cfg.MountDockerSocket,
+			RunnerDockerGID:   cfg.RunnerDockerGID,
+		})
 		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := dockerExec.Ping(pingCtx)
 		cancel()

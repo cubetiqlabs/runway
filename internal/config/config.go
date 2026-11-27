@@ -80,14 +80,18 @@ type ModerationConfig struct {
 }
 
 type OrchestratorConfig struct {
-	Provider          string        `mapstructure:"provider"` // simulated | docker
-	DockerSocket      string        `mapstructure:"docker_socket"`
-	DefaultImage      string        `mapstructure:"default_image"`
-	WorkerCount       int           `mapstructure:"worker_count"`
-	QueueSize         int           `mapstructure:"queue_size"`
-	ReconcileInterval time.Duration `mapstructure:"reconcile_interval"`
-	ProvisionTimeout  time.Duration `mapstructure:"provision_timeout"`
-	StaleHeartbeatTTL time.Duration `mapstructure:"stale_heartbeat_ttl"`
+	Provider               string        `mapstructure:"provider"` // simulated | docker | agent
+	DockerSocket           string        `mapstructure:"docker_socket"`
+	DefaultImage           string        `mapstructure:"default_image"`
+	RunnerDockerHost       string        `mapstructure:"runner_docker_host"`
+	RunnerNetwork          string        `mapstructure:"runner_network"`
+	RunnerMountDockerSocket bool         `mapstructure:"runner_mount_docker_socket"`
+	RunnerDockerGID        string        `mapstructure:"runner_docker_gid"`
+	WorkerCount            int           `mapstructure:"worker_count"`
+	QueueSize              int           `mapstructure:"queue_size"`
+	ReconcileInterval      time.Duration `mapstructure:"reconcile_interval"`
+	ProvisionTimeout       time.Duration `mapstructure:"provision_timeout"`
+	StaleHeartbeatTTL      time.Duration `mapstructure:"stale_heartbeat_ttl"`
 }
 
 type LoggingConfig struct {
@@ -169,6 +173,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("orchestrator.provider", "simulated")
 	v.SetDefault("orchestrator.docker_socket", "/var/run/docker.sock")
 	v.SetDefault("orchestrator.default_image", "ghcr.io/actions/actions-runner:latest")
+	v.SetDefault("orchestrator.runner_docker_host", "")
+	v.SetDefault("orchestrator.runner_network", "")
+	v.SetDefault("orchestrator.runner_mount_docker_socket", false)
+	v.SetDefault("orchestrator.runner_docker_gid", "")
 	v.SetDefault("orchestrator.worker_count", 4)
 	v.SetDefault("orchestrator.queue_size", 128)
 	v.SetDefault("orchestrator.reconcile_interval", "30s")
@@ -198,6 +206,8 @@ func bindEnvKeys(v *viper.Viper) {
 		"admin.email", "admin.password", "admin.name",
 		"moderation.default_action",
 		"orchestrator.provider", "orchestrator.docker_socket", "orchestrator.default_image",
+		"orchestrator.runner_docker_host", "orchestrator.runner_network",
+		"orchestrator.runner_mount_docker_socket", "orchestrator.runner_docker_gid",
 		"orchestrator.worker_count", "orchestrator.queue_size",
 		"orchestrator.reconcile_interval", "orchestrator.provision_timeout",
 		"orchestrator.stale_heartbeat_ttl",

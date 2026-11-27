@@ -40,11 +40,13 @@ jobs:
       - uses: actions/checkout@v4
 ```
 
-To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml), which routes API calls through a hardened `docker-socket-proxy` (automatically included by `./scripts/deploy.sh` when `RUNWAY_ORCHESTRATOR_PROVIDER=docker`):
+To provision real Docker runner containers (`RUNWAY_ORCHESTRATOR_PROVIDER=docker`), include [docker-compose.docker.yml](docker-compose.docker.yml). It pairs `docker-socket-proxy` (zero host `DOCKER_GID` issues) with an isolated `docker:dind` sidecar (`runner-dind`) so workflow `docker build` / `docker run` steps work out of the box (automatically included by `./scripts/deploy.sh` when `RUNWAY_ORCHESTRATOR_PROVIDER=docker`):
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
 ```
+
+_(Ensure your runner pool image includes the Docker CLI, e.g. `catthehacker/ubuntu:runner-22.04` or a custom `ghcr.io/actions/actions-runner` image with `docker-cli`.)_
 
 ## Distributed Agents (`runway-agent`)
 

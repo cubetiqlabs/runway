@@ -16,16 +16,30 @@ import (
 
 const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
 
+// DockerOptions configures how spawned runner containers access Docker for CI steps.
+type DockerOptions struct {
+	RunnerDockerHost  string
+	RunnerNetwork     string
+	MountDockerSocket bool
+	RunnerDockerGID   string
+}
+
 // DockerProvisioner speaks directly to the Docker Engine socket or TCP/HTTP API with zero heavy SDK deps.
 type DockerProvisioner struct {
 	dockerHost string
 	baseURL    string
+	opts       DockerOptions
 	client     *http.Client
 	pullClient *http.Client
 }
 
 // NewDockerProvisioner creates a Docker Engine provisioner supporting Unix sockets or HTTP/TCP endpoints.
 func NewDockerProvisioner(dockerHost string) *DockerProvisioner {
+	return NewDockerProvisionerWithOptions(dockerHost, DockerOptions{})
+}
+
+// NewDockerProvisionerWithOptions creates a Docker Engine provisioner configured with runner Docker/network options.
+func NewDockerProvisionerWithOptions(dockerHost string, opts DockerOptions) *DockerProvisioner {
 	host := strings.TrimSpace(dockerHost)
 	if host == "" {
 		host = "/var/run/docker.sock"
@@ -58,6 +72,7 @@ func NewDockerProvisioner(dockerHost string) *DockerProvisioner {
 	return &DockerProvisioner{
 		dockerHost: host,
 		baseURL:    baseURL,
+		opts:       opts,
 		client:     &http.Client{Transport: transport, Timeout: 30 * time.Second},
 		pullClient: &http.Client{Transport: transport, Timeout: 5 * time.Minute},
 	}
@@ -143,28 +158,44 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 	}
 
 	pidsLimit := int64(4096)
+	env := []string{
+		"RUNNER_NAME=" + req.RunnerName,
+		"ENCODED_JIT_CONFIG=" + req.EncodedJITConfig,
+	}
+	hostConfig := map[string]any{
+		"AutoRemove":  true,
+		"Init":        true,
+		"CapDrop":     []string{"ALL"},
+		"SecurityOpt": []string{"no-new-privileges:true"},
+		"PidsLimit":   pidsLimit,
+		"NanoCpus":    int64(vcpu) * 1_000_000_000,
+		"Memory":      memBytes,
+	}
+
+	if runnerDockerHost := strings.TrimSpace(d.opts.RunnerDockerHost); runnerDockerHost != "" {
+		env = append(env, "DOCKER_HOST="+runnerDockerHost)
+	} else if d.opts.MountDockerSocket {
+		env = append(env, "DOCKER_HOST=unix:///var/run/docker.sock")
+		hostConfig["Binds"] = []string{"/var/run/docker.sock:/var/run/docker.sock"}
+		if gid := strings.TrimSpace(d.opts.RunnerDockerGID); gid != "" {
+			hostConfig["GroupAdd"] = []string{gid}
+		}
+	}
+	if netName := strings.TrimSpace(d.opts.RunnerNetwork); netName != "" {
+		hostConfig["NetworkMode"] = netName
+	}
+
 	payload := map[string]any{
 		"Image":      image,
 		"Entrypoint": []string{"/bin/sh", "-c"},
 		"Cmd":        []string{defaultRunnerCmd},
-		"Env": []string{
-			"RUNNER_NAME=" + req.RunnerName,
-			"ENCODED_JIT_CONFIG=" + req.EncodedJITConfig,
-		},
+		"Env":        env,
 		"Labels": map[string]string{
 			"runway.managed":   "true",
 			"runway.runner_id": req.RunnerID.String(),
 			"runway.pool_slug": req.Pool.Slug,
 		},
-		"HostConfig": map[string]any{
-			"AutoRemove":  true,
-			"Init":        true,
-			"CapDrop":     []string{"ALL"},
-			"SecurityOpt": []string{"no-new-privileges:true"},
-			"PidsLimit":   pidsLimit,
-			"NanoCpus":    int64(vcpu) * 1_000_000_000,
-			"Memory":      memBytes,
-		},
+		"HostConfig": hostConfig,
 	}
 
 	body, err := json.Marshal(payload)

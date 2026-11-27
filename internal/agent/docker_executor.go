@@ -13,9 +13,9 @@ type DockerExecutor struct {
 	prov *orchestrator.DockerProvisioner
 }
 
-func NewDockerExecutor(dockerHost string) *DockerExecutor {
+func NewDockerExecutor(dockerHost string, opts orchestrator.DockerOptions) *DockerExecutor {
 	return &DockerExecutor{
-		prov: orchestrator.NewDockerProvisioner(dockerHost),
+		prov: orchestrator.NewDockerProvisionerWithOptions(dockerHost, opts),
 	}
 }
 

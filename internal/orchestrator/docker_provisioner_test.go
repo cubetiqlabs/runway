@@ -151,3 +151,94 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 		t.Fatalf("expected Init=true and PidsLimit=4096, got %+v", capturedCreate.HostConfig)
 	}
 }
+
+func TestDockerProvisionerDinDAndHostSocketModes(t *testing.T) {
+	var captured struct {
+		Env        []string `json:"Env"`
+		HostConfig struct {
+			NetworkMode string   `json:"NetworkMode"`
+			Binds       []string `json:"Binds"`
+			GroupAdd    []string `json:"GroupAdd"`
+		} `json:"HostConfig"`
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{"NCPU": 4, "MemTotal": int64(8) * 1024 * 1024 * 1024})
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"cid-1"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/cid-1/start":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	// 1. DinD sidecar mode
+	provDinD := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		RunnerDockerHost: "tcp://runner-dind:2375",
+		RunnerNetwork:    "runway-runner-net",
+	})
+	_, err := provDinD.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-dind-1",
+		EncodedJITConfig: "jit-1",
+		Pool:             domain.RunnerPool{Slug: "test", VCPU: 2, MemoryMB: 1024},
+	})
+	if err != nil {
+		t.Fatalf("DinD provision failed: %v", err)
+	}
+	if !containsString(captured.Env, "DOCKER_HOST=tcp://runner-dind:2375") {
+		t.Fatalf("expected DOCKER_HOST=tcp://runner-dind:2375 in Env, got %v", captured.Env)
+	}
+	if captured.HostConfig.NetworkMode != "runway-runner-net" || len(captured.HostConfig.Binds) != 0 {
+		t.Fatalf("unexpected DinD HostConfig: %+v", captured.HostConfig)
+	}
+
+	// 2. Host socket mount opt-in mode
+	captured = struct {
+		Env        []string `json:"Env"`
+		HostConfig struct {
+			NetworkMode string   `json:"NetworkMode"`
+			Binds       []string `json:"Binds"`
+			GroupAdd    []string `json:"GroupAdd"`
+		} `json:"HostConfig"`
+	}{}
+	provSock := NewDockerProvisionerWithOptions(ts.URL, DockerOptions{
+		MountDockerSocket: true,
+		RunnerDockerGID:   "999",
+	})
+	_, err = provSock.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-sock-1",
+		EncodedJITConfig: "jit-2",
+		Pool:             domain.RunnerPool{Slug: "test", VCPU: 2, MemoryMB: 1024},
+	})
+	if err != nil {
+		t.Fatalf("socket mount provision failed: %v", err)
+	}
+	if !containsString(captured.Env, "DOCKER_HOST=unix:///var/run/docker.sock") {
+		t.Fatalf("expected unix socket DOCKER_HOST in Env, got %v", captured.Env)
+	}
+	if len(captured.HostConfig.Binds) != 1 || captured.HostConfig.Binds[0] != "/var/run/docker.sock:/var/run/docker.sock" {
+		t.Fatalf("expected docker.sock bind, got %+v", captured.HostConfig.Binds)
+	}
+	if len(captured.HostConfig.GroupAdd) != 1 || captured.HostConfig.GroupAdd[0] != "999" {
+		t.Fatalf("expected GroupAdd [999], got %+v", captured.HostConfig.GroupAdd)
+	}
+}
+
+func containsString(items []string, want string) bool {
+	for _, s := range items {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

@@ -70,7 +70,12 @@ func NewOrchestrator(
 ) *Orchestrator {
 	provs := map[string]Provisioner{
 		"simulated": NewSimulatedProvisioner(),
-		"docker":    NewDockerProvisioner(cfg.DockerSocket),
+		"docker": NewDockerProvisionerWithOptions(cfg.DockerSocket, DockerOptions{
+			RunnerDockerHost:  cfg.RunnerDockerHost,
+			RunnerNetwork:     cfg.RunnerNetwork,
+			MountDockerSocket: cfg.RunnerMountDockerSocket,
+			RunnerDockerGID:   cfg.RunnerDockerGID,
+		}),
 	}
 	if agentRepo != nil {
 		provs["agent"] = NewAgentProvisioner(agentRepo, encKey)

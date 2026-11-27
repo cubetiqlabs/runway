@@ -1,10 +1,16 @@
-# Overlay for provisioning ephemeral Docker runner containers securely via Docker Socket Proxy:
+# Overlay for provisioning ephemeral Docker runner containers securely via Docker Socket Proxy,
+# with an isolated Docker-in-Docker (DinD) sidecar so CI workflow Docker steps work out of the box:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.docker.yml up -d --wait
-# Runs tecnativa/docker-socket-proxy so Runway stays non-root without host DOCKER_GID permission errors.
 
 networks:
   docker-proxy-net:
     driver: bridge
+  runner-dind-net:
+    name: ${RUNWAY_RUNNER_NETWORK:-runway-runner-net}
+    driver: bridge
+
+volumes:
+  dind-storage:
 
 services:
   docker-proxy:
@@ -47,14 +53,41 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  runner-dind:
+    image: ${RUNWAY_DIND_IMAGE:-docker:dind}
+    container_name: runway-runner-dind
+    restart: unless-stopped
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - dind-storage:/var/lib/docker
+    networks:
+      - runner-dind-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "docker -H tcp://127.0.0.1:2375 info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   runway:
     depends_on:
       postgres:
         condition: service_healthy
       docker-proxy:
         condition: service_started
+      runner-dind:
+        condition: service_healthy
     networks:
       - default
       - docker-proxy-net
     environment:
       RUNWAY_ORCHESTRATOR_DOCKER_SOCKET: ${DOCKER_PROXY_URL:-tcp://docker-proxy:2375}
+      RUNWAY_ORCHESTRATOR_RUNNER_DOCKER_HOST: ${RUNWAY_ORCHESTRATOR_RUNNER_DOCKER_HOST:-tcp://runner-dind:2375}
+      RUNWAY_ORCHESTRATOR_RUNNER_NETWORK: ${RUNWAY_RUNNER_NETWORK:-runway-runner-net}

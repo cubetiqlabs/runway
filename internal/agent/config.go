@@ -14,6 +14,10 @@ type Config struct {
 	Token             string
 	Runtime           string // auto | native | docker
 	DockerSocket      string
+	RunnerDockerHost  string
+	RunnerNetwork     string
+	MountDockerSocket bool
+	RunnerDockerGID   string
 	WorkDir           string
 	Concurrency       int
 	Labels            []string
@@ -58,6 +62,18 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_DOCKER_SOCKET")); v != "" {
 		c.DockerSocket = v
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_DOCKER_HOST")); v != "" {
+		c.RunnerDockerHost = v
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_NETWORK")); v != "" {
+		c.RunnerNetwork = v
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_MOUNT_DOCKER_SOCKET")); v != "" {
+		c.MountDockerSocket = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_RUNNER_DOCKER_GID")); v != "" {
+		c.RunnerDockerGID = v
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_WORK_DIR")); v != "" {
 		c.WorkDir = v
