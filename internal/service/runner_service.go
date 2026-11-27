@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/eventstore"
@@ -26,6 +27,7 @@ type RunnerService struct {
 	auditRepo  domain.AuditRepository
 	orch       *orchestrator.Orchestrator
 	eventStore eventstore.Store
+	cache      cache.Store
 
 	hookMu      sync.RWMutex
 	onSlotFreed func()
@@ -61,6 +63,25 @@ func (s *RunnerService) SetEventStore(es eventstore.Store) {
 	s.hookMu.Lock()
 	s.eventStore = es
 	s.hookMu.Unlock()
+}
+
+func (s *RunnerService) SetCache(c cache.Store) {
+	s.hookMu.Lock()
+	s.cache = c
+	s.hookMu.Unlock()
+}
+
+func (s *RunnerService) getCache() cache.Store {
+	s.hookMu.RLock()
+	c := s.cache
+	s.hookMu.RUnlock()
+	return c
+}
+
+func (s *RunnerService) invalidateKeys(ctx context.Context, keys ...string) {
+	if c := s.getCache(); c != nil {
+		_ = c.Delete(ctx, keys...)
+	}
 }
 
 func (s *RunnerService) SetSlotFreedHook(fn func()) {
@@ -159,6 +180,7 @@ func (s *RunnerService) SeedDefaultPools(ctx context.Context) error {
 			return err
 		}
 	}
+	s.invalidateKeys(ctx, "pools:enabled", "dashboard:overview")
 	return nil
 }
 
@@ -231,6 +253,7 @@ func (s *RunnerService) CreatePool(ctx context.Context, p *domain.RunnerPool, ac
 	if err := s.poolRepo.Create(ctx, p); err != nil {
 		return err
 	}
+	s.invalidateKeys(ctx, "pools:enabled", "dashboard:overview")
 	s.appendAudit(ctx, actor, "pool.created", "runner_pool", p.ID.String(), map[string]any{"name": p.Name, "slug": p.Slug}, ip)
 	return nil
 }
@@ -303,6 +326,7 @@ func (s *RunnerService) UpdatePool(ctx context.Context, p *domain.RunnerPool, ac
 		return err
 	}
 	*p = *existing
+	s.invalidateKeys(ctx, "pools:enabled", "dashboard:overview")
 	s.appendAudit(ctx, actor, "pool.updated", "runner_pool", p.ID.String(), map[string]any{"name": p.Name, "enabled": p.Enabled}, ip)
 	if existing.Enabled {
 		s.notifySlotFreed()
@@ -314,6 +338,7 @@ func (s *RunnerService) DeletePool(ctx context.Context, id uuid.UUID, actor *dom
 	if err := s.poolRepo.Delete(ctx, id); err != nil {
 		return err
 	}
+	s.invalidateKeys(ctx, "pools:enabled", "dashboard:overview")
 	s.appendAudit(ctx, actor, "pool.deleted", "runner_pool", id.String(), nil, ip)
 	return nil
 }
@@ -357,6 +382,7 @@ func (s *RunnerService) DrainRunner(ctx context.Context, id uuid.UUID, actor *do
 		if err := s.orch.TerminateRunner(ctx, rn); err != nil {
 			return nil, err
 		}
+		s.invalidateKeys(ctx, "dashboard:overview")
 		s.appendAudit(ctx, actor, "runner.drained", "runner", rn.ID.String(), map[string]any{"name": rn.Name, "immediate": true}, ip)
 		return s.runnerRepo.GetByID(ctx, id)
 	}
@@ -364,6 +390,7 @@ func (s *RunnerService) DrainRunner(ctx context.Context, id uuid.UUID, actor *do
 	if err := s.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerDraining, nil, "", nil); err != nil {
 		return nil, err
 	}
+	s.invalidateKeys(ctx, "dashboard:overview")
 	s.appendAudit(ctx, actor, "runner.drained", "runner", rn.ID.String(), map[string]any{"name": rn.Name, "immediate": false}, ip)
 	return s.runnerRepo.GetByID(ctx, id)
 }
@@ -447,6 +474,7 @@ func (s *RunnerService) TerminateRunner(ctx context.Context, id uuid.UUID, actor
 	if err := s.orch.TerminateRunner(ctx, rn); err != nil {
 		return err
 	}
+	s.invalidateKeys(ctx, "dashboard:overview")
 	s.appendAudit(ctx, actor, "runner.terminated", "runner", rn.ID.String(), map[string]any{"name": rn.Name}, ip)
 	s.notifySlotFreed()
 	return nil
@@ -478,6 +506,10 @@ func (s *RunnerService) SyncInstallations(ctx context.Context, actor *domain.Use
 		if err := s.instRepo.Upsert(ctx, inst); err != nil {
 			return 0, err
 		}
+	}
+	if c := s.getCache(); c != nil {
+		_ = c.DeletePrefix(ctx, "installation:")
+		_ = c.Delete(ctx, "dashboard:overview")
 	}
 	s.appendAudit(ctx, actor, "installation.synced", "installation", "all", map[string]any{"count": len(remote)}, ip)
 	return len(remote), nil

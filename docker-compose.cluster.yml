@@ -1,0 +1,12 @@
+# Multi-instance control-plane cluster overlay (requires Valkey enabled):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.cluster.yml up -d --wait
+
+services:
+  runway:
+    container_name: !reset null
+    ports: !reset []
+    deploy:
+      replicas: ${RUNWAY_REPLICAS:-3}
+      resources:
+        limits:
+          memory: 512M

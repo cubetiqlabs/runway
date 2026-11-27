@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/domain"
@@ -31,6 +34,9 @@ type WebhookService struct {
 	engine     *moderation.Engine
 	orch       *orchestrator.Orchestrator
 	dispatcher *JobDispatcher
+
+	cacheMu sync.RWMutex
+	cache   cache.Store
 }
 
 func NewWebhookService(
@@ -63,6 +69,19 @@ func NewWebhookService(
 	}
 }
 
+func (s *WebhookService) SetCache(c cache.Store) {
+	s.cacheMu.Lock()
+	s.cache = c
+	s.cacheMu.Unlock()
+}
+
+func (s *WebhookService) getCache() cache.Store {
+	s.cacheMu.RLock()
+	c := s.cache
+	s.cacheMu.RUnlock()
+	return c
+}
+
 type WebhookInput struct {
 	DeliveryID   string
 	EventName    string
@@ -74,6 +93,14 @@ func (s *WebhookService) HandleGitHubWebhook(ctx context.Context, in WebhookInpu
 	start := time.Now()
 	if strings.TrimSpace(in.DeliveryID) == "" || strings.TrimSpace(in.EventName) == "" {
 		return fmt.Errorf("%w: missing X-GitHub-Delivery or X-GitHub-Event header", domain.ErrValidation)
+	}
+
+	c := s.getCache()
+	dedupKey := "webhook:dedup:" + in.DeliveryID
+	if c != nil {
+		if firstSeen, nxErr := c.SetNX(ctx, dedupKey, []byte("1"), webhookDedupTTL); nxErr == nil && !firstSeen {
+			return nil
+		}
 	}
 
 	sigValid := true
@@ -111,6 +138,9 @@ func (s *WebhookService) HandleGitHubWebhook(ctx context.Context, in WebhookInpu
 
 	inserted, err := s.auditRepo.InsertDeliveryIfAbsent(ctx, delivery)
 	if err != nil {
+		if c != nil {
+			_ = c.Delete(ctx, dedupKey)
+		}
 		return err
 	}
 	if !inserted {
@@ -154,6 +184,7 @@ func (s *WebhookService) handleInstallationEvent(ctx context.Context, raw []byte
 	}
 	if ev.Action == "deleted" {
 		err := s.instRepo.DeleteByID(ctx, ev.Installation.ID)
+		invalidateCacheKeys(ctx, s.getCache(), "installation:"+strconv.FormatInt(ev.Installation.ID, 10), cacheKeyOverview)
 		if err == domain.ErrNotFound {
 			return nil
 		}
@@ -169,7 +200,11 @@ func (s *WebhookService) handleInstallationEvent(ctx context.Context, raw []byte
 		Permissions:           ev.Installation.Permissions,
 		SuspendedAt:           ev.Installation.SuspendedAt,
 	}
-	return s.instRepo.Upsert(ctx, inst)
+	if err := s.instRepo.Upsert(ctx, inst); err != nil {
+		return err
+	}
+	invalidateCacheKeys(ctx, s.getCache(), "installation:"+strconv.FormatInt(ev.Installation.ID, 10), cacheKeyOverview)
+	return nil
 }
 
 func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte) (string, string, error) {
@@ -194,6 +229,7 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 				_ = s.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerBusy, ev.WorkflowJob.RunnerID, "", &ev.WorkflowJob.ID)
 			}
 		}
+		invalidateCacheKeys(ctx, s.getCache(), cacheKeyOverview)
 		return "processed", "", nil
 	case "completed":
 		now := time.Now().UTC()
@@ -225,6 +261,7 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 		if s.dispatcher != nil {
 			s.dispatcher.Trigger()
 		}
+		invalidateCacheKeys(ctx, s.getCache(), cacheKeyOverview)
 		return "processed", "", nil
 	default:
 		return "ignored", fmt.Sprintf("ignored workflow_job action %q", ev.Action), nil
@@ -232,11 +269,15 @@ func (s *WebhookService) handleWorkflowJobEvent(ctx context.Context, raw []byte)
 }
 
 func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJobEvent) (string, string, error) {
+	c := s.getCache()
 	var instID *int64
 	if ev.Installation.ID > 0 {
 		id := ev.Installation.ID
 		instID = &id
-		if _, err := s.instRepo.GetByID(ctx, id); err == domain.ErrNotFound {
+		instKey := "installation:" + strconv.FormatInt(id, 10)
+		if _, err := cache.GetOrLoad(ctx, c, instKey, installationCacheTTL, func(loadCtx context.Context) (*domain.Installation, error) {
+			return s.instRepo.GetByID(loadCtx, id)
+		}); err == domain.ErrNotFound {
 			login := ev.Repository.Owner.Login
 			if login == "" {
 				login = "unknown"
@@ -253,10 +294,11 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 				TargetType:            ownerType,
 				RepositoriesSelection: "selected",
 			})
+			invalidateCacheKeys(ctx, c, instKey)
 		}
 	}
 
-	pools, err := s.poolRepo.ListEnabled(ctx)
+	pools, err := cachedEnabledPools(ctx, c, s.poolRepo)
 	if err != nil {
 		return "failed", "", err
 	}
@@ -276,7 +318,7 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 		}
 	}
 
-	policies, err := s.policyRepo.ListEnabledOrdered(ctx)
+	policies, err := cachedEnabledPolicies(ctx, c, s.policyRepo)
 	if err != nil {
 		return "failed", "", err
 	}
@@ -333,6 +375,7 @@ func (s *WebhookService) onJobQueued(ctx context.Context, ev *github.WorkflowJob
 	if err := s.jobRepo.UpsertFromWebhook(ctx, job); err != nil {
 		return "failed", "", err
 	}
+	invalidateCacheKeys(ctx, c, cacheKeyOverview)
 
 	meta, _ := json.Marshal(map[string]any{
 		"repo":     job.RepoFullName,

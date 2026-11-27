@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/domain"
@@ -20,10 +22,36 @@ type AuthService struct {
 	log       *zap.Logger
 	authRepo  domain.AuthRepository
 	auditRepo domain.AuditRepository
+
+	cacheMu sync.RWMutex
+	cache   cache.Store
 }
 
 func NewAuthService(cfg *config.Config, log *zap.Logger, authRepo domain.AuthRepository, auditRepo domain.AuditRepository) *AuthService {
 	return &AuthService{cfg: cfg, log: log, authRepo: authRepo, auditRepo: auditRepo}
+}
+
+func (s *AuthService) SetCache(c cache.Store) {
+	s.cacheMu.Lock()
+	s.cache = c
+	s.cacheMu.Unlock()
+}
+
+func (s *AuthService) getCache() cache.Store {
+	s.cacheMu.RLock()
+	c := s.cache
+	s.cacheMu.RUnlock()
+	return c
+}
+
+type cachedSessionEntry struct {
+	Session domain.Session `json:"session"`
+	User    domain.User    `json:"user"`
+}
+
+type cachedAPITokenEntry struct {
+	Token domain.APIToken `json:"token"`
+	User  domain.User     `json:"user"`
 }
 
 // BootstrapAdmin seeds the initial admin account when the users table is empty.
@@ -151,18 +179,101 @@ func (s *AuthService) AuthenticateSession(ctx context.Context, rawToken string) 
 	if strings.TrimSpace(rawToken) == "" {
 		return nil, nil, domain.ErrUnauthorized
 	}
-	return s.authRepo.GetSessionByTokenHash(ctx, crypto.HashTokenSHA256(rawToken))
+	hash := crypto.HashTokenSHA256(rawToken)
+	cacheKey := "auth:session:" + hash
+	c := s.getCache()
+	if c != nil {
+		if entry, ok, err := cache.GetJSON[cachedSessionEntry](ctx, c, cacheKey); err == nil && ok {
+			if entry.Session.ExpiresAt.After(time.Now().UTC()) && entry.User.IsActive {
+				sess := entry.Session
+				user := entry.User
+				return &sess, &user, nil
+			}
+			_ = c.Delete(ctx, cacheKey)
+		}
+	}
+
+	sess, user, err := s.authRepo.GetSessionByTokenHash(ctx, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c != nil && sess != nil && user != nil && user.IsActive {
+		remaining := time.Until(sess.ExpiresAt)
+		if remaining > 0 {
+			ttl := 2 * time.Minute
+			if remaining < ttl {
+				ttl = remaining
+			}
+			uCopy := *user
+			uCopy.PasswordHash = ""
+			sCopy := *sess
+			sCopy.TokenHash = ""
+			_ = cache.SetJSON(ctx, c, cacheKey, cachedSessionEntry{Session: sCopy, User: uCopy}, ttl)
+		}
+	}
+	return sess, user, nil
 }
 
 func (s *AuthService) AuthenticateBearerToken(ctx context.Context, rawToken string) (*domain.APIToken, *domain.User, error) {
 	if strings.TrimSpace(rawToken) == "" {
 		return nil, nil, domain.ErrUnauthorized
 	}
-	tok, user, err := s.authRepo.GetAPITokenByHash(ctx, crypto.HashTokenSHA256(rawToken))
-	if err != nil {
-		return nil, nil, domain.ErrUnauthorized
+	hash := crypto.HashTokenSHA256(rawToken)
+	cacheKey := "auth:token:" + hash
+	c := s.getCache()
+
+	var tok *domain.APIToken
+	var user *domain.User
+	if c != nil {
+		if entry, ok, err := cache.GetJSON[cachedAPITokenEntry](ctx, c, cacheKey); err == nil && ok {
+			validExpiry := entry.Token.ExpiresAt == nil || entry.Token.ExpiresAt.After(time.Now().UTC())
+			if validExpiry && entry.User.IsActive {
+				tCopy := entry.Token
+				uCopy := entry.User
+				tok = &tCopy
+				user = &uCopy
+			} else {
+				_ = c.Delete(ctx, cacheKey)
+			}
+		}
 	}
-	_ = s.authRepo.TouchAPIToken(ctx, tok.ID)
+
+	if tok == nil || user == nil {
+		var err error
+		tok, user, err = s.authRepo.GetAPITokenByHash(ctx, hash)
+		if err != nil {
+			return nil, nil, domain.ErrUnauthorized
+		}
+		if c != nil && tok != nil && user != nil && user.IsActive {
+			ttl := 60 * time.Second
+			if tok.ExpiresAt != nil {
+				rem := time.Until(*tok.ExpiresAt)
+				if rem <= 0 {
+					return nil, nil, domain.ErrUnauthorized
+				}
+				if rem < ttl {
+					ttl = rem
+				}
+			}
+			tCopy := *tok
+			tCopy.TokenHash = ""
+			uCopy := *user
+			uCopy.PasswordHash = ""
+			_ = cache.SetJSON(ctx, c, cacheKey, cachedAPITokenEntry{Token: tCopy, User: uCopy}, ttl)
+			_ = c.Set(ctx, "auth:token_id:"+tok.ID.String(), []byte(hash), ttl+5*time.Second)
+		}
+	}
+
+	// Throttle TouchAPIToken writes under concurrent/clustered traffic.
+	shouldTouch := true
+	if c != nil {
+		if ok, err := c.SetNX(ctx, "auth:token_touch:"+tok.ID.String(), []byte("1"), time.Minute); err == nil {
+			shouldTouch = ok
+		}
+	}
+	if shouldTouch {
+		_ = s.authRepo.TouchAPIToken(ctx, tok.ID)
+	}
 	return tok, user, nil
 }
 
@@ -170,7 +281,14 @@ func (s *AuthService) Logout(ctx context.Context, rawToken string) error {
 	if strings.TrimSpace(rawToken) == "" {
 		return nil
 	}
-	return s.authRepo.DeleteSessionByTokenHash(ctx, crypto.HashTokenSHA256(rawToken))
+	hash := crypto.HashTokenSHA256(rawToken)
+	if err := s.authRepo.DeleteSessionByTokenHash(ctx, hash); err != nil {
+		return err
+	}
+	if c := s.getCache(); c != nil {
+		_ = c.Delete(ctx, "auth:session:"+hash)
+	}
+	return nil
 }
 
 func (s *AuthService) CreateAPIToken(ctx context.Context, user *domain.User, name string, scopes []string, ttlDays int) (string, *domain.APIToken, error) {
@@ -210,7 +328,18 @@ func (s *AuthService) ListAPITokens(ctx context.Context, userID uuid.UUID) ([]do
 }
 
 func (s *AuthService) DeleteAPIToken(ctx context.Context, id, userID uuid.UUID) error {
-	return s.authRepo.DeleteAPIToken(ctx, id, userID)
+	if err := s.authRepo.DeleteAPIToken(ctx, id, userID); err != nil {
+		return err
+	}
+	if c := s.getCache(); c != nil {
+		idKey := "auth:token_id:" + id.String()
+		if rawHash, ok, err := c.Get(ctx, idKey); err == nil && ok && len(rawHash) > 0 {
+			_ = c.Delete(ctx, "auth:token:"+string(rawHash), idKey, "auth:token_touch:"+id.String())
+		} else {
+			_ = c.Delete(ctx, idKey, "auth:token_touch:"+id.String())
+		}
+	}
+	return nil
 }
 
 func truncate(s string, maxLen int) string {

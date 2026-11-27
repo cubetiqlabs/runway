@@ -201,6 +201,26 @@ export interface EventIngestionStats {
   buffer_capacity: number
 }
 
+export interface CacheStats {
+  driver: string
+  cluster_enabled: boolean
+  hits: number
+  misses: number
+  sets: number
+  deletes: number
+  errors: number
+  hit_rate: number
+}
+
+export interface ClusterNode {
+  instance_id: string
+  hostname: string
+  version: string
+  address: string
+  started_at: string
+  last_seen_at: string
+}
+
 export interface GitHubAppSettingsStatus {
   app_id: number
   app_slug: string
@@ -215,6 +235,13 @@ export interface GitHubAppSettingsStatus {
   eventstore_healthy: boolean
   eventstore_error?: string
   eventstore_stats?: EventIngestionStats
+  cache_driver: string
+  cache_healthy: boolean
+  cache_error?: string
+  cache_cluster_enabled: boolean
+  cache_stats?: CacheStats
+  instance_id: string
+  cluster_nodes?: ClusterNode[]
 }
 
 export interface PageResponse<T> {

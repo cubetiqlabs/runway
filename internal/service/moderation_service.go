@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/github"
 	"github.com/cubetiqlabs/runway/internal/moderation"
@@ -24,6 +26,9 @@ type ModerationService struct {
 	engine     *moderation.Engine
 	orch       *orchestrator.Orchestrator
 	dispatcher *JobDispatcher
+
+	cacheMu sync.RWMutex
+	cache   cache.Store
 }
 
 func NewModerationService(
@@ -50,6 +55,19 @@ func NewModerationService(
 	}
 }
 
+func (s *ModerationService) SetCache(c cache.Store) {
+	s.cacheMu.Lock()
+	s.cache = c
+	s.cacheMu.Unlock()
+}
+
+func (s *ModerationService) getCache() cache.Store {
+	s.cacheMu.RLock()
+	c := s.cache
+	s.cacheMu.RUnlock()
+	return c
+}
+
 // SeedDefaultPolicies inserts a starter fork-PR protection policy if no policies exist.
 func (s *ModerationService) SeedDefaultPolicies(ctx context.Context) error {
 	count, err := s.policyRepo.Count(ctx)
@@ -68,7 +86,11 @@ func (s *ModerationService) SeedDefaultPolicies(ctx context.Context) error {
 		ActorPatterns:  []string{"*"},
 		BlockForkPRs:   true,
 	}
-	return s.policyRepo.Create(ctx, starter)
+	if err := s.policyRepo.Create(ctx, starter); err != nil {
+		return err
+	}
+	invalidateCacheKeys(ctx, s.getCache(), cacheKeyEnabledPolicy)
+	return nil
 }
 
 func (s *ModerationService) ListPolicies(ctx context.Context, filter domain.PolicyFilter) ([]domain.ModerationPolicy, int, error) {
@@ -87,6 +109,7 @@ func (s *ModerationService) CreatePolicy(ctx context.Context, p *domain.Moderati
 	if err := s.policyRepo.Create(ctx, p); err != nil {
 		return err
 	}
+	invalidateCacheKeys(ctx, s.getCache(), cacheKeyEnabledPolicy)
 	s.appendAudit(ctx, actor, "policy.created", "moderation_policy", p.ID.String(), map[string]any{"name": p.Name, "action": p.Action}, ip)
 	return nil
 }
@@ -123,6 +146,7 @@ func (s *ModerationService) UpdatePolicy(ctx context.Context, p *domain.Moderati
 		return err
 	}
 	*p = *existing
+	invalidateCacheKeys(ctx, s.getCache(), cacheKeyEnabledPolicy)
 	s.appendAudit(ctx, actor, "policy.updated", "moderation_policy", p.ID.String(), map[string]any{"name": p.Name, "enabled": p.Enabled}, ip)
 	return nil
 }
@@ -131,12 +155,14 @@ func (s *ModerationService) DeletePolicy(ctx context.Context, id uuid.UUID, acto
 	if err := s.policyRepo.Delete(ctx, id); err != nil {
 		return err
 	}
+	invalidateCacheKeys(ctx, s.getCache(), cacheKeyEnabledPolicy)
 	s.appendAudit(ctx, actor, "policy.deleted", "moderation_policy", id.String(), nil, ip)
 	return nil
 }
 
 func (s *ModerationService) Simulate(ctx context.Context, jobCtx moderation.JobContext) (*moderation.Decision, *domain.RunnerPool, error) {
-	policies, err := s.policyRepo.ListEnabledOrdered(ctx)
+	c := s.getCache()
+	policies, err := cachedEnabledPolicies(ctx, c, s.policyRepo)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -147,7 +173,7 @@ func (s *ModerationService) Simulate(ctx context.Context, jobCtx moderation.JobC
 	}
 	dec := s.engine.Evaluate(policies, jobCtx)
 
-	pools, err := s.poolRepo.ListEnabled(ctx)
+	pools, err := cachedEnabledPools(ctx, c, s.poolRepo)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -176,7 +202,7 @@ func (s *ModerationService) ApproveJob(ctx context.Context, jobID uuid.UUID, rea
 		matchedPool, _ = s.poolRepo.GetByID(ctx, *job.MatchedPoolID)
 	}
 	if matchedPool == nil {
-		pools, err := s.poolRepo.ListEnabled(ctx)
+		pools, err := cachedEnabledPools(ctx, s.getCache(), s.poolRepo)
 		if err != nil {
 			return nil, err
 		}
@@ -206,6 +232,7 @@ func (s *ModerationService) ApproveJob(ctx context.Context, jobID uuid.UUID, rea
 		}
 	}
 
+	invalidateCacheKeys(ctx, s.getCache(), cacheKeyOverview)
 	s.appendAudit(ctx, actor, "job.approved", "workflow_job", job.ID.String(), map[string]any{"reason": reason, "repo": job.RepoFullName}, ip)
 	return s.jobRepo.GetByID(ctx, job.ID)
 }
@@ -224,6 +251,7 @@ func (s *ModerationService) RejectJob(ctx context.Context, jobID uuid.UUID, reas
 	if err := s.jobRepo.UpdateModerationAndRunner(ctx, job.ID, domain.JobRejected, "rejected", reason, &actor.ID, nil, nil); err != nil {
 		return nil, err
 	}
+	invalidateCacheKeys(ctx, s.getCache(), cacheKeyOverview)
 	s.appendAudit(ctx, actor, "job.rejected", "workflow_job", job.ID.String(), map[string]any{"reason": reason, "repo": job.RepoFullName}, ip)
 	return s.jobRepo.GetByID(ctx, job.ID)
 }

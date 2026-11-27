@@ -11,9 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/database"
+	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/eventstore"
 	"github.com/cubetiqlabs/runway/internal/github"
 	apphttp "github.com/cubetiqlabs/runway/internal/http"
@@ -82,6 +84,19 @@ func main() {
 		}
 	}()
 
+	cacheStore, err := cache.New(ctx, cfg.Cache, log)
+	if err != nil {
+		log.Fatal("failed to initialize cache store", zap.Error(err))
+	}
+	defer func() {
+		unregCtx, unregCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = cacheStore.UnregisterNode(unregCtx, cacheStore.InstanceID())
+		unregCancel()
+		if closeErr := cacheStore.Close(); closeErr != nil {
+			log.Warn("cache store shutdown error", zap.Error(closeErr))
+		}
+	}()
+
 	ghAuth, err := github.NewAppAuth(cfg.GitHub.AppID, cfg.GitHub.PrivateKeyPEM, cfg.GitHub.PrivateKeyPath, cfg.GitHub.APIBaseURL, nil)
 	if err != nil {
 		log.Fatal("failed to initialize GitHub App auth", zap.Error(err))
@@ -105,6 +120,7 @@ func main() {
 	engine := moderation.NewEngine(cfg.Moderation.DefaultAction)
 	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, runnerRepo, jobRepo, auditRepo, agentRepo, encKey)
 	orch.SetEventStore(evStore)
+	orch.SetCache(cacheStore)
 	orch.Start(ctx)
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
@@ -117,39 +133,73 @@ func main() {
 	pingCancel()
 
 	authSvc := service.NewAuthService(cfg, log, authRepo, auditRepo)
-	if err := authSvc.BootstrapAdmin(ctx); err != nil {
-		log.Fatal("failed to bootstrap initial admin account", zap.Error(err))
-	}
+	authSvc.SetCache(cacheStore)
 
 	runnerSvc := service.NewRunnerService(cfg, ghClient, instRepo, poolRepo, runnerRepo, auditRepo, orch)
 	runnerSvc.SetJobRepo(jobRepo)
 	runnerSvc.SetEventStore(evStore)
-	if err := runnerSvc.SeedDefaultPools(ctx); err != nil {
-		log.Fatal("failed to seed default runner pools", zap.Error(err))
-	}
+	runnerSvc.SetCache(cacheStore)
 
 	dispatcher := service.NewJobDispatcher(cfg, log, ghClient, instRepo, poolRepo, jobRepo, runnerRepo, agentRepo, auditRepo, orch)
+	dispatcher.SetCache(cacheStore)
 	agentSvc := service.NewAgentService(log, agentRepo, runnerRepo, jobRepo, auditRepo, poolRepo, encKey)
 	agentSvc.SetEventStore(evStore)
+	agentSvc.SetCache(cacheStore)
 	orch.SetSlotFreedHook(dispatcher.Trigger)
 	orch.SetRunnerCleanupHook(dispatcher.CleanupGitHubRunner)
 	runnerSvc.SetSlotFreedHook(dispatcher.Trigger)
 	agentSvc.SetSlotFreedHook(dispatcher.Trigger)
 
 	modSvc := service.NewModerationService(ghClient, policyRepo, jobRepo, poolRepo, runnerRepo, auditRepo, engine, orch, dispatcher)
+	modSvc.SetCache(cacheStore)
+
+	bootstrapLock, acquired, lockErr := cache.AcquireLockWithWait(ctx, cacheStore, "bootstrap", 30*time.Second, 15*time.Second)
+	if lockErr != nil {
+		log.Warn("failed to acquire startup bootstrap lock; continuing safely", zap.Error(lockErr))
+	}
+	if err := authSvc.BootstrapAdmin(ctx); err != nil {
+		if acquired {
+			_ = bootstrapLock.Release(ctx)
+		}
+		log.Fatal("failed to bootstrap initial admin account", zap.Error(err))
+	}
+	if err := runnerSvc.SeedDefaultPools(ctx); err != nil {
+		if acquired {
+			_ = bootstrapLock.Release(ctx)
+		}
+		log.Fatal("failed to seed default runner pools", zap.Error(err))
+	}
 	if err := modSvc.SeedDefaultPolicies(ctx); err != nil {
+		if acquired {
+			_ = bootstrapLock.Release(ctx)
+		}
 		log.Fatal("failed to seed default moderation policies", zap.Error(err))
+	}
+	if acquired && bootstrapLock != nil {
+		_ = bootstrapLock.Release(ctx)
 	}
 
 	webhookSvc := service.NewWebhookService(cfg, log, ghClient, instRepo, poolRepo, policyRepo, jobRepo, runnerRepo, auditRepo, engine, orch, dispatcher)
+	webhookSvc.SetCache(cacheStore)
 	dashboardSvc := service.NewDashboardService(cfg, ghClient, auditRepo, orch)
 	dashboardSvc.SetEventStore(evStore)
+	dashboardSvc.SetCache(cacheStore)
 	dispatcher.Start(ctx)
+	startClusterHeartbeat(ctx, cacheStore, cfg.Address(), version, log)
 
 	app, err := apphttp.NewServer(apphttp.ServerDeps{
-		Config:        cfg,
-		Log:           log,
-		ReadyCheck:    func(c context.Context) error { return database.Ping(c, db) },
+		Config: cfg,
+		Log:    log,
+		ReadyCheck: func(c context.Context) error {
+			if err := database.Ping(c, db); err != nil {
+				return err
+			}
+			if cfg.Cache.Driver == "valkey" || cfg.Cache.Driver == "redis" {
+				return cacheStore.Ping(c)
+			}
+			return nil
+		},
+		CacheStore:    cacheStore,
 		AuthSvc:       authSvc,
 		WebhookSvc:    webhookSvc,
 		RunnerSvc:     runnerSvc,
@@ -167,6 +217,9 @@ func main() {
 			zap.String("address", cfg.Address()),
 			zap.String("environment", cfg.App.Environment),
 			zap.String("provider", cfg.Orchestrator.Provider),
+			zap.String("cache_driver", cacheStore.Driver()),
+			zap.Bool("cluster_enabled", cacheStore.ClusterEnabled()),
+			zap.String("instance_id", cacheStore.InstanceID()),
 			zap.String("docker_socket", cfg.Orchestrator.DockerSocket),
 			zap.String("runner_docker_host", cfg.Orchestrator.RunnerDockerHost),
 			zap.String("runner_network", cfg.Orchestrator.RunnerNetwork),
@@ -191,6 +244,45 @@ func main() {
 	dispatcher.Wait()
 	orch.Wait()
 	log.Info("Runway server stopped cleanly")
+}
+
+func startClusterHeartbeat(ctx context.Context, store cache.Store, address, version string, log *zap.Logger) {
+	if store == nil {
+		return
+	}
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "runway"
+	}
+	startedAt := time.Now().UTC()
+	register := func() {
+		regCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		err := store.RegisterNode(regCtx, domain.ClusterNode{
+			InstanceID: store.InstanceID(),
+			Hostname:   hostname,
+			Version:    version,
+			Address:    address,
+			StartedAt:  startedAt,
+			LastSeenAt: time.Now().UTC(),
+		}, 30*time.Second)
+		if err != nil && ctx.Err() == nil {
+			log.Debug("cluster node heartbeat failed", zap.Error(err))
+		}
+	}
+	register()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				register()
+			}
+		}
+	}()
 }
 
 func runHealthcheck() int {

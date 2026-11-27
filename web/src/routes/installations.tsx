@@ -324,53 +324,104 @@ function InstallationsPage() {
               <code className="font-mono">installation</code>)
             </CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 text-xs">
-            <div>
-              <span className="text-muted-foreground block">App ID</span>
-              <span className="font-mono font-medium">{settings.app_id || "Not configured"}</span>
-            </div>
-            <div>
-              <span className="text-muted-foreground block">Webhook HMAC Secret</span>
-              <Badge variant={settings.webhook_secret_set ? "secondary" : "destructive"}>
-                {settings.webhook_secret_set ? "Configured" : "Unset"}
-              </Badge>
-            </div>
-            <div>
-              <span className="text-muted-foreground block">Private Key (RS256)</span>
-              <Badge variant={settings.private_key_configured ? "secondary" : "destructive"}>
-                {settings.private_key_configured ? "Loaded" : "Demo / Unset"}
-              </Badge>
-            </div>
-            <div>
-              <span className="text-muted-foreground block">Orchestrator</span>
-              <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
-                <span className="font-medium capitalize">
-                  {settings.orchestrator_provider} · {settings.moderation_default_action}
-                </span>
-                <Badge variant={settings.orchestrator_healthy ? "secondary" : "destructive"}>
-                  {settings.orchestrator_healthy ? "Connected" : "Unavailable"}
+          <CardContent className="space-y-3 text-xs">
+            <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-6">
+              <div>
+                <span className="text-muted-foreground block">App ID</span>
+                <span className="font-mono font-medium">{settings.app_id || "Not configured"}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground block">Webhook HMAC Secret</span>
+                <Badge variant={settings.webhook_secret_set ? "secondary" : "destructive"}>
+                  {settings.webhook_secret_set ? "Configured" : "Unset"}
                 </Badge>
               </div>
-              {!settings.orchestrator_healthy && settings.orchestrator_error && (
-                <span className="mt-1 block text-[11px] text-destructive break-all">
-                  {settings.orchestrator_error}
-                </span>
-              )}
-            </div>
-            <div>
-              <span className="text-muted-foreground block">EventStore</span>
-              <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
-                <span className="font-medium capitalize">{settings.eventstore_driver || "postgres"}</span>
-                <Badge variant={settings.eventstore_healthy ? "secondary" : "destructive"}>
-                  {settings.eventstore_healthy ? "Ready" : "Error"}
+              <div>
+                <span className="text-muted-foreground block">Private Key (RS256)</span>
+                <Badge variant={settings.private_key_configured ? "secondary" : "destructive"}>
+                  {settings.private_key_configured ? "Loaded" : "Demo / Unset"}
                 </Badge>
               </div>
-              {settings.eventstore_stats && (
-                <span className="mt-1 block text-[11px] text-muted-foreground">
-                  {settings.eventstore_stats.flushed} flushed · queue {settings.eventstore_stats.queue_depth}
-                </span>
-              )}
+              <div>
+                <span className="text-muted-foreground block">Orchestrator</span>
+                <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                  <span className="font-medium capitalize">
+                    {settings.orchestrator_provider} · {settings.moderation_default_action}
+                  </span>
+                  <Badge variant={settings.orchestrator_healthy ? "secondary" : "destructive"}>
+                    {settings.orchestrator_healthy ? "Connected" : "Unavailable"}
+                  </Badge>
+                </div>
+                {!settings.orchestrator_healthy && settings.orchestrator_error && (
+                  <span className="mt-1 block text-[11px] text-destructive break-all">
+                    {settings.orchestrator_error}
+                  </span>
+                )}
+              </div>
+              <div>
+                <span className="text-muted-foreground block">EventStore</span>
+                <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                  <span className="font-medium capitalize">{settings.eventstore_driver || "postgres"}</span>
+                  <Badge variant={settings.eventstore_healthy ? "secondary" : "destructive"}>
+                    {settings.eventstore_healthy ? "Ready" : "Error"}
+                  </Badge>
+                </div>
+                {settings.eventstore_stats && (
+                  <span className="mt-1 block text-[11px] text-muted-foreground">
+                    {settings.eventstore_stats.flushed} flushed · queue {settings.eventstore_stats.queue_depth}
+                  </span>
+                )}
+              </div>
+              <div>
+                <span className="text-muted-foreground block">Cache &amp; Cluster</span>
+                <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                  <span className="font-medium capitalize">{settings.cache_driver || "memory"}</span>
+                  <Badge variant={settings.cache_healthy ? "secondary" : "destructive"}>
+                    {settings.cache_healthy
+                      ? settings.cache_cluster_enabled
+                        ? "Clustered"
+                        : "Local"
+                      : "Error"}
+                  </Badge>
+                </div>
+                {settings.cache_stats && (
+                  <span className="mt-1 block text-[11px] text-muted-foreground">
+                    {settings.cache_stats.hit_rate.toFixed(1)}% hit · {settings.cache_stats.hits} hits /{" "}
+                    {settings.cache_stats.misses} misses
+                  </span>
+                )}
+                {!settings.cache_healthy && settings.cache_error && (
+                  <span className="mt-1 block text-[11px] text-destructive break-all">
+                    {settings.cache_error}
+                  </span>
+                )}
+              </div>
             </div>
+
+            {settings.cluster_nodes && settings.cluster_nodes.length > 0 && (
+              <div className="border-t pt-2.5">
+                <span className="text-muted-foreground block mb-1.5">
+                  Control-Plane Cluster Nodes ({settings.cluster_nodes.length})
+                </span>
+                <div className="flex flex-wrap gap-2">
+                  {settings.cluster_nodes.map((node) => {
+                    const isSelf = node.instance_id === settings.instance_id
+                    return (
+                      <div
+                        key={node.instance_id}
+                        className="inline-flex items-center gap-1.5 rounded-none border px-2 py-1 text-[11px]"
+                      >
+                        <span className="font-mono font-medium">{node.instance_id}</span>
+                        <span className="text-muted-foreground">
+                          ({node.hostname} · {node.version})
+                        </span>
+                        {isSelf && <Badge variant="secondary">current</Badge>}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}

@@ -15,6 +15,7 @@ type Config struct {
 	App          AppConfig          `mapstructure:"app"`
 	Server       ServerConfig       `mapstructure:"server"`
 	Database     DatabaseConfig     `mapstructure:"database"`
+	Cache        CacheConfig        `mapstructure:"cache"`
 	EventStore   EventStoreConfig   `mapstructure:"eventstore"`
 	GitHub       GitHubConfig       `mapstructure:"github"`
 	Security     SecurityConfig     `mapstructure:"security"`
@@ -22,6 +23,23 @@ type Config struct {
 	Moderation   ModerationConfig   `mapstructure:"moderation"`
 	Orchestrator OrchestratorConfig `mapstructure:"orchestrator"`
 	Logging      LoggingConfig      `mapstructure:"logging"`
+}
+
+type CacheConfig struct {
+	Driver       string        `mapstructure:"driver"` // valkey | redis | memory | disabled
+	URL          string        `mapstructure:"url"`
+	Addrs        []string      `mapstructure:"addrs"`
+	Password     string        `mapstructure:"password"`
+	DB           int           `mapstructure:"db"`
+	KeyPrefix    string        `mapstructure:"key_prefix"`
+	DefaultTTL   time.Duration `mapstructure:"default_ttl"`
+	PoolSize     int           `mapstructure:"pool_size"`
+	MinIdleConns int           `mapstructure:"min_idle_conns"`
+	DialTimeout  time.Duration `mapstructure:"dial_timeout"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+	TLSEnabled   bool          `mapstructure:"tls_enabled"`
+	InstanceID   string        `mapstructure:"instance_id"`
 }
 
 type EventStoreConfig struct {
@@ -177,6 +195,21 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.max_conn_lifetime", "30m")
 	v.SetDefault("database.max_conn_idle_time", "5m")
 
+	v.SetDefault("cache.driver", "memory")
+	v.SetDefault("cache.url", "")
+	v.SetDefault("cache.addrs", []string{})
+	v.SetDefault("cache.password", "")
+	v.SetDefault("cache.db", 0)
+	v.SetDefault("cache.key_prefix", "runway:")
+	v.SetDefault("cache.default_ttl", "30s")
+	v.SetDefault("cache.pool_size", 32)
+	v.SetDefault("cache.min_idle_conns", 4)
+	v.SetDefault("cache.dial_timeout", "5s")
+	v.SetDefault("cache.read_timeout", "3s")
+	v.SetDefault("cache.write_timeout", "3s")
+	v.SetDefault("cache.tls_enabled", false)
+	v.SetDefault("cache.instance_id", "")
+
 	v.SetDefault("eventstore.driver", "postgres")
 	v.SetDefault("eventstore.postgres_url", "")
 	v.SetDefault("eventstore.clickhouse_url", "")
@@ -236,6 +269,10 @@ func bindEnvKeys(v *viper.Viper) {
 		"server.allowed_origins", "server.trusted_proxies",
 		"database.url", "database.max_conns", "database.min_conns",
 		"database.max_conn_lifetime", "database.max_conn_idle_time",
+		"cache.driver", "cache.url", "cache.addrs", "cache.password", "cache.db",
+		"cache.key_prefix", "cache.default_ttl", "cache.pool_size", "cache.min_idle_conns",
+		"cache.dial_timeout", "cache.read_timeout", "cache.write_timeout",
+		"cache.tls_enabled", "cache.instance_id",
 		"eventstore.driver", "eventstore.postgres_url", "eventstore.clickhouse_url",
 		"eventstore.clickhouse_database", "eventstore.clickhouse_username", "eventstore.clickhouse_password",
 		"eventstore.batch_size", "eventstore.flush_interval", "eventstore.buffer_size", "eventstore.retention_days",
@@ -348,6 +385,55 @@ func (c *Config) validateAndNormalize() error {
 	}
 	if c.EventStore.RetentionDays < 1 {
 		c.EventStore.RetentionDays = 90
+	}
+
+	if len(c.Cache.Addrs) > 0 {
+		normalizedAddrs := make([]string, 0, len(c.Cache.Addrs))
+		for _, item := range c.Cache.Addrs {
+			for _, part := range strings.Split(item, ",") {
+				if s := strings.TrimSpace(part); s != "" {
+					normalizedAddrs = append(normalizedAddrs, s)
+				}
+			}
+		}
+		c.Cache.Addrs = normalizedAddrs
+	}
+	c.Cache.Driver = strings.ToLower(strings.TrimSpace(c.Cache.Driver))
+	if c.Cache.Driver == "" {
+		if strings.TrimSpace(c.Cache.URL) != "" || len(c.Cache.Addrs) > 0 {
+			c.Cache.Driver = "valkey"
+		} else {
+			c.Cache.Driver = "memory"
+		}
+	}
+	switch c.Cache.Driver {
+	case "valkey", "redis", "memory", "disabled":
+	default:
+		return fmt.Errorf("invalid cache.driver %q: must be 'valkey', 'redis', 'memory', or 'disabled'", c.Cache.Driver)
+	}
+	if (c.Cache.Driver == "valkey" || c.Cache.Driver == "redis") && strings.TrimSpace(c.Cache.URL) == "" && len(c.Cache.Addrs) == 0 {
+		return fmt.Errorf("cache.url (RUNWAY_CACHE_URL) or cache.addrs is required when cache.driver is %q", c.Cache.Driver)
+	}
+	if strings.TrimSpace(c.Cache.KeyPrefix) == "" {
+		c.Cache.KeyPrefix = "runway:"
+	}
+	if c.Cache.DefaultTTL <= 0 {
+		c.Cache.DefaultTTL = 30 * time.Second
+	}
+	if c.Cache.PoolSize <= 0 {
+		c.Cache.PoolSize = 32
+	}
+	if c.Cache.MinIdleConns < 0 {
+		c.Cache.MinIdleConns = 4
+	}
+	if c.Cache.DialTimeout <= 0 {
+		c.Cache.DialTimeout = 5 * time.Second
+	}
+	if c.Cache.ReadTimeout <= 0 {
+		c.Cache.ReadTimeout = 3 * time.Second
+	}
+	if c.Cache.WriteTimeout <= 0 {
+		c.Cache.WriteTimeout = 3 * time.Second
 	}
 
 	return nil

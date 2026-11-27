@@ -22,6 +22,36 @@ services:
       retries: 10
       start_period: 10s
 
+  valkey:
+    image: ${VALKEY_IMAGE:-valkey/valkey:latest}
+    container_name: runway-valkey
+    restart: unless-stopped
+    init: true
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${VALKEY_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - "60"
+      - "1000"
+    volumes:
+      - valkeydata:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   runway:
     image: ${RUNWAY_IMAGE:-ghcr.io/cubetiqlabs/runway:latest}
     build:
@@ -35,10 +65,18 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     environment:
       RUNWAY_APP_ENVIRONMENT: ${RUNWAY_APP_ENVIRONMENT:-development}
       RUNWAY_SERVER_PORT: "8080"
       RUNWAY_DATABASE_URL: postgres://${POSTGRES_USER:-runway}:${POSTGRES_PASSWORD:-runway_dev_password}@postgres:5432/${POSTGRES_DB:-runway}?sslmode=disable
+      RUNWAY_CACHE_DRIVER: ${RUNWAY_CACHE_DRIVER:-valkey}
+      RUNWAY_CACHE_URL: ${RUNWAY_CACHE_URL:-redis://valkey:6379/0}
+      RUNWAY_CACHE_KEY_PREFIX: ${RUNWAY_CACHE_KEY_PREFIX:-runway:}
+      RUNWAY_CACHE_DEFAULT_TTL: ${RUNWAY_CACHE_DEFAULT_TTL:-30s}
+      RUNWAY_CACHE_POOL_SIZE: ${RUNWAY_CACHE_POOL_SIZE:-32}
+      RUNWAY_CACHE_INSTANCE_ID: ${RUNWAY_CACHE_INSTANCE_ID:-}
       RUNWAY_SECURITY_SESSION_SECRET: ${RUNWAY_SECURITY_SESSION_SECRET:-change-me-in-production-min-32-characters-long}
       RUNWAY_SECURITY_ENCRYPTION_KEY: ${RUNWAY_SECURITY_ENCRYPTION_KEY:-change-me-in-production-32-bytes-key}
       RUNWAY_SECURITY_COOKIE_SECURE: ${RUNWAY_SECURITY_COOKIE_SECURE:-false}
@@ -117,3 +155,4 @@ services:
 volumes:
   pgdata:
   chdata:
+  valkeydata:
