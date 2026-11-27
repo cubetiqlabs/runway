@@ -3,10 +3,12 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/google/uuid"
@@ -137,7 +139,7 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 	if len(capturedCreate.Entrypoint) != 2 || capturedCreate.Entrypoint[0] != "/bin/sh" {
 		t.Fatalf("expected /bin/sh -c entrypoint, got %v", capturedCreate.Entrypoint)
 	}
-	if len(capturedCreate.Cmd) != 1 || !strings.Contains(capturedCreate.Cmd[0], "--jitconfig") || !strings.Contains(capturedCreate.Cmd[0], "unset ENCODED_JIT_CONFIG") || !strings.Contains(capturedCreate.Cmd[0], "/home/runner/.env") {
+	if len(capturedCreate.Cmd) != 1 || !strings.Contains(capturedCreate.Cmd[0], "--jitconfig") || !strings.Contains(capturedCreate.Cmd[0], "unset ENCODED_JIT_CONFIG") || !strings.Contains(capturedCreate.Cmd[0], "/home/runner/.env") || !strings.Contains(capturedCreate.Cmd[0], "RUNNER_TOOL_CACHE") || !strings.Contains(capturedCreate.Cmd[0], "[ ! -w") {
 		t.Fatalf("unexpected runner cmd: %v", capturedCreate.Cmd)
 	}
 	if capturedCreate.HostConfig.NanoCpus != 2_000_000_000 {
@@ -151,8 +153,53 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 	if !capturedCreate.HostConfig.Init || capturedCreate.HostConfig.PidsLimit != 4096 || capturedCreate.HostConfig.ShmSize < 64*1024*1024 {
 		t.Fatalf("expected Init=true, PidsLimit=4096, and ShmSize>=64MiB, got %+v", capturedCreate.HostConfig)
 	}
-	if !containsString(capturedCreate.Env, "CI=true") || !containsString(capturedCreate.Env, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
-		t.Fatalf("expected CI=true and RUNNER_TOOL_CACHE in Env, got %v", capturedCreate.Env)
+	if !containsString(capturedCreate.Env, "CI=true") {
+		t.Fatalf("expected CI=true in Env, got %v", capturedCreate.Env)
+	}
+	if containsString(capturedCreate.Env, "RUNNER_TOOL_CACHE=/opt/hostedtoolcache") {
+		t.Fatalf("expected RUNNER_TOOL_CACHE not forced in Env, got %v", capturedCreate.Env)
+	}
+}
+
+func TestDockerProvisionerMaybeRefreshLatest(t *testing.T) {
+	pulled := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/images/create" {
+			pulled <- r.URL.Query().Get("fromImage") + ":" + r.URL.Query().Get("tag")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"Pull complete"}`+"\n")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	p := NewDockerProvisioner(srv.URL)
+	p.pullMu.Lock()
+	p.lastPulled["ghcr.io/cubetiqlabs/runway-runner:latest"] = time.Now().Add(-latestRefreshInterval - time.Minute)
+	p.pullMu.Unlock()
+
+	p.recordAndMaybeRefreshLatest("ghcr.io/cubetiqlabs/runway-runner:latest", false)
+
+	select {
+	case got := <-pulled:
+		if got != "ghcr.io/cubetiqlabs/runway-runner:latest" {
+			t.Fatalf("unexpected refreshed image: %s", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for background :latest refresh pull")
+	}
+
+	// Non-latest tag should not trigger a background pull.
+	p.pullMu.Lock()
+	p.lastPulled["ghcr.io/cubetiqlabs/runway-runner:v1.0.0"] = time.Now().Add(-latestRefreshInterval - time.Minute)
+	p.pullMu.Unlock()
+	p.recordAndMaybeRefreshLatest("ghcr.io/cubetiqlabs/runway-runner:v1.0.0", false)
+
+	select {
+	case got := <-pulled:
+		t.Fatalf("unexpected pull for non-latest tag: %s", got)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

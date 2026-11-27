@@ -11,12 +11,16 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-const defaultRunnerImage = "ghcr.io/cubetiqlabs/runway-runner:latest"
+const (
+	defaultRunnerImage    = "ghcr.io/cubetiqlabs/runway-runner:latest"
+	latestRefreshInterval = 30 * time.Minute
+)
 
-const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if [ -n "${DOCKER_HOST:-}" ] && [ -d /home/runner ]; then touch /home/runner/.env 2>/dev/null || true; if ! grep -q '^DOCKER_HOST=' /home/runner/.env 2>/dev/null; then printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> /home/runner/.env 2>/dev/null || true; fi; fi; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
+const defaultRunnerCmd = `set -e; JIT="$ENCODED_JIT_CONFIG"; unset ENCODED_JIT_CONFIG; if { [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ ! -w "${RUNNER_TOOL_CACHE}" ]; } || { [ -n "${AGENT_TOOLSDIRECTORY:-}" ] && [ ! -w "${AGENT_TOOLSDIRECTORY}" ]; }; then FALLBACK_TOOL_CACHE=/home/runner/_work/_tool; [ -d /home/runner ] || FALLBACK_TOOL_CACHE="$(pwd)/_work/_tool"; export RUNNER_TOOL_CACHE="$FALLBACK_TOOL_CACHE" AGENT_TOOLSDIRECTORY="$FALLBACK_TOOL_CACHE"; mkdir -p "$RUNNER_TOOL_CACHE" 2>/dev/null || true; fi; if [ -d /home/runner ]; then touch /home/runner/.env 2>/dev/null || true; if [ -n "${DOCKER_HOST:-}" ] && ! grep -q '^DOCKER_HOST=' /home/runner/.env 2>/dev/null; then printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> /home/runner/.env 2>/dev/null || true; fi; if [ -n "${RUNNER_TOOL_CACHE:-}" ] && ! grep -q '^RUNNER_TOOL_CACHE=' /home/runner/.env 2>/dev/null; then printf 'RUNNER_TOOL_CACHE=%s\nAGENT_TOOLSDIRECTORY=%s\n' "$RUNNER_TOOL_CACHE" "${AGENT_TOOLSDIRECTORY:-$RUNNER_TOOL_CACHE}" >> /home/runner/.env 2>/dev/null || true; fi; fi; if [ -x /home/runner/run.sh ]; then exec /home/runner/run.sh --jitconfig "$JIT"; elif [ -x ./run.sh ]; then exec ./run.sh --jitconfig "$JIT"; else exec run.sh --jitconfig "$JIT"; fi`
 
 // DockerOptions configures how spawned runner containers access Docker for CI steps.
 type DockerOptions struct {
@@ -33,6 +37,10 @@ type DockerProvisioner struct {
 	opts       DockerOptions
 	client     *http.Client
 	pullClient *http.Client
+
+	pullMu     sync.Mutex
+	lastPulled map[string]time.Time
+	pulling    map[string]bool
 }
 
 // NewDockerProvisioner creates a Docker Engine provisioner supporting Unix sockets or HTTP/TCP endpoints.
@@ -77,6 +85,8 @@ func NewDockerProvisionerWithOptions(dockerHost string, opts DockerOptions) *Doc
 		opts:       opts,
 		client:     &http.Client{Transport: transport, Timeout: 30 * time.Second},
 		pullClient: &http.Client{Transport: transport, Timeout: 5 * time.Minute},
+		lastPulled: make(map[string]time.Time),
+		pulling:    make(map[string]bool),
 	}
 }
 
@@ -172,8 +182,6 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 	env := []string{
 		"CI=true",
 		"RUNNER_NAME=" + req.RunnerName,
-		"RUNNER_TOOL_CACHE=/opt/hostedtoolcache",
-		"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache",
 		"ENCODED_JIT_CONFIG=" + req.EncodedJITConfig,
 	}
 	hostConfig := map[string]any{
@@ -219,15 +227,18 @@ func (d *DockerProvisioner) Provision(ctx context.Context, req ProvisionRequest)
 	}
 
 	containerID, err := d.createContainer(ctx, req.RunnerName, body)
+	pulledNow := false
 	if err != nil && isImageNotFoundError(err) {
 		if pullErr := d.pullImage(ctx, image); pullErr != nil {
 			return nil, pullErr
 		}
+		pulledNow = true
 		containerID, err = d.createContainer(ctx, req.RunnerName, body)
 	}
 	if err != nil {
 		return nil, err
 	}
+	d.recordAndMaybeRefreshLatest(image, pulledNow)
 
 	startReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/containers/%s/start", d.baseURL, url.PathEscape(containerID)), nil)
 	if err != nil {
@@ -429,4 +440,51 @@ func (d *DockerProvisioner) Healthy(ctx context.Context, providerRef string) (bo
 		return false, err
 	}
 	return inspect.State.Running, nil
+}
+
+// recordAndMaybeRefreshLatest tracks when an image was last pulled and triggers
+// a non-blocking background pull for :latest images older than latestRefreshInterval.
+func (d *DockerProvisioner) recordAndMaybeRefreshLatest(image string, pulledNow bool) {
+	_, tag := splitImageRepoTag(image)
+	if tag != "latest" {
+		return
+	}
+
+	now := time.Now()
+	d.pullMu.Lock()
+	if d.lastPulled == nil {
+		d.lastPulled = make(map[string]time.Time)
+	}
+	if d.pulling == nil {
+		d.pulling = make(map[string]bool)
+	}
+	if pulledNow {
+		d.lastPulled[image] = now
+		d.pullMu.Unlock()
+		return
+	}
+	last, ok := d.lastPulled[image]
+	if !ok {
+		d.lastPulled[image] = now
+		d.pullMu.Unlock()
+		return
+	}
+	if now.Sub(last) < latestRefreshInterval || d.pulling[image] {
+		d.pullMu.Unlock()
+		return
+	}
+	d.pulling[image] = true
+	d.pullMu.Unlock()
+
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		err := d.pullImage(refreshCtx, image)
+		d.pullMu.Lock()
+		delete(d.pulling, image)
+		if err == nil {
+			d.lastPulled[image] = time.Now()
+		}
+		d.pullMu.Unlock()
+	}()
 }
