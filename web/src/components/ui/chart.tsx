@@ -28,6 +28,40 @@ export const RUNWAY_CHART_THEME: Partial<ChartTheme> = {
   ],
 }
 
+class ChartErrorBoundary extends React.Component<
+  { height: number; message: string; className?: string; children: React.ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false }
+
+  static getDerivedStateFromError() {
+    return { hasError: true }
+  }
+
+  componentDidUpdate(prevProps: { children: React.ReactNode }) {
+    if (this.state.hasError && prevProps.children !== this.props.children) {
+      this.setState({ hasError: false })
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div
+          style={{ height: this.props.height }}
+          className={cn(
+            "flex items-center justify-center border border-dashed border-border text-[11px] text-muted-foreground",
+            this.props.className
+          )}
+        >
+          {this.props.message}
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 export function ChartContainer({
   config,
   className,
@@ -84,31 +118,39 @@ export function AreaLineMetricChart({
 }) {
   const definition = useMemo(() => {
     if (data.length === 0) return null
+    const indexed = data.map((pt, idx) => ({
+      idx,
+      label: pt.label || `#${idx + 1}`,
+      value: Number.isFinite(pt.value) ? pt.value : 0,
+    }))
     return defineChart(
       {
         theme: RUNWAY_CHART_THEME,
         margin: { top: 8, right: 10, bottom: 20, left: 32 },
         marks: [
-          areaY(data, {
-            x: "label",
+          areaY(indexed, {
+            x: "idx",
             y: "value",
             fill: color,
             fillOpacity: 0.16,
           }),
-          lineY(data, {
-            x: "label",
+          lineY(indexed, {
+            x: "idx",
             y: "value",
             stroke: color,
             strokeWidth: 2,
-            points: data.length <= 24,
+            points: indexed.length <= 24,
           }),
         ],
         scales: {
           x: {
-            scale: () => scalePoint<string>().padding(0.15),
+            scale: () => scalePoint<number>().padding(0.15),
             axis: {
               line: false,
-              ticks: false,
+              ticks: {
+                line: false,
+                format: (v: number) => indexed[Number(v)]?.label ?? String(v),
+              },
               tickLabels: { thin: true, fontSize: 10 },
             },
           },
@@ -144,9 +186,11 @@ export function AreaLineMetricChart({
   }
 
   return (
-    <ChartContainer className={className}>
-      <Chart definition={definition} height={height} ariaLabel={ariaLabel} />
-    </ChartContainer>
+    <ChartErrorBoundary height={height} message={emptyMessage} className={className}>
+      <ChartContainer className={className}>
+        <Chart definition={definition} height={height} ariaLabel={ariaLabel} />
+      </ChartContainer>
+    </ChartErrorBoundary>
   )
 }
 
@@ -174,12 +218,22 @@ export function CategoryBarChart({
 }) {
   const definition = useMemo(() => {
     if (data.length === 0) return null
+    const seen = new Map<string, number>()
+    const safeData = data.map((d) => {
+      const base = d.category || "—"
+      const count = (seen.get(base) ?? 0) + 1
+      seen.set(base, count)
+      return {
+        category: count > 1 ? `${base} (${count})` : base,
+        value: Number.isFinite(d.value) ? d.value : 0,
+      }
+    })
     return defineChart(
       {
         theme: RUNWAY_CHART_THEME,
         margin: { top: 8, right: 10, bottom: 26, left: 36 },
         marks: [
-          barY(data, {
+          barY(safeData, {
             x: "category",
             y: "value",
             fill: color,
@@ -229,8 +283,10 @@ export function CategoryBarChart({
   }
 
   return (
-    <ChartContainer className={className}>
-      <Chart definition={definition} height={height} ariaLabel={ariaLabel} />
-    </ChartContainer>
+    <ChartErrorBoundary height={height} message={emptyMessage} className={className}>
+      <ChartContainer className={className}>
+        <Chart definition={definition} height={height} ariaLabel={ariaLabel} />
+      </ChartContainer>
+    </ChartErrorBoundary>
   )
 }
