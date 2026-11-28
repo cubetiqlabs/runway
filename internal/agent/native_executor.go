@@ -93,14 +93,18 @@ func (e *NativeExecutor) ExecuteWithLogs(ctx context.Context, task *TaskPayload,
 			existed := statErr == nil
 			if mkErr := os.MkdirAll(cacheRoot, 0o755); mkErr == nil {
 				e.cache.TrackVolumeHitMiss(cacheRoot, existed)
+				leaseKey, slotDir := e.cache.AcquireToolCacheSlot(scopeKey)
+				defer e.cache.ReleaseToolCacheSlot(leaseKey)
+				toolDir := filepath.Join(cacheRoot, "toolcache", slotDir)
 				for _, sub := range []string{"gomod", "gocache", "npm", "bun", "pip", "cargo", "ccache", "sccache", "toolcache"} {
 					_ = os.MkdirAll(filepath.Join(cacheRoot, sub), 0o755)
 				}
+				_ = os.MkdirAll(toolDir, 0o755)
 				vcpu := task.VCPU
 				if vcpu <= 0 {
 					vcpu = runtime.NumCPU()
 				}
-				env = append(env, orchestrator.CacheEnvVars(cacheRoot, task.BuildProfile, vcpu)...)
+				env = append(env, orchestrator.CacheEnvVarsWithToolCache(cacheRoot, toolDir, task.BuildProfile, vcpu)...)
 			}
 		}
 	}

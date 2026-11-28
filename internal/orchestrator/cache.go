@@ -9,7 +9,8 @@ import (
 	"sync/atomic"
 )
 
-// CacheManager manages scoped persistent build caches and concurrency-safe DinD layer cache slot leases.
+// CacheManager manages scoped persistent build caches, exclusive per-job toolcache slots,
+// and concurrency-safe DinD layer cache slot leases.
 type CacheManager struct {
 	mu           sync.Mutex
 	dindSlots    map[string]map[int]bool
@@ -17,7 +18,13 @@ type CacheManager struct {
 		scopeKey string
 		slot     int
 	}
-	knownVolumes map[string]bool
+	toolSlots     map[string]map[int]bool
+	toolSlotIndex map[string]struct {
+		scopeKey string
+		slot     int
+	}
+	knownVolumes  map[string]bool
+	healedVolumes map[string]bool
 
 	hits   atomic.Int64
 	misses atomic.Int64
@@ -30,7 +37,13 @@ func NewCacheManager() *CacheManager {
 			scopeKey string
 			slot     int
 		}),
-		knownVolumes: make(map[string]bool),
+		toolSlots: make(map[string]map[int]bool),
+		toolSlotIndex: make(map[string]struct {
+			scopeKey string
+			slot     int
+		}),
+		knownVolumes:  make(map[string]bool),
+		healedVolumes: make(map[string]bool),
 	}
 }
 
@@ -74,11 +87,68 @@ func (c *CacheManager) TrackVolumeHitMiss(volName string, existed bool) {
 	c.knownVolumes[volName] = true
 }
 
+func (c *CacheManager) IsVolumeHealed(volName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.healedVolumes[volName]
+}
+
+func (c *CacheManager) MarkVolumeHealed(volName string) {
+	if volName == "" {
+		return
+	}
+	c.mu.Lock()
+	c.healedVolumes[volName] = true
+	c.mu.Unlock()
+}
+
 func (c *CacheManager) RecordHit()  { c.hits.Add(1) }
 func (c *CacheManager) RecordMiss() { c.misses.Add(1) }
 
 func (c *CacheManager) Stats() (hits, misses int64) {
 	return c.hits.Load(), c.misses.Load()
+}
+
+// AcquireToolCacheSlot leases an exclusive toolcache subdirectory slot per cache scope
+// so concurrent runner jobs never corrupt or race on @actions/tool-cache extractions.
+func (c *CacheManager) AcquireToolCacheSlot(scopeKey string) (leaseKey, relDir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	used := c.toolSlots[scopeKey]
+	if used == nil {
+		used = make(map[int]bool)
+		c.toolSlots[scopeKey] = used
+	}
+	slot := 0
+	for used[slot] {
+		slot++
+	}
+	used[slot] = true
+	leaseKey = fmt.Sprintf("%s:%d", scopeKey, slot)
+	relDir = fmt.Sprintf("slot-%d", slot)
+	c.toolSlotIndex[leaseKey] = struct {
+		scopeKey string
+		slot     int
+	}{scopeKey: scopeKey, slot: slot}
+	return leaseKey, relDir
+}
+
+// ReleaseToolCacheSlot releases the concurrency lease on a toolcache slot.
+func (c *CacheManager) ReleaseToolCacheSlot(leaseKey string) {
+	if leaseKey == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	info, ok := c.toolSlotIndex[leaseKey]
+	if !ok {
+		return
+	}
+	if used := c.toolSlots[info.scopeKey]; used != nil {
+		delete(used, info.slot)
+	}
+	delete(c.toolSlotIndex, leaseKey)
 }
 
 // AcquireDinDCacheSlot leases the lowest available slot index for a DinD /var/lib/docker volume
@@ -128,6 +198,19 @@ func CacheEnvVars(cacheRoot, buildProfile string, vcpu int) []string {
 	if root == "" {
 		return nil
 	}
+	return CacheEnvVarsWithToolCache(root, root+"/toolcache", buildProfile, vcpu)
+}
+
+// CacheEnvVarsWithToolCache returns build-tool cache variables with an explicit toolcache path.
+func CacheEnvVarsWithToolCache(cacheRoot, toolCacheDir, buildProfile string, vcpu int) []string {
+	root := strings.TrimRight(strings.TrimSpace(cacheRoot), "/")
+	if root == "" {
+		return nil
+	}
+	toolDir := strings.TrimRight(strings.TrimSpace(toolCacheDir), "/")
+	if toolDir == "" {
+		toolDir = root + "/toolcache"
+	}
 	if vcpu <= 0 {
 		vcpu = 2
 	}
@@ -141,8 +224,8 @@ func CacheEnvVars(cacheRoot, buildProfile string, vcpu int) []string {
 		"CARGO_HOME=" + root + "/cargo",
 		"CCACHE_DIR=" + root + "/ccache",
 		"SCCACHE_DIR=" + root + "/sccache",
-		"RUNNER_TOOL_CACHE=" + root + "/toolcache",
-		"AGENT_TOOLSDIRECTORY=" + root + "/toolcache",
+		"RUNNER_TOOL_CACHE=" + toolDir,
+		"AGENT_TOOLSDIRECTORY=" + toolDir,
 	}
 	profile := strings.ToLower(strings.TrimSpace(buildProfile))
 	if profile == "fast" || profile == "ultra" {

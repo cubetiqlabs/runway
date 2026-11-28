@@ -342,6 +342,12 @@ func normalizeEvent(ev domain.Event) domain.Event {
 	return ev
 }
 
+func reverseMetricPoints(points []domain.AgentMetricPoint) {
+	for i, j := 0, len(points)-1; i < j; i, j = i+1, j-1 {
+		points[i], points[j] = points[j], points[i]
+	}
+}
+
 func clampLimitOffset(p domain.PageParams, def, max int) (int, int) {
 	limit := p.Limit
 	if limit <= 0 {

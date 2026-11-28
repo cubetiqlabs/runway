@@ -27,6 +27,16 @@ export const Route = createFileRoute("/events")({
   component: EventsPage,
 })
 
+const EVENT_WINDOW_ITEMS: Record<string, string> = {
+  "15m": "Last 15m",
+  "1h": "Last 1h",
+  "6h": "Last 6h",
+  "24h": "Last 24h",
+  "7d": "Last 7d",
+  "30d": "Last 30d",
+  all: "All time",
+}
+
 function EventsPage() {
   const livePolling = useAppSelector((s) => s.livePolling)
 
@@ -183,6 +193,7 @@ function EventsPage() {
         </div>
         <div className="flex items-center gap-2">
           <Select
+            items={EVENT_WINDOW_ITEMS}
             value={windowRange}
             onValueChange={(v) => {
               setPage(1)
@@ -193,10 +204,13 @@ function EventsPage() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
+              <SelectItem value="15m">Last 15m</SelectItem>
               <SelectItem value="1h">Last 1h</SelectItem>
               <SelectItem value="6h">Last 6h</SelectItem>
               <SelectItem value="24h">Last 24h</SelectItem>
-              <SelectItem value="168h">Last 7d</SelectItem>
+              <SelectItem value="7d">Last 7d</SelectItem>
+              <SelectItem value="30d">Last 30d</SelectItem>
+              <SelectItem value="all">All time</SelectItem>
             </SelectContent>
           </Select>
           <Button
@@ -277,7 +291,9 @@ function EventsPage() {
             <Card>
               <CardHeader className="pb-2">
                 <CardTitle>Event Volume by Category</CardTitle>
-                <CardDescription>Distribution across streams for window {windowRange}</CardDescription>
+                <CardDescription>
+                  Distribution across streams ({EVENT_WINDOW_ITEMS[windowRange] ?? windowRange})
+                </CardDescription>
               </CardHeader>
               <CardContent>
                 <CategoryBarChart
@@ -323,8 +339,10 @@ function EventsPage() {
               { label: "Audit Logs", value: "audit" },
               { label: "Runner Logs", value: "runner_log" },
               { label: "Runner Lifecycle", value: "runner_lifecycle" },
+              { label: "Job Lifecycle", value: "job_lifecycle" },
               { label: "Agent Lifecycle", value: "agent_lifecycle" },
               { label: "Agent Metrics", value: "agent_metric" },
+              { label: "System", value: "system" },
             ],
           },
           {
@@ -349,6 +367,7 @@ function EventsPage() {
           setSearch("")
           setCategory("all")
           setSeverity("all")
+          setWindowRange("24h")
         }}
         sortBy={sortBy}
         sortDir={sortDir}

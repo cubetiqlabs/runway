@@ -86,8 +86,11 @@ func (s *DashboardService) GetEventSummary(ctx context.Context, since time.Time)
 			BySeverity: map[string]int64{},
 		}, nil
 	}
-	mins := int(time.Since(since).Round(time.Minute).Minutes())
-	key := fmt.Sprintf("dashboard:event_summary:%dm", mins)
+	key := "dashboard:event_summary:all"
+	if !since.IsZero() {
+		mins := int(time.Since(since).Round(time.Minute).Minutes())
+		key = fmt.Sprintf("dashboard:event_summary:%dm", mins)
+	}
 	return cache.GetOrLoad(ctx, s.getCache(), key, 5*time.Second, func(c context.Context) (*domain.EventSummary, error) {
 		return es.GetSummary(c, since)
 	})

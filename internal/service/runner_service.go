@@ -405,7 +405,7 @@ func (s *RunnerService) GetRunnerLogs(ctx context.Context, id uuid.UUID, page do
 	s.hookMu.RUnlock()
 
 	if es != nil {
-		if page.Limit <= 0 {
+		if page.Limit <= 0 || page.Limit > 500 {
 			page.Limit = 200
 		}
 		if page.SortBy == "" {
@@ -425,7 +425,7 @@ func (s *RunnerService) GetRunnerLogs(ctx context.Context, id uuid.UUID, page do
 
 	// Fallback to live Docker container logs while container is still running.
 	if s.orch != nil && rn.Provider == "docker" && rn.ProviderRef != "" {
-		entries, logErr := s.orch.FetchRunnerLogs(ctx, rn, 200)
+		entries, logErr := s.orch.FetchRunnerLogs(ctx, rn, page.Limit)
 		if logErr == nil && len(entries) > 0 {
 			out := make([]domain.Event, 0, len(entries))
 			for _, e := range entries {

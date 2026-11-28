@@ -4,4 +4,6 @@ package agent
 
 import "github.com/cubetiqlabs/runway/internal/domain"
 
+func (m *MetricsCollector) initPlatformMetrics() {}
+
 func (m *MetricsCollector) fillPlatformMetrics(_ *domain.AgentMetricsSnapshot) {}

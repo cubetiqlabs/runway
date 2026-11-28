@@ -73,7 +73,7 @@ export const runnerLogsQueryOptions = (id: string, params: ListQueryParams = {})
   queryOptions({
     queryKey: queryKeys.runnerLogs(id, params),
     queryFn: ({ signal }) => api.getRunnerLogs(id, params, signal),
-    staleTime: 3_000,
+    staleTime: 1_500,
   })
 
 export const jobsQueryOptions = (params: ListQueryParams = {}) =>

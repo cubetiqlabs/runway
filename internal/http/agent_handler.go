@@ -170,7 +170,11 @@ func (h *AgentHandler) Heartbeat(c fiber.Ctx) error {
 		return domain.ErrUnauthorized
 	}
 	var in service.AgentHeartbeatInput
-	_ = c.Bind().Body(&in)
+	if len(c.Body()) > 0 {
+		if err := c.Bind().Body(&in); err != nil {
+			return sendError(c, fiber.StatusBadRequest, "bad_request", "invalid heartbeat payload")
+		}
+	}
 	res, err := h.agentSvc.Heartbeat(c.Context(), agent, in)
 	if err != nil {
 		return err

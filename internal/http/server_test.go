@@ -259,3 +259,18 @@ func TestClusterRateLimitStorageAndServer(t *testing.T) {
 		t.Fatalf("expected 429 on 3rd login request with shared limiter, got %d %v", resp.StatusCode, err)
 	}
 }
+
+func TestParseWindowDuration(t *testing.T) {
+	if got := parseWindowDuration("15m", time.Hour); got != 15*time.Minute {
+		t.Fatalf("expected 15m, got %v", got)
+	}
+	if got := parseWindowDuration("7d", time.Hour); got != 7*24*time.Hour {
+		t.Fatalf("expected 7d (168h), got %v", got)
+	}
+	if got := parseWindowDuration("30d", time.Hour); got != 30*24*time.Hour {
+		t.Fatalf("expected 30d, got %v", got)
+	}
+	if got := parseWindowDuration("365d", time.Hour); got != 90*24*time.Hour {
+		t.Fatalf("expected 365d clamped to 90d, got %v", got)
+	}
+}
