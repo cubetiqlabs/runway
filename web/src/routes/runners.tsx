@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { createFileRoute } from "@tanstack/react-router"
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   RefreshIcon,
@@ -30,7 +31,9 @@ import {
 import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
 import { StatusBadge } from "@/components/status-badge"
 import { api } from "@/lib/api"
-import type { EventRecord, Runner } from "@/lib/types"
+import { queryKeys, runnerLogsQueryOptions, runnersQueryOptions } from "@/lib/query"
+import { useAppSelector } from "@/lib/store"
+import type { Runner } from "@/lib/types"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/runners")({
@@ -38,8 +41,9 @@ export const Route = createFileRoute("/runners")({
 })
 
 function RunnersPage() {
-  const [runners, setRunners] = useState<Runner[]>([])
-  const [total, setTotal] = useState(0)
+  const queryClient = useQueryClient()
+  const livePolling = useAppSelector((s) => s.livePolling)
+
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
   const [statusFilter, setStatusFilter] = useState<string>("all")
@@ -47,85 +51,78 @@ function RunnersPage() {
   const [search, setSearch] = useState("")
   const [sortBy, setSortBy] = useState("created_at")
   const [sortDir, setSortDir] = useState<SortDirection>("desc")
-  const [loading, setLoading] = useState(true)
   const [confirmTarget, setConfirmTarget] = useState<Runner | null>(null)
-
   const [logsTarget, setLogsTarget] = useState<Runner | null>(null)
-  const [logs, setLogs] = useState<EventRecord[]>([])
-  const [logsLoading, setLogsLoading] = useState(false)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await api.listRunners({
-        status: statusFilter,
-        provider: providerFilter,
-        search: search.trim() || undefined,
-        limit: pageSize,
-        page,
-        sort_by: sortBy,
-        sort_dir: sortDir,
-      })
-      setRunners(res.items)
-      setTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load runners")
-    } finally {
-      setLoading(false)
-    }
-  }, [statusFilter, providerFilter, search, pageSize, page, sortBy, sortDir])
-
-  useEffect(() => {
-    void load()
-  }, [load])
-
-  const hasActive = runners.some((r) =>
-    r.status === "provisioning" || r.status === "busy" || r.status === "draining"
+  const queryParams = useMemo(
+    () => ({
+      status: statusFilter,
+      provider: providerFilter,
+      search: search.trim() || undefined,
+      limit: pageSize,
+      page,
+      sort_by: sortBy,
+      sort_dir: sortDir,
+    }),
+    [statusFilter, providerFilter, search, pageSize, page, sortBy, sortDir]
   )
+
+  const runnersQuery = useQuery({
+    ...runnersQueryOptions(queryParams),
+    placeholderData: keepPreviousData,
+    refetchInterval: (query) => {
+      if (!livePolling) return false
+      const items = query.state.data?.items ?? []
+      return items.some((r) => r.status === "provisioning" || r.status === "busy" || r.status === "draining")
+        ? 4_000
+        : 15_000
+    },
+  })
+
   useEffect(() => {
-    const interval = window.setInterval(() => void load(), hasActive ? 4000 : 15000)
-    return () => window.clearInterval(interval)
-  }, [load, hasActive])
-
-  const openLogs = async (runner: Runner) => {
-    setLogsTarget(runner)
-    setLogsLoading(true)
-    try {
-      const res = await api.getRunnerLogs(runner.id, { limit: 200 })
-      setLogs(res.items)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to fetch runner logs")
-      setLogs([])
-    } finally {
-      setLogsLoading(false)
+    if (runnersQuery.error) {
+      toast.error(
+        runnersQuery.error instanceof Error ? runnersQuery.error.message : "Failed to load runners"
+      )
     }
-  }
+  }, [runnersQuery.error])
 
-  const handleDrain = async (runner: Runner) => {
-    try {
-      const updated = await api.drainRunner(runner.id)
+  const logsQuery = useQuery({
+    ...runnerLogsQueryOptions(logsTarget?.id ?? "", { limit: 200 }),
+    enabled: Boolean(logsTarget?.id),
+    refetchInterval: logsTarget && livePolling ? 4_000 : false,
+  })
+
+  const drainMutation = useMutation({
+    mutationFn: (runner: Runner) => api.drainRunner(runner.id),
+    onSuccess: (updated, runner) => {
       toast.success(
         updated.status === "terminated"
           ? `Drained and terminated idle runner ${runner.name}`
           : `Draining active runner ${runner.name}`
       )
-      void load()
-    } catch (err) {
+      void queryClient.invalidateQueries({ queryKey: ["runners"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to drain runner")
-    }
-  }
+    },
+  })
 
-  const handleTerminate = async () => {
-    if (!confirmTarget) return
-    try {
-      await api.terminateRunner(confirmTarget.id)
-      toast.success(`Terminated runner ${confirmTarget.name}`)
+  const terminateMutation = useMutation({
+    mutationFn: (id: string) => api.terminateRunner(id),
+    onSuccess: () => {
+      toast.success(`Terminated runner ${confirmTarget?.name ?? ""}`)
       setConfirmTarget(null)
-      void load()
-    } catch (err) {
+      void queryClient.invalidateQueries({ queryKey: ["runners"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to terminate runner")
-    }
-  }
+    },
+  })
+
+  const logs = logsQuery.data?.items ?? []
 
   const columns: DataTableColumn<Runner>[] = useMemo(
     () => [
@@ -187,7 +184,7 @@ function RunnersPage() {
         hideable: false,
         cell: (rn) => (
           <div className="flex flex-wrap items-center gap-1.5">
-            <Button type="button" size="xs" variant="outline" onClick={() => void openLogs(rn)}>
+            <Button type="button" size="xs" variant="outline" onClick={() => setLogsTarget(rn)}>
               <HugeiconsIcon icon={File01Icon} strokeWidth={2} />
               <span>Logs</span>
             </Button>
@@ -195,8 +192,8 @@ function RunnersPage() {
               type="button"
               size="xs"
               variant="outline"
-              disabled={rn.status === "draining" || rn.status === "terminated"}
-              onClick={() => void handleDrain(rn)}
+              disabled={rn.status === "draining" || rn.status === "terminated" || drainMutation.isPending}
+              onClick={() => drainMutation.mutate(rn)}
             >
               <HugeiconsIcon icon={PauseCircleIcon} strokeWidth={2} />
               <span>Drain</span>
@@ -215,7 +212,7 @@ function RunnersPage() {
         ),
       },
     ],
-    []
+    [drainMutation]
   )
 
   return (
@@ -227,19 +224,26 @@ function RunnersPage() {
             Inspect active ephemeral runners, drain capacity safely, view logs, or force-terminate instances.
           </p>
         </div>
-        <Button type="button" variant="outline" size="sm" onClick={() => void load()}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={runnersQuery.isFetching}
+          onClick={() => void runnersQuery.refetch()}
+        >
           <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
-          <span>Refresh</span>
+          <span>{runnersQuery.isFetching ? "Refreshing..." : "Refresh"}</span>
         </Button>
       </div>
 
       <DataTable
         id="runners-table"
         caption="Self-hosted GitHub Actions runners managed by Runway"
-        data={runners}
+        data={runnersQuery.data?.items ?? []}
         columns={columns}
         getRowId={(rn) => rn.id}
-        loading={loading}
+        loading={runnersQuery.isPending}
+        fetching={runnersQuery.isFetching && !runnersQuery.isPending}
         emptyMessage="No runners match the current filters."
         searchValue={search}
         onSearchChange={(val) => {
@@ -251,6 +255,7 @@ function RunnersPage() {
           {
             id: "status",
             label: "Status",
+            searchable: true,
             value: statusFilter,
             onChange: (v) => {
               setPage(1)
@@ -269,6 +274,7 @@ function RunnersPage() {
           {
             id: "provider",
             label: "Provider",
+            searchable: true,
             value: providerFilter,
             onChange: (v) => {
               setPage(1)
@@ -298,7 +304,7 @@ function RunnersPage() {
         pagination={{
           page,
           pageSize,
-          total,
+          total: runnersQuery.data?.total ?? 0,
           onPageChange: setPage,
           onPageSizeChange: (n) => {
             setPage(1)
@@ -318,7 +324,7 @@ function RunnersPage() {
             </DialogDescription>
           </DialogHeader>
           <div className="flex-1 overflow-auto border border-border bg-muted/30 p-3 font-mono text-[11px] space-y-1 max-h-96">
-            {logsLoading ? (
+            {logsQuery.isPending ? (
               <div className="text-muted-foreground">Loading logs...</div>
             ) : logs.length === 0 ? (
               <div className="text-muted-foreground">No runner logs recorded yet.</div>
@@ -373,7 +379,10 @@ function RunnersPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={() => void handleTerminate()}>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => confirmTarget && terminateMutation.mutate(confirmTarget.id)}
+            >
               Terminate Runner
             </AlertDialogAction>
           </AlertDialogFooter>

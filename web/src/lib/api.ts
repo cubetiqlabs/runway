@@ -1,3 +1,4 @@
+import { appStore, setCsrfTokenState } from "./store"
 import type {
   Agent,
   AgentDetail,
@@ -20,10 +21,8 @@ import type {
   WorkflowJob,
 } from "./types"
 
-let csrfToken = ""
-
 export function setCsrfToken(token: string) {
-  csrfToken = token
+  setCsrfTokenState(token)
 }
 
 export class ApiError extends Error {
@@ -70,6 +69,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json")
   }
+  const csrfToken = appStore.state.csrfToken
   if (
     csrfToken &&
     (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE")
@@ -112,12 +112,14 @@ export const api = {
       body: JSON.stringify({ email, password }),
     }),
   logout: () => request<{ ok: boolean }>("/api/v1/auth/logout", { method: "POST" }),
-  me: () => request<{ user: User; csrf_token: string }>("/api/v1/auth/me"),
+  me: (signal?: AbortSignal) =>
+    request<{ user: User; csrf_token: string }>("/api/v1/auth/me", { signal }),
 
-  overview: () => request<DashboardOverview>("/api/v1/dashboard/overview"),
+  overview: (signal?: AbortSignal) =>
+    request<DashboardOverview>("/api/v1/dashboard/overview", { signal }),
 
-  listPools: (params: ListQueryParams = {}) =>
-    request<PageResponse<RunnerPool>>(`/api/v1/pools${buildQuery(params, 50)}`),
+  listPools: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<RunnerPool>>(`/api/v1/pools${buildQuery(params, 50)}`, { signal }),
   createPool: (pool: Partial<RunnerPool>) =>
     request<RunnerPool>("/api/v1/pools", { method: "POST", body: JSON.stringify(pool) }),
   updatePool: (id: string, pool: Partial<RunnerPool>) =>
@@ -125,17 +127,19 @@ export const api = {
   deletePool: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/pools/${id}`, { method: "DELETE" }),
 
-  listRunners: (params: ListQueryParams = {}) =>
-    request<PageResponse<Runner>>(`/api/v1/runners${buildQuery(params, 25)}`),
-  getRunnerLogs: (id: string, params: ListQueryParams = {}) =>
-    request<PageResponse<EventRecord>>(`/api/v1/runners/${id}/logs${buildQuery(params, 200)}`),
+  listRunners: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<Runner>>(`/api/v1/runners${buildQuery(params, 25)}`, { signal }),
+  getRunnerLogs: (id: string, params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<EventRecord>>(`/api/v1/runners/${id}/logs${buildQuery(params, 200)}`, {
+      signal,
+    }),
   drainRunner: (id: string) =>
     request<Runner>(`/api/v1/runners/${id}/drain`, { method: "POST" }),
   terminateRunner: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/runners/${id}/terminate`, { method: "POST" }),
 
-  listJobs: (params: ListQueryParams = {}) =>
-    request<PageResponse<WorkflowJob>>(`/api/v1/jobs${buildQuery(params, 25)}`),
+  listJobs: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<WorkflowJob>>(`/api/v1/jobs${buildQuery(params, 25)}`, { signal }),
   approveJob: (id: string, reason?: string) =>
     request<WorkflowJob>(`/api/v1/jobs/${id}/approve`, {
       method: "POST",
@@ -147,8 +151,10 @@ export const api = {
       body: JSON.stringify({ reason }),
     }),
 
-  listPolicies: (params: ListQueryParams = {}) =>
-    request<PageResponse<ModerationPolicy>>(`/api/v1/policies${buildQuery(params, 25)}`),
+  listPolicies: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<ModerationPolicy>>(`/api/v1/policies${buildQuery(params, 25)}`, {
+      signal,
+    }),
   createPolicy: (policy: Partial<ModerationPolicy>) =>
     request<ModerationPolicy>("/api/v1/policies", {
       method: "POST",
@@ -176,30 +182,40 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  listInstallations: (params: ListQueryParams = {}) =>
-    request<PageResponse<Installation>>(`/api/v1/installations${buildQuery(params, 25)}`),
+  listInstallations: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<Installation>>(`/api/v1/installations${buildQuery(params, 25)}`, {
+      signal,
+    }),
   syncInstallations: () =>
     request<{ synced: number }>("/api/v1/installations/sync", { method: "POST" }),
-  listDeliveries: (params: ListQueryParams = {}) =>
-    request<PageResponse<WebhookDelivery>>(`/api/v1/webhooks/deliveries${buildQuery(params, 25)}`),
-  listAuditLogs: (params: ListQueryParams = {}) =>
-    request<PageResponse<AuditLog>>(`/api/v1/audit-logs${buildQuery(params, 25)}`),
-  listEvents: (params: ListQueryParams = {}) =>
-    request<PageResponse<EventRecord>>(`/api/v1/events${buildQuery(params, 25)}`),
-  eventSummary: (window = "24h") =>
-    request<EventSummary>(`/api/v1/events/summary?window=${encodeURIComponent(window)}`),
-  settingsStatus: () => request<GitHubAppSettingsStatus>("/api/v1/settings/github-app"),
+  listDeliveries: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<WebhookDelivery>>(`/api/v1/webhooks/deliveries${buildQuery(params, 25)}`, {
+      signal,
+    }),
+  listAuditLogs: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<AuditLog>>(`/api/v1/audit-logs${buildQuery(params, 25)}`, { signal }),
+  listEvents: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<EventRecord>>(`/api/v1/events${buildQuery(params, 25)}`, { signal }),
+  eventSummary: (window = "24h", signal?: AbortSignal) =>
+    request<EventSummary>(`/api/v1/events/summary?window=${encodeURIComponent(window)}`, {
+      signal,
+    }),
+  settingsStatus: (signal?: AbortSignal) =>
+    request<GitHubAppSettingsStatus>("/api/v1/settings/github-app", { signal }),
 
-  listAgents: (params: ListQueryParams = {}) =>
-    request<PageResponse<Agent>>(`/api/v1/agents${buildQuery(params, 25)}`),
-  getAgent: (id: string, window = "1h") =>
-    request<AgentDetail>(`/api/v1/agents/${id}?window=${encodeURIComponent(window)}`),
-  getAgentMetrics: (id: string, window = "1h", limit = 240) =>
+  listAgents: (params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<Agent>>(`/api/v1/agents${buildQuery(params, 25)}`, { signal }),
+  getAgent: (id: string, window = "1h", signal?: AbortSignal) =>
+    request<AgentDetail>(`/api/v1/agents/${id}?window=${encodeURIComponent(window)}`, { signal }),
+  getAgentMetrics: (id: string, window = "1h", limit = 240, signal?: AbortSignal) =>
     request<{ items: AgentMetricPoint[] }>(
-      `/api/v1/agents/${id}/metrics?window=${encodeURIComponent(window)}&limit=${limit}`
+      `/api/v1/agents/${id}/metrics?window=${encodeURIComponent(window)}&limit=${limit}`,
+      { signal }
     ),
-  listAgentTasks: (id: string, params: ListQueryParams = {}) =>
-    request<PageResponse<AgentTask>>(`/api/v1/agents/${id}/tasks${buildQuery(params, 25)}`),
+  listAgentTasks: (id: string, params: ListQueryParams = {}, signal?: AbortSignal) =>
+    request<PageResponse<AgentTask>>(`/api/v1/agents/${id}/tasks${buildQuery(params, 25)}`, {
+      signal,
+    }),
   registerAgent: (payload: {
     name: string
     os: string

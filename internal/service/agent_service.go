@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/crypto"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/eventstore"
@@ -23,6 +24,7 @@ type AgentService struct {
 	auditRepo  domain.AuditRepository
 	poolRepo   domain.PoolRepository
 	eventStore eventstore.Store
+	cache      cache.Store
 	encKey     []byte
 
 	hookMu      sync.RWMutex
@@ -53,6 +55,31 @@ func (s *AgentService) SetEventStore(es eventstore.Store) {
 	s.hookMu.Lock()
 	s.eventStore = es
 	s.hookMu.Unlock()
+}
+
+func (s *AgentService) SetCache(c cache.Store) {
+	s.hookMu.Lock()
+	s.cache = c
+	s.hookMu.Unlock()
+}
+
+func (s *AgentService) getCache() cache.Store {
+	s.hookMu.RLock()
+	c := s.cache
+	s.hookMu.RUnlock()
+	return c
+}
+
+func (s *AgentService) invalidateAgentCache(ctx context.Context, agentID uuid.UUID, tokenHash string) {
+	c := s.getCache()
+	if c == nil {
+		return
+	}
+	if tokenHash != "" {
+		_ = c.Delete(ctx, "auth:agent:"+tokenHash)
+	}
+	_ = c.DeletePrefix(ctx, "agent:detail:"+agentID.String()+":")
+	_ = c.Delete(ctx, "dashboard:overview")
 }
 
 func (s *AgentService) emitEvent(ev domain.Event) {
@@ -194,6 +221,7 @@ func (s *AgentService) DrainAgent(ctx context.Context, id uuid.UUID, actor *doma
 		Message:      fmt.Sprintf("Agent %s transitioned to %s", ag.Name, nextStatus),
 		IPAddress:    ip,
 	})
+	s.invalidateAgentCache(ctx, id, ag.TokenHash)
 	return s.agentRepo.GetByID(ctx, id)
 }
 
@@ -222,6 +250,7 @@ func (s *AgentService) ResumeAgent(ctx context.Context, id uuid.UUID, actor *dom
 		Message:      fmt.Sprintf("Agent %s resumed (%s)", ag.Name, nextStatus),
 		IPAddress:    ip,
 	})
+	s.invalidateAgentCache(ctx, id, ag.TokenHash)
 	if nextStatus == domain.AgentOnline {
 		s.notifySlotFreed()
 	}
@@ -229,30 +258,36 @@ func (s *AgentService) ResumeAgent(ctx context.Context, id uuid.UUID, actor *dom
 }
 
 func (s *AgentService) GetAgentDetail(ctx context.Context, id uuid.UUID, window time.Duration) (*domain.AgentDetail, error) {
-	ag, err := s.agentRepo.GetByID(ctx, id)
-	if err != nil {
-		return nil, err
+	if window <= 0 {
+		window = time.Hour
 	}
-	stats, err := s.agentRepo.GetAgentTaskStats(ctx, id)
-	if err != nil || stats == nil {
-		stats = &domain.AgentTaskStats{}
-	}
-	tasks, _, _ := s.agentRepo.ListTasksByAgent(ctx, id, domain.AgentTaskFilter{
-		PageParams: domain.PageParams{Limit: 10, Offset: 0},
+	key := fmt.Sprintf("agent:detail:%s:%s", id.String(), window.String())
+	return cache.GetOrLoad(ctx, s.getCache(), key, 3*time.Second, func(c context.Context) (*domain.AgentDetail, error) {
+		ag, err := s.agentRepo.GetByID(c, id)
+		if err != nil {
+			return nil, err
+		}
+		stats, err := s.agentRepo.GetAgentTaskStats(c, id)
+		if err != nil || stats == nil {
+			stats = &domain.AgentTaskStats{}
+		}
+		tasks, _, _ := s.agentRepo.ListTasksByAgent(c, id, domain.AgentTaskFilter{
+			PageParams: domain.PageParams{Limit: 10, Offset: 0},
+		})
+		if tasks == nil {
+			tasks = []domain.AgentTask{}
+		}
+		history, _ := s.GetAgentMetrics(c, id, window, 240)
+		if history == nil {
+			history = []domain.AgentMetricPoint{}
+		}
+		return &domain.AgentDetail{
+			Agent:         *ag,
+			Stats:         *stats,
+			MetricHistory: history,
+			RecentTasks:   tasks,
+		}, nil
 	})
-	if tasks == nil {
-		tasks = []domain.AgentTask{}
-	}
-	history, _ := s.GetAgentMetrics(ctx, id, window, 240)
-	if history == nil {
-		history = []domain.AgentMetricPoint{}
-	}
-	return &domain.AgentDetail{
-		Agent:         *ag,
-		Stats:         *stats,
-		MetricHistory: history,
-		RecentTasks:   tasks,
-	}, nil
 }
 
 func (s *AgentService) ListAgentTasks(ctx context.Context, id uuid.UUID, filter domain.AgentTaskFilter) ([]domain.AgentTask, int, error) {
@@ -283,6 +318,10 @@ func actorEmail(u *domain.User) string {
 }
 
 func (s *AgentService) RotateToken(ctx context.Context, id uuid.UUID, actor *domain.User, ip string) (*RegisterAgentResponse, error) {
+	existing, err := s.agentRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	rawSuffix, err := crypto.GenerateRandomToken(32)
 	if err != nil {
 		return nil, err
@@ -292,6 +331,7 @@ func (s *AgentService) RotateToken(ctx context.Context, id uuid.UUID, actor *dom
 	if err := s.agentRepo.UpdateToken(ctx, id, prefix, crypto.HashTokenSHA256(rawToken)); err != nil {
 		return nil, err
 	}
+	s.invalidateAgentCache(ctx, id, existing.TokenHash)
 	s.appendAudit(ctx, actor, "agent.token_rotated", "agent", id.String(), nil, ip)
 	agent, err := s.agentRepo.GetByID(ctx, id)
 	if err != nil {
@@ -301,9 +341,15 @@ func (s *AgentService) RotateToken(ctx context.Context, id uuid.UUID, actor *dom
 }
 
 func (s *AgentService) DeleteAgent(ctx context.Context, id uuid.UUID, actor *domain.User, ip string) error {
+	existing, _ := s.agentRepo.GetByID(ctx, id)
 	if err := s.agentRepo.Delete(ctx, id); err != nil {
 		return err
 	}
+	var oldHash string
+	if existing != nil {
+		oldHash = existing.TokenHash
+	}
+	s.invalidateAgentCache(ctx, id, oldHash)
 	s.appendAudit(ctx, actor, "agent.deleted", "agent", id.String(), nil, ip)
 	return nil
 }
@@ -312,9 +358,23 @@ func (s *AgentService) AuthenticateAgent(ctx context.Context, rawBearer string) 
 	if !strings.HasPrefix(rawBearer, "rwa_") {
 		return nil, domain.ErrUnauthorized
 	}
-	agent, err := s.agentRepo.GetByTokenHash(ctx, crypto.HashTokenSHA256(rawBearer))
+	hash := crypto.HashTokenSHA256(rawBearer)
+	c := s.getCache()
+	if c != nil {
+		if cached, ok, err := cache.GetJSON[domain.Agent](ctx, c, "auth:agent:"+hash); err == nil && ok {
+			ag := cached
+			ag.TokenHash = hash
+			return &ag, nil
+		}
+	}
+	agent, err := s.agentRepo.GetByTokenHash(ctx, hash)
 	if err != nil {
 		return nil, domain.ErrUnauthorized
+	}
+	if c != nil && agent != nil {
+		agCopy := *agent
+		agCopy.TokenHash = ""
+		_ = cache.SetJSON(ctx, c, "auth:agent:"+hash, agCopy, 30*time.Second)
 	}
 	return agent, nil
 }
@@ -393,6 +453,7 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 	if status == domain.AgentDraining && in.ActiveJobs == 0 {
 		if transitioned, trErr := s.agentRepo.MarkDrainingCompleteIfIdle(ctx, agent.ID); trErr == nil && transitioned {
 			status = domain.AgentDrained
+			s.invalidateAgentCache(ctx, agent.ID, agent.TokenHash)
 			s.emitEvent(domain.Event{
 				Category:     domain.EventCategoryAgentLifecycle,
 				EventType:    "agent.drained",
@@ -591,6 +652,7 @@ func (s *AgentService) CompleteTask(ctx context.Context, agent *domain.Agent, ta
 		}, "")
 	}
 	if transitioned, trErr := s.agentRepo.MarkDrainingCompleteIfIdle(ctx, agent.ID); trErr == nil && transitioned {
+		s.invalidateAgentCache(ctx, agent.ID, agent.TokenHash)
 		s.emitEvent(domain.Event{
 			Category:     domain.EventCategoryAgentLifecycle,
 			EventType:    "agent.drained",
@@ -601,6 +663,8 @@ func (s *AgentService) CompleteTask(ctx context.Context, agent *domain.Agent, ta
 			Status:       string(domain.AgentDrained),
 			Message:      fmt.Sprintf("Agent %s completed draining after task %s", agent.Name, task.RunnerName),
 		})
+	} else {
+		s.invalidateAgentCache(ctx, agent.ID, "")
 	}
 	s.notifySlotFreed()
 	return nil

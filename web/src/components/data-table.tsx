@@ -1,4 +1,17 @@
 import React, { useEffect, useId, useMemo, useState } from "react"
+import {
+  columnVisibilityFeature,
+  constructSortFn,
+  createSortedRowModel,
+  rowSortingFeature,
+  sortFn_basic,
+  tableFeatures,
+  useTable,
+  type ColumnDef,
+  type ColumnVisibilityState,
+  type RowData,
+  type SortingState,
+} from "@tanstack/react-table"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   ArrowUp01Icon,
@@ -20,7 +33,20 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import {
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
+import { SearchableCombobox } from "@/components/searchable-combobox"
+import {
+  clearTableColumnVisibility,
+  setTableColumnVisibility,
+  useAppSelector,
+} from "@/lib/store"
 import { cn } from "@/lib/utils"
 
 export type SortDirection = "asc" | "desc"
@@ -52,6 +78,7 @@ export interface DataTableFilter {
   value: string
   onChange: (value: string) => void
   options: DataTableFilterOption[]
+  searchable?: boolean
   className?: string
 }
 
@@ -64,13 +91,14 @@ export interface DataTablePagination {
   pageSizeOptions?: number[]
 }
 
-export interface DataTableProps<T> {
+export interface DataTableProps<T extends object> {
   id: string
   caption: string
   data: T[]
   columns: DataTableColumn<T>[]
   getRowId: (row: T) => string
   loading?: boolean
+  fetching?: boolean
   emptyMessage?: string
   searchValue?: string
   onSearchChange?: (value: string) => void
@@ -83,36 +111,30 @@ export interface DataTableProps<T> {
   pagination?: DataTablePagination
   toolbarActions?: React.ReactNode
   onRowClick?: (row: T) => void
+  hideColumnPicker?: boolean
   className?: string
 }
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" })
 
-function loadColumnVisibility(storageKey: string, columns: DataTableColumn<any>[]): Record<string, boolean> {
-  const defaults: Record<string, boolean> = {}
-  for (const c of columns) {
-    defaults[c.id] = c.defaultVisible !== false
-  }
-  if (typeof window === "undefined") {
-    return defaults
-  }
-  try {
-    const raw = window.localStorage.getItem(storageKey)
-    if (!raw) return defaults
-    const parsed = JSON.parse(raw) as Record<string, boolean>
-    return { ...defaults, ...parsed }
-  } catch {
-    return defaults
-  }
-}
+const collatorSortFn = constructSortFn({
+  sort: (a: unknown, b: unknown) => collator.compare(String(a ?? ""), String(b ?? "")),
+})
 
-export function DataTable<T>({
+const dtFeatures = tableFeatures({
+  columnVisibilityFeature,
+  rowSortingFeature,
+  sortedRowModel: createSortedRowModel(),
+})
+
+export function DataTable<T extends object>({
   id,
   caption,
   data,
   columns,
   getRowId,
   loading = false,
+  fetching = false,
   emptyMessage = "No records found.",
   searchValue,
   onSearchChange,
@@ -125,17 +147,14 @@ export function DataTable<T>({
   pagination,
   toolbarActions,
   onRowClick,
+  hideColumnPicker = false,
   className,
 }: DataTableProps<T>) {
   const captionId = useId()
   const searchInputId = useId()
-  const storageKey = `runway:dt:cols:${id}`
 
-  const [visibleMap, setVisibleMap] = useState<Record<string, boolean>>(() =>
-    loadColumnVisibility(storageKey, columns)
-  )
-  const [localSortBy, setLocalSortBy] = useState<string>("")
-  const [localSortDir, setLocalSortDir] = useState<SortDirection>("asc")
+  const storedVisibility = useAppSelector((s) => s.tableColumnVisibility[id])
+  const [localSorting, setLocalSorting] = useState<SortingState>([])
   const [announcement, setAnnouncement] = useState("")
   const [localSearch, setLocalSearch] = useState(searchValue ?? "")
 
@@ -151,55 +170,94 @@ export function DataTable<T>({
       if (localSearch !== (searchValue ?? "")) {
         onSearchChange(localSearch)
       }
-    }, 250)
+    }, 220)
     return () => window.clearTimeout(timer)
   }, [localSearch, onSearchChange, searchValue])
 
-  useEffect(() => {
-    if (typeof window === "undefined") return
-    try {
-      window.localStorage.setItem(storageKey, JSON.stringify(visibleMap))
-    } catch {
-      // ignore storage quota errors
+  const defaultVisibility = useMemo<ColumnVisibilityState>(() => {
+    const out: ColumnVisibilityState = {}
+    for (const c of columns) {
+      out[c.id] = c.defaultVisible !== false
     }
-  }, [storageKey, visibleMap])
+    return out
+  }, [columns])
 
-  const activeSortBy = controlledSortBy !== undefined ? controlledSortBy : localSortBy
-  const activeSortDir = controlledSortDir !== undefined ? controlledSortDir : localSortDir
-
-  const visibleColumns = useMemo(
-    () => columns.filter((col) => visibleMap[col.id] !== false),
-    [columns, visibleMap]
+  const columnVisibility = useMemo<ColumnVisibilityState>(
+    () => ({ ...defaultVisibility, ...storedVisibility }),
+    [defaultVisibility, storedVisibility]
   )
 
-  const sortedRows = useMemo(() => {
-    if (onSortChange || !activeSortBy) {
-      return data
+  const sortingState = useMemo<SortingState>(() => {
+    if (onSortChange) {
+      if (!controlledSortBy) return []
+      return [{ id: controlledSortBy, desc: controlledSortDir === "desc" }]
     }
-    const col = columns.find((c) => (c.sortKey || c.id) === activeSortBy)
-    if (!col) return data
+    return localSorting
+  }, [onSortChange, controlledSortBy, controlledSortDir, localSorting])
 
-    const dirFactor = activeSortDir === "asc" ? 1 : -1
-    const getVal = (row: T): string | number => {
-      if (col.sortValue) return col.sortValue(row)
-      if (col.accessorKey) {
-        const v = (row as Record<string, unknown>)[col.accessorKey]
-        if (typeof v === "number") return v
-        if (v === null || v === undefined) return ""
-        return String(v)
-      }
-      return ""
+  const columnMetaById = useMemo(() => {
+    const map = new Map<string, DataTableColumn<T>>()
+    for (const col of columns) {
+      map.set(col.id, col)
     }
+    return map
+  }, [columns])
 
-    return [...data].sort((a, b) => {
-      const va = getVal(a)
-      const vb = getVal(b)
-      if (col.sortType === "number" || (typeof va === "number" && typeof vb === "number")) {
-        return dirFactor * (Number(va) - Number(vb))
-      }
-      return dirFactor * collator.compare(String(va), String(vb))
-    })
-  }, [data, columns, activeSortBy, activeSortDir, onSortChange])
+  type TableRowItem = T & RowData
+
+  const columnDefs = useMemo<ColumnDef<typeof dtFeatures, TableRowItem, unknown>[]>(() => {
+    return columns.map((col) => ({
+      id: col.id,
+      header: () => col.header,
+      accessorFn: (row: TableRowItem) => {
+        if (col.sortValue) return col.sortValue(row)
+        if (col.accessorKey) return row[col.accessorKey]
+        return ""
+      },
+      cell: (ctx) => col.cell(ctx.row.original),
+      enableHiding: col.hideable !== false,
+      enableSorting: Boolean(col.sortable),
+      sortingFn: col.sortType === "number" ? sortFn_basic : collatorSortFn,
+    }))
+  }, [columns])
+
+  const table = useTable<typeof dtFeatures, TableRowItem>({
+    features: dtFeatures,
+    data: data as TableRowItem[],
+    columns: columnDefs,
+    getRowId: (row) => getRowId(row),
+    manualSorting: Boolean(onSortChange),
+    enableSortingRemoval: false,
+    state: {
+      columnVisibility,
+      sorting: sortingState,
+    },
+    onColumnVisibilityChange: (updater) => {
+      const next = typeof updater === "function" ? updater(columnVisibility) : updater
+      const remaining = columns.filter((c) => next[c.id] !== false).length
+      if (remaining === 0) return
+      setTableColumnVisibility(id, next)
+    },
+    onSortingChange: (updater) => {
+      if (onSortChange) return
+      const next = typeof updater === "function" ? updater(localSorting) : updater
+      setLocalSorting(next)
+    },
+  })
+
+  const visibleColumns = table.getVisibleLeafColumns()
+  const rows = onSortChange ? table.getCoreRowModel().rows : table.getSortedRowModel().rows
+
+  const activeSortBy =
+    onSortChange && controlledSortBy !== undefined
+      ? controlledSortBy
+      : localSorting[0]?.id ?? ""
+  const activeSortDir: SortDirection =
+    onSortChange && controlledSortDir !== undefined
+      ? controlledSortDir
+      : localSorting[0]?.desc
+        ? "desc"
+        : "asc"
 
   const handleSort = (col: DataTableColumn<T>) => {
     if (!col.sortable) return
@@ -210,29 +268,11 @@ export function DataTable<T>({
     if (onSortChange) {
       onSortChange(key, nextDir)
     } else {
-      setLocalSortBy(key)
-      setLocalSortDir(nextDir)
+      setLocalSorting([{ id: col.id, desc: nextDir === "desc" }])
     }
     setAnnouncement(
-      `Sorted by ${col.header}, ${nextDir === "asc" ? "ascending" : "descending"}, ${sortedRows.length} rows`
+      `Sorted by ${col.header}, ${nextDir === "asc" ? "ascending" : "descending"}, ${rows.length} rows`
     )
-  }
-
-  const toggleColumn = (colId: string, checked: boolean) => {
-    setVisibleMap((prev) => {
-      const next = { ...prev, [colId]: checked }
-      const remaining = columns.filter((c) => next[c.id] !== false).length
-      if (remaining === 0) return prev
-      return next
-    })
-  }
-
-  const resetColumns = () => {
-    const defaults: Record<string, boolean> = {}
-    for (const c of columns) {
-      defaults[c.id] = c.defaultVisible !== false
-    }
-    setVisibleMap(defaults)
   }
 
   const hasActiveFilters =
@@ -240,16 +280,22 @@ export function DataTable<T>({
     Boolean(filters?.some((f) => f.value !== "" && f.value !== "all"))
 
   const pageSizeOptions = pagination?.pageSizeOptions ?? [10, 25, 50, 100]
-  const total = pagination?.total ?? sortedRows.length
+  const total = pagination?.total ?? rows.length
   const pageSize = pagination?.pageSize ?? 25
   const page = pagination?.page ?? 1
   const totalPages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)))
   const startIdx = total === 0 ? 0 : (page - 1) * pageSize + 1
-  const endIdx = total === 0 ? 0 : Math.min(total, (page - 1) * pageSize + sortedRows.length)
+  const endIdx = total === 0 ? 0 : Math.min(total, (page - 1) * pageSize + rows.length)
+
+  const showToolbar =
+    Boolean(onSearchChange) ||
+    Boolean(filters && filters.length > 0) ||
+    (!hideColumnPicker && columns.some((c) => c.hideable !== false)) ||
+    Boolean(toolbarActions)
 
   return (
     <div className={cn("space-y-3", className)}>
-      {(onSearchChange || (filters && filters.length > 0) || columns.some((c) => c.hideable !== false) || toolbarActions) && (
+      {showToolbar && (
         <div className="flex flex-wrap items-center justify-between gap-2.5">
           <div className="flex flex-wrap items-center gap-2 flex-1 min-w-0">
             {onSearchChange && (
@@ -290,19 +336,31 @@ export function DataTable<T>({
             )}
 
             {filters?.map((f) => (
-              <div key={f.id} className={cn("min-w-36", f.className)}>
-                <Select value={f.value} onValueChange={(v) => f.onChange(v || "all")}>
-                  <SelectTrigger aria-label={f.label} className="h-8 text-xs w-full">
-                    <SelectValue placeholder={f.label} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {f.options.map((opt) => (
-                      <SelectItem key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+              <div key={f.id} className={cn("min-w-40", f.className)}>
+                {f.searchable ? (
+                  <SearchableCombobox
+                    ariaLabel={f.label}
+                    options={f.options}
+                    value={f.value}
+                    onValueChange={(v) => f.onChange(v || "all")}
+                    placeholder={f.label}
+                    emptyMessage={`No matching ${f.label.toLowerCase()}`}
+                    className="h-8 text-xs"
+                  />
+                ) : (
+                  <Select value={f.value} onValueChange={(v) => f.onChange(v || "all")}>
+                    <SelectTrigger aria-label={f.label} className="h-8 text-xs w-full">
+                      <SelectValue placeholder={f.label} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {f.options.map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
               </div>
             ))}
 
@@ -325,33 +383,41 @@ export function DataTable<T>({
           <div className="flex flex-wrap items-center gap-2">
             {toolbarActions}
 
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={
-                  <Button type="button" variant="outline" size="sm" className="h-8 text-xs">
-                    <HugeiconsIcon icon={Settings02Icon} strokeWidth={2} className="size-3.5" />
-                    <span>Columns</span>
-                  </Button>
-                }
-              />
-              <DropdownMenuContent align="end" className="w-48">
-                <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                {columns
-                  .filter((c) => c.hideable !== false)
-                  .map((col) => (
-                    <DropdownMenuCheckboxItem
-                      key={col.id}
-                      checked={visibleMap[col.id] !== false}
-                      onCheckedChange={(checked) => toggleColumn(col.id, Boolean(checked))}
-                    >
-                      {col.header}
-                    </DropdownMenuCheckboxItem>
-                  ))}
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={resetColumns}>Reset columns</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            {!hideColumnPicker && columns.some((c) => c.hideable !== false) && (
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button type="button" variant="outline" size="sm" className="h-8 text-xs">
+                      <HugeiconsIcon icon={Settings02Icon} strokeWidth={2} className="size-3.5" />
+                      <span>Columns</span>
+                    </Button>
+                  }
+                />
+                <DropdownMenuContent align="end" className="w-48">
+                  <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  {table
+                    .getAllLeafColumns()
+                    .filter((col) => col.getCanHide())
+                    .map((col) => {
+                      const def = columnMetaById.get(col.id)
+                      return (
+                        <DropdownMenuCheckboxItem
+                          key={col.id}
+                          checked={col.getIsVisible()}
+                          onCheckedChange={(checked) => col.toggleVisibility(Boolean(checked))}
+                        >
+                          {def?.header ?? col.id}
+                        </DropdownMenuCheckboxItem>
+                      )
+                    })}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => clearTableColumnVisibility(id)}>
+                    Reset columns
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
           </div>
         </div>
       )}
@@ -360,13 +426,13 @@ export function DataTable<T>({
         {announcement}
       </div>
 
-      {loading && sortedRows.length === 0 ? (
+      {loading && rows.length === 0 ? (
         <div className="space-y-2 border border-border bg-card p-4">
           {Array.from({ length: 5 }).map((_, i) => (
             <Skeleton key={i} className="h-9 w-full" />
           ))}
         </div>
-      ) : !loading && sortedRows.length === 0 ? (
+      ) : !loading && rows.length === 0 ? (
         <div className="border border-dashed border-border bg-card/50 p-8 text-center text-xs text-muted-foreground">
           {emptyMessage}
         </div>
@@ -375,77 +441,95 @@ export function DataTable<T>({
           tabIndex={0}
           role="region"
           aria-labelledby={captionId}
-          className="runway-table-region border border-border bg-card focus-visible:outline-2 focus-visible:outline-ring"
+          className="relative runway-table-region border border-border bg-card focus-visible:outline-2 focus-visible:outline-ring"
         >
+          {fetching && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-primary/80 animate-pulse"
+            />
+          )}
           <table className="runway-table">
             <caption id={captionId} className="sr-only">
               {caption}
             </caption>
-            <thead>
-              <tr>
-                {visibleColumns.map((col) => {
-                  const key = col.sortKey || col.id
-                  const isSorted = col.sortable && activeSortBy === key
-                  const ariaSort = isSorted
-                    ? activeSortDir === "asc"
-                      ? "ascending"
-                      : "descending"
-                    : undefined
+            <TableHeader className="[&_tr]:border-b-0">
+              {table.getHeaderGroups().map((headerGroup) => (
+                <TableRow key={headerGroup.id} className="border-b-0 hover:bg-transparent">
+                  {headerGroup.headers.map((header) => {
+                    const colDef = columnMetaById.get(header.column.id)
+                    if (!colDef) return null
+                    const key = colDef.sortKey || colDef.id
+                    const isSorted = colDef.sortable && activeSortBy === key
+                    const ariaSort = isSorted
+                      ? activeSortDir === "asc"
+                        ? "ascending"
+                        : "descending"
+                      : undefined
 
-                  return (
-                    <th
-                      key={col.id}
-                      scope="col"
-                      aria-sort={ariaSort}
-                      className={col.headerClassName}
-                    >
-                      {col.sortable ? (
-                        <button
-                          type="button"
-                          className="runway-table-sort-btn"
-                          onClick={() => handleSort(col)}
-                        >
-                          <span>{col.header}</span>
-                          <HugeiconsIcon
-                            icon={ArrowUp01Icon}
-                            strokeWidth={2}
-                            aria-hidden="true"
-                            className="runway-sort-icon size-3.5 shrink-0"
-                          />
-                        </button>
-                      ) : (
-                        col.header
-                      )}
-                    </th>
-                  )
-                })}
-              </tr>
-            </thead>
-            <tbody>
-              {sortedRows.map((row) => (
-                <tr
-                  key={getRowId(row)}
-                  onClick={onRowClick ? () => onRowClick(row) : undefined}
-                  className={onRowClick ? "cursor-pointer" : undefined}
+                    return (
+                      <TableHead
+                        key={header.id}
+                        scope="col"
+                        aria-sort={ariaSort}
+                        className={colDef.headerClassName}
+                      >
+                        {colDef.sortable ? (
+                          <button
+                            type="button"
+                            className="runway-table-sort-btn"
+                            onClick={() => handleSort(colDef)}
+                          >
+                            <span>{colDef.header}</span>
+                            <HugeiconsIcon
+                              icon={ArrowUp01Icon}
+                              strokeWidth={2}
+                              aria-hidden="true"
+                              className="runway-sort-icon size-3.5 shrink-0"
+                            />
+                          </button>
+                        ) : (
+                          colDef.header
+                        )}
+                      </TableHead>
+                    )
+                  })}
+                </TableRow>
+              ))}
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => (
+                <TableRow
+                  key={row.id}
+                  onClick={onRowClick ? () => onRowClick(row.original) : undefined}
+                  className={cn("border-b-0", onRowClick && "cursor-pointer")}
                 >
-                  {visibleColumns.map((col, idx) => {
-                    const isHeader = col.isRowHeader || (idx === 0 && !visibleColumns.some((c) => c.isRowHeader))
+                  {row.getVisibleCells().map((cell, idx) => {
+                    const colDef = columnMetaById.get(cell.column.id)
+                    if (!colDef) return null
+                    const isHeader =
+                      colDef.isRowHeader ||
+                      (idx === 0 && !visibleColumns.some((c) => columnMetaById.get(c.id)?.isRowHeader))
                     if (isHeader) {
                       return (
-                        <th key={col.id} scope="row" className={col.cellClassName}>
-                          {col.cell(row)}
+                        <th key={cell.id} scope="row" className={colDef.cellClassName}>
+                          <table.FlexRender cell={cell} />
                         </th>
                       )
                     }
                     return (
-                      <td key={col.id} data-label={col.header} className={col.cellClassName}>
-                        {col.cell(row)}
-                      </td>
+                      <TableCell
+                        key={cell.id}
+                        data-label={colDef.header}
+                        className={colDef.cellClassName}
+                      >
+                        <table.FlexRender cell={cell} />
+                      </TableCell>
                     )
                   })}
-                </tr>
+                </TableRow>
               ))}
-            </tbody>
+            </TableBody>
           </table>
         </div>
       )}

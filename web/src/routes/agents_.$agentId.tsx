@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router"
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   ArrowLeft01Icon,
@@ -13,6 +14,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { AreaLineMetricChart, type TimeSeriesPoint } from "@/components/ui/chart"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -37,7 +39,14 @@ import {
 import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
 import { StatusBadge } from "@/components/status-badge"
 import { api } from "@/lib/api"
-import type { AgentDetail, AgentMetricPoint, AgentTask, EventRecord, RegisterAgentResponse } from "@/lib/types"
+import {
+  agentDetailQueryOptions,
+  agentTasksQueryOptions,
+  eventsQueryOptions,
+  queryKeys,
+} from "@/lib/query"
+import { useAppSelector } from "@/lib/store"
+import type { AgentMetricPoint, AgentTask, EventRecord, RegisterAgentResponse } from "@/lib/types"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/agents_/$agentId")({
@@ -62,42 +71,33 @@ function formatMS(ms?: number): string {
   return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`
 }
 
-function MetricChart({
+function MetricCard({
   title,
   unit,
   color,
   points,
   getValue,
-  maxScale = 100,
 }: {
   title: string
   unit: string
   color: string
   points: AgentMetricPoint[]
   getValue: (pt: AgentMetricPoint) => number
-  maxScale?: number
 }) {
   const latest = points.length > 0 ? getValue(points[points.length - 1]) : 0
   const peak = points.reduce((acc, p) => Math.max(acc, getValue(p)), 0)
-  const width = 420
-  const height = 96
-  const padX = 4
-  const padY = 8
 
-  const coords = points.map((pt, i) => {
-    const x =
-      points.length <= 1
-        ? width / 2
-        : padX + (i / (points.length - 1)) * (width - padX * 2)
-    const v = Math.min(maxScale, Math.max(0, getValue(pt)))
-    const y = height - padY - (v / Math.max(1, maxScale)) * (height - padY * 2)
-    return `${x.toFixed(1)},${y.toFixed(1)}`
-  })
-  const linePath = coords.length > 0 ? `M ${coords.join(" L ")}` : ""
-  const areaPath =
-    coords.length > 1
-      ? `${linePath} L ${(width - padX).toFixed(1)},${height - padY} L ${padX},${height - padY} Z`
-      : ""
+  const series = useMemo<TimeSeriesPoint[]>(
+    () =>
+      points.map((pt) => ({
+        label: new Date(pt.timestamp).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        value: Number(getValue(pt).toFixed(2)),
+      })),
+    [points, getValue]
+  )
 
   return (
     <Card>
@@ -111,23 +111,12 @@ function MetricChart({
         </div>
       </CardHeader>
       <CardContent className="space-y-1.5">
-        {points.length === 0 ? (
-          <div className="flex h-24 items-center justify-center border border-dashed border-border text-[11px] text-muted-foreground">
-            Waiting for telemetry samples
-          </div>
-        ) : (
-          <svg
-            viewBox={`0 0 ${width} ${height}`}
-            className="h-24 w-full overflow-visible border border-border/60 bg-muted/20"
-            role="img"
-            aria-label={`${title} history chart`}
-          >
-            {areaPath && <path d={areaPath} fill={color} fillOpacity={0.14} />}
-            {linePath && (
-              <path d={linePath} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" />
-            )}
-          </svg>
-        )}
+        <AreaLineMetricChart
+          data={series}
+          ariaLabel={`${title} telemetry history chart`}
+          color={color}
+          height={115}
+        />
         <div className="flex items-center justify-between text-[10px] text-muted-foreground">
           <span>{points.length} samples</span>
           <span>
@@ -143,15 +132,12 @@ function MetricChart({
 function AgentDetailPage() {
   const { agentId } = Route.useParams()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const livePolling = useAppSelector((s) => s.livePolling)
 
-  const [detail, setDetail] = useState<AgentDetail | null>(null)
-  const [loading, setLoading] = useState(true)
   const [windowRange, setWindowRange] = useState("1h")
 
   // Tasks table state
-  const [tasks, setTasks] = useState<AgentTask[]>([])
-  const [tasksTotal, setTasksTotal] = useState(0)
-  const [tasksLoading, setTasksLoading] = useState(false)
   const [taskPage, setTaskPage] = useState(1)
   const [taskPageSize, setTaskPageSize] = useState(10)
   const [taskSearch, setTaskSearch] = useState("")
@@ -160,9 +146,6 @@ function AgentDetailPage() {
   const [taskSortDir, setTaskSortDir] = useState<SortDirection>("desc")
 
   // Events table state
-  const [events, setEvents] = useState<EventRecord[]>([])
-  const [eventsTotal, setEventsTotal] = useState(0)
-  const [eventsLoading, setEventsLoading] = useState(false)
   const [eventPage, setEventPage] = useState(1)
   const [eventPageSize, setEventPageSize] = useState(10)
   const [eventSearch, setEventSearch] = useState("")
@@ -170,74 +153,104 @@ function AgentDetailPage() {
   const [issued, setIssued] = useState<RegisterAgentResponse | null>(null)
   const [deleteOpen, setDeleteOpen] = useState(false)
 
-  const loadDetail = useCallback(async () => {
-    try {
-      const res = await api.getAgent(agentId, windowRange)
-      setDetail(res)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load agent details")
-    } finally {
-      setLoading(false)
+  const detailQuery = useQuery({
+    ...agentDetailQueryOptions(agentId, windowRange),
+    placeholderData: keepPreviousData,
+    refetchInterval: (query) => {
+      if (!livePolling) return false
+      return query.state.data?.agent.status === "draining" ? 4_000 : 10_000
+    },
+  })
+
+  const tasksQuery = useQuery({
+    ...agentTasksQueryOptions(agentId, {
+      limit: taskPageSize,
+      page: taskPage,
+      status: taskStatus,
+      search: taskSearch.trim() || undefined,
+      sort_by: taskSortBy,
+      sort_dir: taskSortDir,
+    }),
+    placeholderData: keepPreviousData,
+    refetchInterval: livePolling ? 10_000 : false,
+  })
+
+  const eventsQuery = useQuery({
+    ...eventsQueryOptions({
+      resource_id: agentId,
+      limit: eventPageSize,
+      page: eventPage,
+      search: eventSearch.trim() || undefined,
+    }),
+    placeholderData: keepPreviousData,
+  })
+
+  useEffect(() => {
+    if (detailQuery.error) {
+      toast.error(
+        detailQuery.error instanceof Error
+          ? detailQuery.error.message
+          : "Failed to load agent details"
+      )
     }
-  }, [agentId, windowRange])
+  }, [detailQuery.error])
 
-  const loadTasks = useCallback(async () => {
-    setTasksLoading(true)
-    try {
-      const res = await api.listAgentTasks(agentId, {
-        limit: taskPageSize,
-        page: taskPage,
-        status: taskStatus,
-        search: taskSearch.trim() || undefined,
-        sort_by: taskSortBy,
-        sort_dir: taskSortDir,
-      })
-      setTasks(res.items)
-      setTasksTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load agent tasks")
-    } finally {
-      setTasksLoading(false)
+  useEffect(() => {
+    if (tasksQuery.error) {
+      toast.error(
+        tasksQuery.error instanceof Error ? tasksQuery.error.message : "Failed to load agent tasks"
+      )
     }
-  }, [agentId, taskPage, taskPageSize, taskStatus, taskSearch, taskSortBy, taskSortDir])
+  }, [tasksQuery.error])
 
-  const loadEvents = useCallback(async () => {
-    setEventsLoading(true)
-    try {
-      const res = await api.listEvents({
-        resource_id: agentId,
-        limit: eventPageSize,
-        page: eventPage,
-        search: eventSearch.trim() || undefined,
-      })
-      setEvents(res.items)
-      setEventsTotal(res.total)
-    } catch {
-      // ignore if eventstore disabled
-    } finally {
-      setEventsLoading(false)
-    }
-  }, [agentId, eventPage, eventPageSize, eventSearch])
+  const drainMutation = useMutation({
+    mutationFn: () => api.drainAgent(agentId),
+    onSuccess: (res) => {
+      toast.success(`Agent ${res.name} status: ${res.status}`)
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Drain failed")
+    },
+  })
 
-  useEffect(() => {
-    void loadDetail()
-  }, [loadDetail])
+  const resumeMutation = useMutation({
+    mutationFn: () => api.resumeAgent(agentId),
+    onSuccess: (res) => {
+      toast.success(`Agent ${res.name} resumed (${res.status})`)
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Resume failed")
+    },
+  })
 
-  useEffect(() => {
-    void loadTasks()
-  }, [loadTasks])
+  const rotateMutation = useMutation({
+    mutationFn: () => api.rotateAgentToken(agentId),
+    onSuccess: (res) => {
+      setIssued(res)
+      toast.success("Agent token rotated")
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Token rotation failed")
+    },
+  })
 
-  useEffect(() => {
-    void loadEvents()
-  }, [loadEvents])
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void loadDetail()
-      void loadTasks()
-    }, 8000)
-    return () => window.clearInterval(timer)
-  }, [loadDetail, loadTasks])
+  const deleteMutation = useMutation({
+    mutationFn: () => api.deleteAgent(agentId),
+    onSuccess: () => {
+      toast.success(`Deleted agent ${detailQuery.data?.agent.name ?? ""}`)
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+      void navigate({ to: "/agents" })
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Delete failed")
+    },
+  })
 
   const taskColumns: DataTableColumn<AgentTask>[] = useMemo(
     () => [
@@ -336,7 +349,9 @@ function AgentDetailPage() {
     []
   )
 
-  if (loading && !detail) {
+  const detail = detailQuery.data
+
+  if (detailQuery.isPending && !detail) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-10 w-64" />
@@ -365,47 +380,8 @@ function AgentDetailPage() {
 
   const { agent, stats, metric_history } = detail
   const m = agent.metrics ?? {}
-
-  const handleDrain = async () => {
-    try {
-      const res = await api.drainAgent(agent.id)
-      toast.success(`Agent ${agent.name} status: ${res.status}`)
-      void loadDetail()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Drain failed")
-    }
-  }
-
-  const handleResume = async () => {
-    try {
-      const res = await api.resumeAgent(agent.id)
-      toast.success(`Agent ${agent.name} resumed (${res.status})`)
-      void loadDetail()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Resume failed")
-    }
-  }
-
-  const handleRotate = async () => {
-    try {
-      const res = await api.rotateAgentToken(agent.id)
-      setIssued(res)
-      toast.success("Agent token rotated")
-      void loadDetail()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Token rotation failed")
-    }
-  }
-
-  const confirmDelete = async () => {
-    try {
-      await api.deleteAgent(agent.id)
-      toast.success(`Deleted agent ${agent.name}`)
-      await navigate({ to: "/agents" })
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Delete failed")
-    }
-  }
+  const tasksTotal = tasksQuery.data?.total ?? 0
+  const eventsTotal = eventsQuery.data?.total ?? 0
 
   return (
     <div className="space-y-5">
@@ -428,7 +404,8 @@ function AgentDetailPage() {
             )}
           </div>
           <p className="text-xs text-muted-foreground font-mono">
-            {agent.hostname || agent.token_prefix} · {agent.os}/{agent.arch} · v{agent.version || "dev"}
+            {agent.hostname || agent.token_prefix} · {agent.os}/{agent.arch} · v
+            {agent.version || "dev"}
             {agent.pool_name ? ` · Pool: ${agent.pool_name}` : ""}
           </p>
         </div>
@@ -445,12 +422,28 @@ function AgentDetailPage() {
               <SelectItem value="24h">Last 24h</SelectItem>
             </SelectContent>
           </Select>
-          <Button type="button" variant="outline" size="sm" onClick={() => void loadDetail()}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={detailQuery.isFetching}
+            onClick={() => {
+              void detailQuery.refetch()
+              void tasksQuery.refetch()
+              void eventsQuery.refetch()
+            }}
+          >
             <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
-            <span>Refresh</span>
+            <span>{detailQuery.isFetching ? "Refreshing..." : "Refresh"}</span>
           </Button>
           {agent.status === "draining" || agent.status === "drained" ? (
-            <Button type="button" variant="outline" size="sm" onClick={() => void handleResume()}>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={resumeMutation.isPending}
+              onClick={() => resumeMutation.mutate()}
+            >
               <HugeiconsIcon icon={PlayIcon} strokeWidth={2} />
               <span>Resume</span>
             </Button>
@@ -459,14 +452,20 @@ function AgentDetailPage() {
               type="button"
               variant="outline"
               size="sm"
-              disabled={agent.status === "offline"}
-              onClick={() => void handleDrain()}
+              disabled={agent.status === "offline" || drainMutation.isPending}
+              onClick={() => drainMutation.mutate()}
             >
               <HugeiconsIcon icon={PauseCircleIcon} strokeWidth={2} />
               <span>Drain</span>
             </Button>
           )}
-          <Button type="button" variant="outline" size="sm" onClick={() => void handleRotate()}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={rotateMutation.isPending}
+            onClick={() => rotateMutation.mutate()}
+          >
             <HugeiconsIcon icon={Key01Icon} strokeWidth={2} />
             <span>Rotate Token</span>
           </Button>
@@ -531,36 +530,35 @@ function AgentDetailPage() {
         </Card>
       </div>
 
-      {/* Telemetry Charts */}
+      {/* TanStack Telemetry Charts */}
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <MetricChart
+        <MetricCard
           title="CPU Usage"
           unit="%"
           color="var(--chart-1)"
           points={metric_history}
           getValue={(p) => p.cpu_usage_percent}
         />
-        <MetricChart
+        <MetricCard
           title="Memory Usage"
           unit="%"
           color="var(--chart-2)"
           points={metric_history}
           getValue={(p) => p.memory_usage_percent}
         />
-        <MetricChart
+        <MetricCard
           title="Disk Usage"
           unit="%"
           color="var(--chart-3)"
           points={metric_history}
           getValue={(p) => p.disk_usage_percent}
         />
-        <MetricChart
-          title="Active Jobs"
+        <MetricCard
+          title="Load Avg (1m)"
           unit=""
           color="var(--chart-4)"
           points={metric_history}
-          getValue={(p) => p.active_jobs}
-          maxScale={Math.max(1, agent.max_concurrency)}
+          getValue={(p) => p.load_avg_1}
         />
       </div>
 
@@ -613,10 +611,11 @@ function AgentDetailPage() {
           <DataTable
             id={`agent-tasks-${agent.id}`}
             caption="Tasks executed by this agent"
-            data={tasks}
+            data={tasksQuery.data?.items ?? []}
             columns={taskColumns}
             getRowId={(t) => t.id}
-            loading={tasksLoading}
+            loading={tasksQuery.isPending}
+            fetching={tasksQuery.isFetching && !tasksQuery.isPending}
             emptyMessage="No tasks executed by this agent yet."
             searchValue={taskSearch}
             onSearchChange={(val) => {
@@ -628,6 +627,7 @@ function AgentDetailPage() {
               {
                 id: "status",
                 label: "Status",
+                searchable: true,
                 value: taskStatus,
                 onChange: (v) => {
                   setTaskPage(1)
@@ -667,10 +667,11 @@ function AgentDetailPage() {
           <DataTable
             id={`agent-events-${agent.id}`}
             caption="EventStore records for this agent"
-            data={events}
+            data={eventsQuery.data?.items ?? []}
             columns={eventColumns}
             getRowId={(ev) => ev.id}
-            loading={eventsLoading}
+            loading={eventsQuery.isPending}
+            fetching={eventsQuery.isFetching && !eventsQuery.isPending}
             emptyMessage="No events recorded for this agent yet."
             searchValue={eventSearch}
             onSearchChange={(val) => {
@@ -705,7 +706,11 @@ function AgentDetailPage() {
                   type="button"
                   size="xs"
                   variant="outline"
-                  onClick={() => void navigator.clipboard.writeText(issued.token).then(() => toast.success("Copied token"))}
+                  onClick={() =>
+                    void navigator.clipboard
+                      .writeText(issued.token)
+                      .then(() => toast.success("Copied token"))
+                  }
                 >
                   <HugeiconsIcon icon={Copy01Icon} strokeWidth={2} />
                   <span>Copy</span>
@@ -734,7 +739,7 @@ function AgentDetailPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={() => void confirmDelete()}>
+            <AlertDialogAction variant="destructive" onClick={() => deleteMutation.mutate()}>
               Delete Agent
             </AlertDialogAction>
           </AlertDialogFooter>

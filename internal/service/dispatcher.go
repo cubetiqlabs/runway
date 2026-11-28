@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/github"
@@ -37,6 +38,8 @@ type JobDispatcher struct {
 	auditRepo  domain.AuditRepository
 	orch       *orchestrator.Orchestrator
 
+	cacheMu       sync.RWMutex
+	cache         cache.Store
 	dispatchMu    sync.Mutex
 	drainMu       sync.Mutex
 	backoffMu     sync.Mutex
@@ -80,6 +83,25 @@ func NewJobDispatcher(
 	}
 }
 
+func (d *JobDispatcher) SetCache(c cache.Store) {
+	if d == nil {
+		return
+	}
+	d.cacheMu.Lock()
+	d.cache = c
+	d.cacheMu.Unlock()
+}
+
+func (d *JobDispatcher) getCache() cache.Store {
+	if d == nil {
+		return nil
+	}
+	d.cacheMu.RLock()
+	c := d.cache
+	d.cacheMu.RUnlock()
+	return c
+}
+
 func (d *JobDispatcher) Start(ctx context.Context) {
 	if d == nil {
 		return
@@ -87,6 +109,10 @@ func (d *JobDispatcher) Start(ctx context.Context) {
 	interval := d.sweepInterval
 	if interval <= 0 {
 		interval = defaultDispatcherSweepInterval
+	}
+	if c := d.getCache(); c != nil && c.ClusterEnabled() {
+		d.wg.Add(1)
+		go d.subscribeClusterWakeups(ctx, c)
 	}
 	d.wg.Add(1)
 	go func() {
@@ -110,13 +136,58 @@ func (d *JobDispatcher) Start(ctx context.Context) {
 	}()
 }
 
+func (d *JobDispatcher) subscribeClusterWakeups(ctx context.Context, c cache.Store) {
+	defer d.wg.Done()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		sub, err := c.Subscribe(ctx, cacheClusterSlotFreed)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				continue
+			}
+		}
+		d.consumeClusterWakeups(ctx, c.InstanceID(), sub)
+		_ = sub.Close()
+	}
+}
+
+func (d *JobDispatcher) consumeClusterWakeups(ctx context.Context, selfID string, sub cache.Subscription) {
+	ch := sub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sender, ok := <-ch:
+			if !ok {
+				return
+			}
+			if sender != selfID {
+				select {
+				case d.notifyCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}
+}
+
 func (d *JobDispatcher) Wait() {
 	if d != nil {
 		d.wg.Wait()
 	}
 }
 
-// Trigger wakes the background dispatcher immediately to drain queued jobs.
+// Trigger wakes the background dispatcher immediately and broadcasts slot availability across cluster replicas.
 func (d *JobDispatcher) Trigger() {
 	if d == nil {
 		return
@@ -124,6 +195,13 @@ func (d *JobDispatcher) Trigger() {
 	select {
 	case d.notifyCh <- struct{}{}:
 	default:
+	}
+	if c := d.getCache(); c != nil && c.ClusterEnabled() {
+		go func(store cache.Store) {
+			pubCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			_ = store.Publish(pubCtx, cacheClusterSlotFreed, store.InstanceID())
+		}(c)
 	}
 }
 
@@ -142,66 +220,15 @@ func (d *JobDispatcher) DispatchJob(ctx context.Context, job *domain.WorkflowJob
 		provider = "simulated"
 	}
 
-	d.dispatchMu.Lock()
-	activeInPool, err := d.runnerRepo.CountActiveInPool(ctx, pool.ID)
+	c := d.getCache()
+	rn, err := d.reserveRunnerAndClaimJob(ctx, c, job, pool, provider)
 	if err != nil {
-		d.dispatchMu.Unlock()
 		return err
 	}
-	if activeInPool >= pool.MaxConcurrency {
-		d.dispatchMu.Unlock()
-		return fmt.Errorf("%w: pool %q reached max_concurrency (%d)", domain.ErrCapacityFull, pool.Name, pool.MaxConcurrency)
+	if rn == nil {
+		return nil
 	}
-
-	if provider == "agent" && d.agentRepo != nil {
-		freeSlots, onlineAgents, err := d.agentRepo.CountAvailableSlotsForPool(ctx, pool)
-		if err != nil {
-			d.dispatchMu.Unlock()
-			return err
-		}
-		if onlineAgents == 0 {
-			d.dispatchMu.Unlock()
-			return fmt.Errorf("%w: no online runway-agent matching pool %q", domain.ErrCapacityFull, pool.Name)
-		}
-		if freeSlots <= 0 {
-			d.dispatchMu.Unlock()
-			return fmt.Errorf("%w: all online runway-agent workers for pool %q are at capacity", domain.ErrCapacityFull, pool.Name)
-		}
-	}
-
-	runnerName := buildRunnerName(pool.Slug, job.GitHubJobID)
-	now := time.Now().UTC()
-	rn := &domain.Runner{
-		PoolID:          &pool.ID,
-		InstallationID:  job.InstallationID,
-		Name:            runnerName,
-		Provider:        provider,
-		Labels:          pool.Labels,
-		Status:          domain.RunnerProvisioning,
-		Ephemeral:       true,
-		CurrentJobID:    &job.GitHubJobID,
-		LastHeartbeatAt: &now,
-	}
-	if err := d.runnerRepo.Create(ctx, rn); err != nil {
-		d.dispatchMu.Unlock()
-		return err
-	}
-
-	if d.jobRepo != nil {
-		reason := fmt.Sprintf("Provisioning runner %s on pool %s", runnerName, pool.Name)
-		claimed, claimErr := d.jobRepo.ClaimForProvisioning(ctx, job.ID, &pool.ID, &rn.ID, reason)
-		if claimErr != nil {
-			_ = d.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
-			d.dispatchMu.Unlock()
-			return claimErr
-		}
-		if !claimed {
-			_ = d.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
-			d.dispatchMu.Unlock()
-			return nil
-		}
-	}
-	d.dispatchMu.Unlock()
+	invalidateCacheKeys(ctx, c, cacheKeyOverview)
 
 	if ownerType == "" && job.InstallationID != nil && d.instRepo != nil {
 		if inst, instErr := d.instRepo.GetByID(ctx, *job.InstallationID); instErr == nil && inst != nil {
@@ -219,7 +246,7 @@ func (d *JobDispatcher) DispatchJob(ctx context.Context, job *domain.WorkflowJob
 				groupID = 1
 			}
 			req := github.JITConfigRequest{
-				Name:          runnerName,
+				Name:          rn.Name,
 				RunnerGroupID: groupID,
 				Labels:        mergeRunnerLabels(pool, job.Labels),
 			}
@@ -267,6 +294,74 @@ func (d *JobDispatcher) DispatchJob(ctx context.Context, job *domain.WorkflowJob
 
 	d.clearBackoff(job.ID)
 	return nil
+}
+
+func (d *JobDispatcher) reserveRunnerAndClaimJob(ctx context.Context, c cache.Store, job *domain.WorkflowJob, pool domain.RunnerPool, provider string) (*domain.Runner, error) {
+	d.dispatchMu.Lock()
+	defer d.dispatchMu.Unlock()
+
+	if c != nil && c.ClusterEnabled() {
+		lock, acquired, lockErr := cache.AcquireLockWithWait(ctx, c, "dispatch:pool:"+pool.ID.String(), 10*time.Second, 2*time.Second)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		if !acquired {
+			return nil, fmt.Errorf("%w: pool %q dispatch lock contended across cluster", domain.ErrCapacityFull, pool.Name)
+		}
+		defer func() { _ = lock.Release(context.Background()) }()
+	}
+
+	activeInPool, err := d.runnerRepo.CountActiveInPool(ctx, pool.ID)
+	if err != nil {
+		return nil, err
+	}
+	if activeInPool >= pool.MaxConcurrency {
+		return nil, fmt.Errorf("%w: pool %q reached max_concurrency (%d)", domain.ErrCapacityFull, pool.Name, pool.MaxConcurrency)
+	}
+
+	if provider == "agent" && d.agentRepo != nil {
+		freeSlots, onlineAgents, err := d.agentRepo.CountAvailableSlotsForPool(ctx, pool)
+		if err != nil {
+			return nil, err
+		}
+		if onlineAgents == 0 {
+			return nil, fmt.Errorf("%w: no online runway-agent matching pool %q", domain.ErrCapacityFull, pool.Name)
+		}
+		if freeSlots <= 0 {
+			return nil, fmt.Errorf("%w: all online runway-agent workers for pool %q are at capacity", domain.ErrCapacityFull, pool.Name)
+		}
+	}
+
+	runnerName := buildRunnerName(pool.Slug, job.GitHubJobID)
+	now := time.Now().UTC()
+	rn := &domain.Runner{
+		PoolID:          &pool.ID,
+		InstallationID:  job.InstallationID,
+		Name:            runnerName,
+		Provider:        provider,
+		Labels:          pool.Labels,
+		Status:          domain.RunnerProvisioning,
+		Ephemeral:       true,
+		CurrentJobID:    &job.GitHubJobID,
+		LastHeartbeatAt: &now,
+	}
+	if err := d.runnerRepo.Create(ctx, rn); err != nil {
+		return nil, err
+	}
+
+	if d.jobRepo != nil {
+		reason := fmt.Sprintf("Provisioning runner %s on pool %s", runnerName, pool.Name)
+		claimed, claimErr := d.jobRepo.ClaimForProvisioning(ctx, job.ID, &pool.ID, &rn.ID, reason)
+		if claimErr != nil {
+			_ = d.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
+			return nil, claimErr
+		}
+		if !claimed {
+			_ = d.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
+			return nil, nil
+		}
+	}
+	return rn, nil
 }
 
 // CleanupGitHubRunner deletes a pre-registered JIT runner on GitHub when provisioning failed or timed out
@@ -324,6 +419,15 @@ func (d *JobDispatcher) drainQueuedOnce(ctx context.Context) {
 	}
 	defer d.drainMu.Unlock()
 
+	c := d.getCache()
+	if c != nil && c.ClusterEnabled() {
+		lock, acquired, lockErr := c.AcquireLock(ctx, "dispatcher:drain", 25*time.Second)
+		if lockErr != nil || !acquired {
+			return
+		}
+		defer func() { _ = lock.Release(context.Background()) }()
+	}
+
 	sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -338,7 +442,7 @@ func (d *JobDispatcher) drainQueuedOnce(ctx context.Context) {
 		return
 	}
 
-	pools, err := d.poolRepo.ListEnabled(sweepCtx)
+	pools, err := cachedEnabledPools(sweepCtx, c, d.poolRepo)
 	if err != nil {
 		if sweepCtx.Err() == nil {
 			d.log.Warn("dispatcher failed to list enabled pools", zap.Error(err))

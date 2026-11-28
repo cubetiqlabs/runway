@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react"
+import React, { useEffect } from "react"
 import { Link, useLocation, useNavigate } from "@tanstack/react-router"
+import { useQueryClient } from "@tanstack/react-query"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   DashboardSquare02Icon,
@@ -15,6 +16,8 @@ import {
   Menu01Icon,
   Cancel01Icon,
   Activity01Icon,
+  PauseCircleIcon,
+  PlayIcon,
 } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -25,6 +28,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useAuth } from "@/lib/auth"
+import { prefetchRouteData } from "@/lib/query"
+import { setMobileNavOpen, toggleLivePolling, useAppSelector } from "@/lib/store"
 import { useTheme, type ThemeMode } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 
@@ -44,14 +49,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const { mode, setMode } = useTheme()
   const location = useLocation()
   const navigate = useNavigate()
-  const [mobileOpen, setMobileOpen] = useState(false)
+  const queryClient = useQueryClient()
+
+  const mobileOpen = useAppSelector((s) => s.mobileNavOpen)
+  const livePolling = useAppSelector((s) => s.livePolling)
 
   useEffect(() => {
     if (!mobileOpen) return
     const prevOverflow = document.body.style.overflow
     document.body.style.overflow = "hidden"
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMobileOpen(false)
+      if (e.key === "Escape") setMobileNavOpen(false)
     }
     window.addEventListener("keydown", onKeyDown)
     return () => {
@@ -78,7 +86,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <Link
             key={item.to}
             to={item.to}
-            onClick={() => setMobileOpen(false)}
+            preload="intent"
+            onMouseEnter={() => void prefetchRouteData(queryClient, item.to)}
+            onFocus={() => void prefetchRouteData(queryClient, item.to)}
+            onClick={() => setMobileNavOpen(false)}
             className={cn(
               "flex items-center gap-2.5 px-3 py-2 text-xs font-medium transition-colors border-l-2",
               active
@@ -127,7 +138,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="fixed inset-0 z-50 md:hidden flex">
           <div
             className="fixed inset-0 bg-black/50"
-            onClick={() => setMobileOpen(false)}
+            onClick={() => setMobileNavOpen(false)}
             aria-hidden="true"
           />
           <aside className="relative z-10 flex h-dvh w-64 flex-col overflow-hidden border-r border-sidebar-border bg-sidebar">
@@ -137,7 +148,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 type="button"
                 variant="ghost"
                 size="icon-sm"
-                onClick={() => setMobileOpen(false)}
+                onClick={() => setMobileNavOpen(false)}
                 aria-label="Close navigation"
               >
                 <HugeiconsIcon icon={Cancel01Icon} strokeWidth={2} />
@@ -157,7 +168,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               variant="ghost"
               size="icon-sm"
               className="md:hidden"
-              onClick={() => setMobileOpen(true)}
+              onClick={() => setMobileNavOpen(true)}
               aria-label="Open navigation"
             >
               <HugeiconsIcon icon={Menu01Icon} strokeWidth={2} />
@@ -168,6 +179,22 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
 
           <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant={livePolling ? "secondary" : "outline"}
+              size="sm"
+              aria-pressed={livePolling}
+              onClick={() => toggleLivePolling()}
+              title={livePolling ? "Pause live background polling" : "Resume live background polling"}
+            >
+              <HugeiconsIcon
+                icon={livePolling ? PauseCircleIcon : PlayIcon}
+                strokeWidth={2}
+                className="size-3.5"
+              />
+              <span className="hidden sm:inline">{livePolling ? "Live" : "Paused"}</span>
+            </Button>
+
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={

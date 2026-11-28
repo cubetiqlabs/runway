@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/service"
@@ -29,6 +30,7 @@ type ServerDeps struct {
 	Config        *config.Config
 	Log           *zap.Logger
 	ReadyCheck    ReadinessChecker
+	CacheStore    cache.Store
 	AuthSvc       *service.AuthService
 	WebhookSvc    *service.WebhookService
 	RunnerSvc     *service.RunnerService
@@ -99,9 +101,17 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 		return c.JSON(fiber.Map{"status": "ready"})
 	})
 
+	limiterStorage := func(prefix string) fiber.Storage {
+		if deps.CacheStore != nil && deps.CacheStore.ClusterEnabled() {
+			return newCacheFiberStorage(deps.CacheStore, prefix)
+		}
+		return nil
+	}
+
 	// GitHub App Webhook endpoint (HMAC-SHA256 verified inside service)
 	webhookHandler := NewWebhookHandler(deps.WebhookSvc)
 	webhookLimiter := limiter.New(limiter.Config{
+		Storage:    limiterStorage("ratelimit:webhook:"),
 		Max:        cfg.Security.WebhookRateMax,
 		Expiration: time.Minute,
 	})
@@ -110,6 +120,7 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 	// Public auth endpoint with brute-force rate limit
 	authHandler := NewAuthHandler(cfg, deps.AuthSvc)
 	loginLimiter := limiter.New(limiter.Config{
+		Storage:    limiterStorage("ratelimit:login:"),
 		Max:        cfg.Security.LoginRateMax,
 		Expiration: time.Minute,
 	})
@@ -121,6 +132,7 @@ func NewServer(deps ServerDeps) (*fiber.App, error) {
 	// Registered before `protected` so user authMiddleware does not intercept agent bearer tokens.
 	agentHandler := NewAgentHandler(deps.AgentSvc)
 	agentLimiter := limiter.New(limiter.Config{
+		Storage:    limiterStorage("ratelimit:agent:"),
 		Max:        600,
 		Expiration: time.Minute,
 	})

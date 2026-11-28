@@ -433,3 +433,23 @@ type RunnerLogEntry struct {
 	Level     string    `json:"level"`
 	Line      string    `json:"line"`
 }
+
+type CacheStats struct {
+	Driver         string  `json:"driver"`
+	ClusterEnabled bool    `json:"cluster_enabled"`
+	Hits           uint64  `json:"hits"`
+	Misses         uint64  `json:"misses"`
+	Sets           uint64  `json:"sets"`
+	Deletes        uint64  `json:"deletes"`
+	Errors         uint64  `json:"errors"`
+	HitRate        float64 `json:"hit_rate"`
+}
+
+type ClusterNode struct {
+	InstanceID string    `json:"instance_id"`
+	Hostname   string    `json:"hostname"`
+	Version    string    `json:"version"`
+	Address    string    `json:"address"`
+	StartedAt  time.Time `json:"started_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+}
