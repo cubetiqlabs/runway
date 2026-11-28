@@ -28,6 +28,7 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -394,23 +395,25 @@ export function DataTable<T extends object>({
                   }
                 />
                 <DropdownMenuContent align="end" className="w-48">
-                  <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
-                  <DropdownMenuSeparator />
-                  {table
-                    .getAllLeafColumns()
-                    .filter((col) => col.getCanHide())
-                    .map((col) => {
-                      const def = columnMetaById.get(col.id)
-                      return (
-                        <DropdownMenuCheckboxItem
-                          key={col.id}
-                          checked={col.getIsVisible()}
-                          onCheckedChange={(checked) => col.toggleVisibility(Boolean(checked))}
-                        >
-                          {def?.header ?? col.id}
-                        </DropdownMenuCheckboxItem>
-                      )
-                    })}
+                  <DropdownMenuGroup>
+                    <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    {table
+                      .getAllLeafColumns()
+                      .filter((col) => col.getCanHide())
+                      .map((col) => {
+                        const def = columnMetaById.get(col.id)
+                        return (
+                          <DropdownMenuCheckboxItem
+                            key={col.id}
+                            checked={col.getIsVisible()}
+                            onCheckedChange={(checked) => col.toggleVisibility(Boolean(checked))}
+                          >
+                            {def?.header ?? col.id}
+                          </DropdownMenuCheckboxItem>
+                        )
+                      })}
+                  </DropdownMenuGroup>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => clearTableColumnVisibility(id)}>
                     Reset columns

@@ -71,32 +71,42 @@ function formatMS(ms?: number): string {
   return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`
 }
 
+type AgentMetricKey =
+  | "cpu_usage_percent"
+  | "memory_usage_percent"
+  | "disk_usage_percent"
+  | "load_avg_1"
+
 function MetricCard({
   title,
   unit,
   color,
   points,
-  getValue,
+  metricKey,
 }: {
   title: string
   unit: string
   color: string
   points: AgentMetricPoint[]
-  getValue: (pt: AgentMetricPoint) => number
+  metricKey: AgentMetricKey
 }) {
-  const latest = points.length > 0 ? getValue(points[points.length - 1]) : 0
-  const peak = points.reduce((acc, p) => Math.max(acc, getValue(p)), 0)
+  const readMetric = (pt: AgentMetricPoint): number => Number(pt[metricKey] ?? 0)
+  const latest = points.length > 0 ? readMetric(points[points.length - 1]) : 0
+  const peak = points.reduce((acc, p) => Math.max(acc, readMetric(p)), 0)
 
   const series = useMemo<TimeSeriesPoint[]>(
     () =>
       points.map((pt) => ({
-        label: new Date(pt.timestamp).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-        value: Number(getValue(pt).toFixed(2)),
+        label: pt.timestamp
+          ? new Date(pt.timestamp).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            })
+          : "—",
+        value: Number(Number(pt[metricKey] ?? 0).toFixed(2)),
       })),
-    [points, getValue]
+    [points, metricKey]
   )
 
   return (
@@ -380,6 +390,15 @@ function AgentDetailPage() {
 
   const { agent, stats, metric_history } = detail
   const m = agent.metrics ?? {}
+  const history = metric_history ?? []
+  const labels = agent.labels ?? []
+  const safeStats = stats ?? {
+    total_tasks: 0,
+    success_rate: 0,
+    avg_duration_ms: 0,
+    p95_duration_ms: 0,
+    tasks_24h: 0,
+  }
   const tasksTotal = tasksQuery.data?.total ?? 0
   const eventsTotal = eventsQuery.data?.total ?? 0
 
@@ -524,8 +543,8 @@ function AgentDetailPage() {
             </CardTitle>
           </CardHeader>
           <CardContent className="text-[11px] text-muted-foreground">
-            {stats.total_tasks} tasks ({stats.success_rate.toFixed(0)}% pass) · avg{" "}
-            {formatMS(stats.avg_duration_ms)}
+            {safeStats.total_tasks} tasks ({Number(safeStats.success_rate ?? 0).toFixed(0)}% pass) ·
+            avg {formatMS(safeStats.avg_duration_ms)}
           </CardContent>
         </Card>
       </div>
@@ -536,29 +555,29 @@ function AgentDetailPage() {
           title="CPU Usage"
           unit="%"
           color="var(--chart-1)"
-          points={metric_history}
-          getValue={(p) => p.cpu_usage_percent}
+          points={history}
+          metricKey="cpu_usage_percent"
         />
         <MetricCard
           title="Memory Usage"
           unit="%"
           color="var(--chart-2)"
-          points={metric_history}
-          getValue={(p) => p.memory_usage_percent}
+          points={history}
+          metricKey="memory_usage_percent"
         />
         <MetricCard
           title="Disk Usage"
           unit="%"
           color="var(--chart-3)"
-          points={metric_history}
-          getValue={(p) => p.disk_usage_percent}
+          points={history}
+          metricKey="disk_usage_percent"
         />
         <MetricCard
           title="Load Avg (1m)"
           unit=""
           color="var(--chart-4)"
-          points={metric_history}
-          getValue={(p) => p.load_avg_1}
+          points={history}
+          metricKey="load_avg_1"
         />
       </div>
 
@@ -581,16 +600,16 @@ function AgentDetailPage() {
           <div>
             <span className="text-muted-foreground block">24h Tasks / P95 Duration</span>
             <span className="font-mono">
-              {stats.tasks_24h} runs · p95 {formatMS(stats.p95_duration_ms)}
+              {safeStats.tasks_24h} runs · p95 {formatMS(safeStats.p95_duration_ms)}
             </span>
           </div>
           <div>
             <span className="text-muted-foreground block">Labels</span>
             <div className="flex flex-wrap gap-1 mt-0.5">
-              {agent.labels.length === 0 ? (
+              {labels.length === 0 ? (
                 <span className="text-muted-foreground">Default</span>
               ) : (
-                agent.labels.map((l) => (
+                labels.map((l) => (
                   <Badge key={l} variant="secondary" className="font-mono text-[10px]">
                     {l}
                   </Badge>
