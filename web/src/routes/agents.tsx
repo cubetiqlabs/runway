@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react"
 import { createFileRoute, Link } from "@tanstack/react-router"
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useForm } from "@tanstack/react-form"
-import { useSelector } from "@tanstack/react-store"
 import { z } from "zod"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
@@ -42,7 +41,7 @@ import { SearchableCombobox, type ComboboxOption } from "@/components/searchable
 import { StatusBadge } from "@/components/status-badge"
 import { api } from "@/lib/api"
 import { agentsQueryOptions, poolsQueryOptions, queryKeys } from "@/lib/query"
-import { appStore } from "@/lib/store"
+import { useAppSelector } from "@/lib/store"
 import type { Agent, RegisterAgentResponse } from "@/lib/types"
 import { toast } from "sonner"
 
@@ -91,7 +90,7 @@ const INITIAL_FORM: AgentFormValues = {
 
 function AgentsPage() {
   const queryClient = useQueryClient()
-  const livePolling = useSelector(appStore, (s) => s.livePolling)
+  const livePolling = useAppSelector((s) => s.livePolling)
 
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
@@ -478,8 +477,8 @@ function AgentsPage() {
         data={agents}
         columns={columns}
         getRowId={(a) => a.id}
-        loading={agentsQuery.isLoading}
-        fetching={agentsQuery.isFetching}
+        loading={agentsQuery.isPending}
+        fetching={agentsQuery.isFetching && !agentsQuery.isPending}
         emptyMessage="No distributed agents match the current filters."
         searchValue={search}
         onSearchChange={(val) => {

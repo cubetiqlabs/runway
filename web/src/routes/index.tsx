@@ -45,18 +45,21 @@ function OverviewPage() {
 
   const data = overviewQuery.data
   const loading = overviewQuery.isPending
+  const pools = data?.pool_utilization ?? []
+  const recentJobs = data?.recent_jobs ?? []
+  const recentDeliveries = data?.recent_deliveries ?? []
 
   const poolChartData = useMemo(
     () =>
-      (data?.pool_utilization ?? []).map((p) => ({
+      pools.map((p) => ({
         category: p.name.length > 16 ? `${p.name.slice(0, 14)}…` : p.name,
         value: p.online_runners + p.busy_runners,
       })),
-    [data?.pool_utilization]
+    [pools]
   )
 
   const webhookLatencyData = useMemo(() => {
-    const items = [...(data?.recent_deliveries ?? [])].reverse()
+    const items = [...recentDeliveries].reverse()
     return items.map((d, idx) => ({
       label: d.received_at
         ? new Date(d.received_at).toLocaleTimeString([], {
@@ -67,7 +70,7 @@ function OverviewPage() {
         : `#${idx + 1}`,
       value: d.processing_ms,
     }))
-  }, [data?.recent_deliveries])
+  }, [recentDeliveries])
 
   return (
     <div className="space-y-6">
@@ -135,7 +138,7 @@ function OverviewPage() {
                 <CardTitle className="text-2xl font-bold">{data.installations}</CardTitle>
               </CardHeader>
               <CardContent className="text-[11px] text-muted-foreground">
-                {data.pool_utilization.length} configured runner pools
+                {pools.length} configured runner pools
               </CardContent>
             </Card>
           </>
@@ -189,11 +192,11 @@ function OverviewPage() {
           </Link>
         </CardHeader>
         <CardContent>
-          {!data || data.pool_utilization.length === 0 ? (
+          {pools.length === 0 ? (
             <p className="text-xs text-muted-foreground">No runner pools configured yet.</p>
           ) : (
             <div className="grid gap-3 md:grid-cols-2">
-              {data.pool_utilization.map((pool) => {
+              {pools.map((pool) => {
                 const used = pool.online_runners + pool.busy_runners
                 const pct = Math.min(100, Math.round((used / Math.max(1, pool.max_concurrency)) * 100))
                 return (
@@ -237,7 +240,7 @@ function OverviewPage() {
             </Link>
           </CardHeader>
           <CardContent>
-            {!data || data.recent_jobs.length === 0 ? (
+            {recentJobs.length === 0 ? (
               <div className="border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
                 No workflow_job webhooks received yet.
               </div>
@@ -261,7 +264,7 @@ function OverviewPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {data.recent_jobs.map((job) => (
+                    {recentJobs.map((job) => (
                       <TableRow key={job.id} className="border-b-0">
                         <th scope="row" className="max-w-44 truncate">
                           {job.repo_full_name}
@@ -295,7 +298,7 @@ function OverviewPage() {
             </Link>
           </CardHeader>
           <CardContent>
-            {!data || data.recent_deliveries.length === 0 ? (
+            {recentDeliveries.length === 0 ? (
               <div className="border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
                 No webhook deliveries logged yet.
               </div>
@@ -319,7 +322,7 @@ function OverviewPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {data.recent_deliveries.map((d) => (
+                    {recentDeliveries.map((d) => (
                       <TableRow key={d.delivery_id} className="border-b-0">
                         <th scope="row">
                           {d.event_name}
