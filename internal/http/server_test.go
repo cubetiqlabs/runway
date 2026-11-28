@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/moderation"
@@ -167,5 +168,94 @@ func TestServerSecurityAndRouting(t *testing.T) {
 	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/runners", nil))
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 on SPA route /runners, got %d %v", resp.StatusCode, err)
+	}
+}
+
+func TestClusterRateLimitStorageAndServer(t *testing.T) {
+	store := cache.NewMemoryStore("http:", "api-1")
+	store.SetClusterEnabled(true)
+	defer store.Close()
+
+	storage := newCacheFiberStorage(store, "ratelimit:test:")
+	if v, err := storage.Get("missing"); err != nil || v != nil {
+		t.Fatalf("expected nil, nil on missing key, got %v %v", v, err)
+	}
+	if err := storage.Set("ip1", []byte("5"), time.Minute); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+	if v, err := storage.Get("ip1"); err != nil || string(v) != "5" {
+		t.Fatalf("expected 5, got %q %v", string(v), err)
+	}
+	if err := storage.Delete("ip1"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if v, err := storage.Get("ip1"); err != nil || v != nil {
+		t.Fatalf("expected nil after delete, got %v %v", v, err)
+	}
+	_ = storage.Set("ip2", []byte("2"), time.Minute)
+	if err := storage.Reset(); err != nil {
+		t.Fatalf("Reset failed: %v", err)
+	}
+	if v, _ := storage.Get("ip2"); v != nil {
+		t.Fatalf("expected nil after reset, got %v", v)
+	}
+
+	cfg := &config.Config{
+		App: config.AppConfig{Name: "runway", Environment: "development"},
+		Server: config.ServerConfig{
+			BodyLimitBytes: 1 << 20,
+			ReadTimeout:    5 * time.Second,
+			WriteTimeout:   5 * time.Second,
+			IdleTimeout:    5 * time.Second,
+		},
+		Security: config.SecurityConfig{
+			LoginRateMax:   2,
+			WebhookRateMax: 10,
+		},
+		Orchestrator: config.OrchestratorConfig{Provider: "simulated", WorkerCount: 1, QueueSize: 8},
+	}
+
+	log := zap.NewNop()
+	auditRepo := &stubAuditRepo{}
+	authSvc := service.NewAuthService(cfg, log, &stubAuthRepo{}, auditRepo)
+	orch := orchestrator.NewOrchestrator(cfg.Orchestrator, log, nil, nil, auditRepo, nil, nil)
+	webhookSvc := service.NewWebhookService(cfg, log, nil, nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch, nil)
+	runnerSvc := service.NewRunnerService(cfg, nil, nil, nil, nil, auditRepo, orch)
+	modSvc := service.NewModerationService(nil, nil, nil, nil, nil, auditRepo, moderation.NewEngine("allow"), orch, nil)
+	dashSvc := service.NewDashboardService(cfg, nil, auditRepo, orch)
+	dashSvc.SetCache(store)
+
+	app, err := NewServer(ServerDeps{
+		Config:        cfg,
+		Log:           log,
+		ReadyCheck:    func(context.Context) error { return nil },
+		CacheStore:    store,
+		AuthSvc:       authSvc,
+		WebhookSvc:    webhookSvc,
+		RunnerSvc:     runnerSvc,
+		ModerationSvc: modSvc,
+		DashboardSvc:  dashSvc,
+	})
+	if err != nil {
+		t.Fatalf("NewServer with CacheStore failed: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader([]byte(`{}`)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, reqErr := app.Test(req)
+		if reqErr != nil {
+			t.Fatalf("login request %d failed: %v", i, reqErr)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			t.Fatalf("unexpected 429 on request %d", i)
+		}
+	}
+
+	reqLimited := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader([]byte(`{}`)))
+	reqLimited.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(reqLimited)
+	if err != nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on 3rd login request with shared limiter, got %d %v", resp.StatusCode, err)
 	}
 }

@@ -19,6 +19,22 @@ database:
   max_conn_lifetime: 30m
   max_conn_idle_time: 5m
 
+cache:
+  driver: memory # valkey | redis | memory | disabled
+  url: redis://localhost:6379/0
+  addrs: [] # optional multiple addrs for Valkey/Redis Cluster
+  password: ""
+  db: 0
+  key_prefix: "runway:"
+  default_ttl: 30s
+  pool_size: 32
+  min_idle_conns: 4
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
+  tls_enabled: false
+  instance_id: "" # auto-generated if empty
+
 eventstore:
   driver: postgres # postgres | clickhouse | disabled
   postgres_url: "" # optional separate PG DSN; defaults to database.url

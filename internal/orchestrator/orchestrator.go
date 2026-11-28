@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/cache"
 	"github.com/cubetiqlabs/runway/internal/config"
 	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/eventstore"
@@ -58,6 +59,7 @@ type Orchestrator struct {
 	auditRepo    domain.AuditRepository
 	agentRepo    domain.AgentRepository
 	eventStore   eventstore.Store
+	cache        cache.Store
 	provisioners map[string]Provisioner
 
 	queue           chan dispatchTask
@@ -144,6 +146,25 @@ func (o *Orchestrator) SetEventStore(es eventstore.Store) {
 	o.hookMu.Lock()
 	o.eventStore = es
 	o.hookMu.Unlock()
+}
+
+func (o *Orchestrator) SetCache(c cache.Store) {
+	o.hookMu.Lock()
+	o.cache = c
+	o.hookMu.Unlock()
+}
+
+func (o *Orchestrator) getCache() cache.Store {
+	o.hookMu.RLock()
+	c := o.cache
+	o.hookMu.RUnlock()
+	return c
+}
+
+func (o *Orchestrator) invalidateOverview(ctx context.Context) {
+	if c := o.getCache(); c != nil {
+		_ = c.Delete(ctx, "dashboard:overview")
+	}
 }
 
 func (o *Orchestrator) emitEvent(ev domain.Event) {
@@ -259,6 +280,7 @@ func (o *Orchestrator) TerminateRunner(ctx context.Context, runner *domain.Runne
 		Status:       string(domain.RunnerTerminated),
 		Message:      fmt.Sprintf("Runner %s terminated", runner.Name),
 	})
+	o.invalidateOverview(ctx)
 	o.notifySlotFreed()
 	return nil
 }
@@ -270,6 +292,7 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 	if err := o.runnerRepo.UpdateStatus(ctx, runner.ID, domain.RunnerTerminated, nil, "", nil); err != nil {
 		return err
 	}
+	o.invalidateOverview(ctx)
 	o.emitEvent(domain.Event{
 		Category:     domain.EventCategoryRunnerLifecycle,
 		EventType:    "runner.released",
@@ -470,6 +493,7 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 		initialStatus = domain.RunnerOnline
 	}
 	_ = o.runnerRepo.SetProvisioned(provCtx, rn.ID, initialStatus, task.githubRunnerID, res.ProviderRef, &task.job.GitHubJobID)
+	o.invalidateOverview(provCtx)
 	o.emitEvent(domain.Event{
 		Category:      domain.EventCategoryRunnerLifecycle,
 		EventType:     "runner.provisioned",
@@ -521,6 +545,18 @@ func (o *Orchestrator) requeueLostRunnerJob(ctx context.Context, rn *domain.Runn
 }
 
 func (o *Orchestrator) reconcileOnce(ctx context.Context) {
+	if c := o.getCache(); c != nil && c.ClusterEnabled() {
+		lockTTL := o.cfg.ReconcileInterval
+		if lockTTL < 20*time.Second {
+			lockTTL = 20 * time.Second
+		}
+		lock, acquired, err := c.AcquireLock(ctx, "orchestrator:reconcile", lockTTL)
+		if err != nil || !acquired {
+			return
+		}
+		defer func() { _ = lock.Release(context.Background()) }()
+	}
+
 	now := time.Now().UTC()
 	seen := make(map[uuid.UUID]struct{})
 

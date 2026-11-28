@@ -1,5 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { createFileRoute, Link } from "@tanstack/react-router"
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useForm } from "@tanstack/react-form"
+import { useSelector } from "@tanstack/react-store"
+import { z } from "zod"
 import { HugeiconsIcon } from "@hugeicons/react"
 import {
   Add01Icon,
@@ -13,9 +17,8 @@ import {
 } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Dialog,
   DialogContent,
@@ -35,26 +38,48 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { DataTable, type DataTableColumn, type SortDirection } from "@/components/data-table"
+import { SearchableCombobox, type ComboboxOption } from "@/components/searchable-combobox"
 import { StatusBadge } from "@/components/status-badge"
 import { api } from "@/lib/api"
-import type { Agent, RegisterAgentResponse, RunnerPool } from "@/lib/types"
+import { agentsQueryOptions, poolsQueryOptions, queryKeys } from "@/lib/query"
+import { appStore } from "@/lib/store"
+import type { Agent, RegisterAgentResponse } from "@/lib/types"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/agents")({
   component: AgentsPage,
 })
 
-interface AgentFormState {
-  name: string
-  os: string
-  arch: string
-  runtime: string
-  labelsText: string
-  pool_id: string
-  max_concurrency: string
-}
+const OS_OPTIONS: ComboboxOption[] = [
+  { value: "linux", label: "Linux" },
+  { value: "macos", label: "macOS" },
+  { value: "windows", label: "Windows" },
+]
 
-const INITIAL_FORM: AgentFormState = {
+const ARCH_OPTIONS: ComboboxOption[] = [
+  { value: "x64", label: "x64 (amd64)" },
+  { value: "arm64", label: "arm64" },
+]
+
+const RUNTIME_OPTIONS: ComboboxOption[] = [
+  { value: "auto", label: "Auto (Docker or Native)" },
+  { value: "native", label: "Native Host Runner" },
+  { value: "docker", label: "Docker Containers" },
+]
+
+const agentFormSchema = z.object({
+  name: z.string().trim().min(1, "Agent name is required."),
+  os: z.string(),
+  arch: z.string(),
+  runtime: z.string(),
+  labelsText: z.string(),
+  pool_id: z.string(),
+  max_concurrency: z.string(),
+})
+
+type AgentFormValues = z.infer<typeof agentFormSchema>
+
+const INITIAL_FORM: AgentFormValues = {
   name: "",
   os: "linux",
   arch: "x64",
@@ -65,10 +90,8 @@ const INITIAL_FORM: AgentFormState = {
 }
 
 function AgentsPage() {
-  const [agents, setAgents] = useState<Agent[]>([])
-  const [total, setTotal] = useState(0)
-  const [pools, setPools] = useState<RunnerPool[]>([])
-  const [loading, setLoading] = useState(true)
+  const queryClient = useQueryClient()
+  const livePolling = useSelector(appStore, (s) => s.livePolling)
 
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
@@ -80,124 +103,147 @@ function AgentsPage() {
   const [sortDir, setSortDir] = useState<SortDirection>("desc")
 
   const [createOpen, setCreateOpen] = useState(false)
-  const [form, setForm] = useState<AgentFormState>(INITIAL_FORM)
-  const [saving, setSaving] = useState(false)
   const [issued, setIssued] = useState<RegisterAgentResponse | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Agent | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const [agRes, poolRes] = await Promise.all([
-        api.listAgents({
-          limit: pageSize,
-          page,
-          search: search.trim() || undefined,
-          status: statusFilter,
-          os: osFilter,
-          runtime: runtimeFilter,
-          sort_by: sortBy,
-          sort_dir: sortDir,
-        }),
-        api.listPools({ limit: 100 }),
-      ])
-      setAgents(agRes.items)
-      setTotal(agRes.total)
-      setPools(poolRes.items)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load agents")
-    } finally {
-      setLoading(false)
-    }
-  }, [page, pageSize, search, statusFilter, osFilter, runtimeFilter, sortBy, sortDir])
+  const queryParams = useMemo(
+    () => ({
+      limit: pageSize,
+      page,
+      search: search.trim() || undefined,
+      status: statusFilter,
+      os: osFilter,
+      runtime: runtimeFilter,
+      sort_by: sortBy,
+      sort_dir: sortDir,
+    }),
+    [pageSize, page, search, statusFilter, osFilter, runtimeFilter, sortBy, sortDir]
+  )
+
+  const agentsQuery = useQuery({
+    ...agentsQueryOptions(queryParams),
+    placeholderData: keepPreviousData,
+    refetchInterval: (query) => {
+      if (!livePolling) return false
+      const items = query.state.data?.items ?? []
+      return items.some((a) => a.status === "draining") ? 4_000 : 15_000
+    },
+  })
+
+  const poolsQuery = useQuery(poolsQueryOptions({ limit: 100 }))
 
   useEffect(() => {
-    void load()
-  }, [load])
-
-  const hasDraining = agents.some((a) => a.status === "draining")
-  useEffect(() => {
-    const interval = window.setInterval(() => void load(), hasDraining ? 4000 : 15000)
-    return () => window.clearInterval(interval)
-  }, [load, hasDraining])
-
-  const handleRegister = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!form.name.trim()) {
-      toast.error("Agent name is required")
-      return
+    if (agentsQuery.error) {
+      toast.error(
+        agentsQuery.error instanceof Error ? agentsQuery.error.message : "Failed to load agents"
+      )
     }
-    setSaving(true)
-    try {
-      const res = await api.registerAgent({
-        name: form.name.trim(),
-        os: form.os,
-        arch: form.arch,
-        runtime: form.runtime,
-        labels: form.labelsText
+  }, [agentsQuery.error])
+
+  const registerMutation = useMutation({
+    mutationFn: (value: AgentFormValues) =>
+      api.registerAgent({
+        name: value.name.trim(),
+        os: value.os,
+        arch: value.arch,
+        runtime: value.runtime,
+        labels: value.labelsText
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean),
-        pool_id: form.pool_id === "any" ? null : form.pool_id,
-        max_concurrency: Number(form.max_concurrency) || 2,
-      })
+        pool_id: value.pool_id === "any" ? null : value.pool_id,
+        max_concurrency: Number(value.max_concurrency) || 2,
+      }),
+    onSuccess: (res) => {
       setCreateOpen(false)
-      setForm(INITIAL_FORM)
+      form.reset(INITIAL_FORM)
       setIssued(res)
-      void load()
-    } catch (err) {
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to register agent")
-    } finally {
-      setSaving(false)
-    }
-  }
+    },
+  })
 
-  const handleDrain = async (a: Agent) => {
-    try {
-      const updated = await api.drainAgent(a.id)
+  const drainMutation = useMutation({
+    mutationFn: (agent: Agent) => api.drainAgent(agent.id),
+    onSuccess: (updated, agent) => {
       toast.success(
         updated.status === "drained"
-          ? `Agent ${a.name} drained (idle)`
-          : `Agent ${a.name} draining active jobs`
+          ? `Agent ${agent.name} drained (idle)`
+          : `Agent ${agent.name} draining active jobs`
       )
-      void load()
-    } catch (err) {
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: ["agents", agent.id] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to drain agent")
-    }
-  }
+    },
+  })
 
-  const handleResume = async (a: Agent) => {
-    try {
-      const updated = await api.resumeAgent(a.id)
-      toast.success(`Agent ${a.name} resumed (${updated.status})`)
-      void load()
-    } catch (err) {
+  const resumeMutation = useMutation({
+    mutationFn: (agent: Agent) => api.resumeAgent(agent.id),
+    onSuccess: (updated, agent) => {
+      toast.success(`Agent ${agent.name} resumed (${updated.status})`)
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: ["agents", agent.id] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to resume agent")
-    }
-  }
+    },
+  })
 
-  const handleRotate = async (a: Agent) => {
-    try {
-      const res = await api.rotateAgentToken(a.id)
+  const rotateMutation = useMutation({
+    mutationFn: (agent: Agent) => api.rotateAgentToken(agent.id),
+    onSuccess: (res, agent) => {
       setIssued(res)
-      toast.success(`Rotated token for ${a.name}`)
-      void load()
-    } catch (err) {
+      toast.success(`Rotated token for ${agent.name}`)
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: ["agents", agent.id] })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to rotate token")
-    }
-  }
+    },
+  })
 
-  const confirmDelete = async () => {
-    if (!deleteTarget) return
-    try {
-      await api.deleteAgent(deleteTarget.id)
-      toast.success(`Deleted agent ${deleteTarget.name}`)
+  const deleteMutation = useMutation({
+    mutationFn: (agent: Agent) => api.deleteAgent(agent.id),
+    onSuccess: (_res, agent) => {
+      toast.success(`Deleted agent ${agent.name}`)
       setDeleteTarget(null)
-      void load()
-    } catch (err) {
+      void queryClient.invalidateQueries({ queryKey: ["agents"] })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    },
+    onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Failed to delete agent")
-    }
-  }
+    },
+  })
+
+  const form = useForm({
+    defaultValues: INITIAL_FORM,
+    validators: {
+      onSubmit: agentFormSchema,
+    },
+    onSubmit: async ({ value }) => {
+      await registerMutation.mutateAsync(value)
+    },
+  })
+
+  const pools = poolsQuery.data?.items ?? []
+  const poolOptions = useMemo<ComboboxOption[]>(
+    () => [
+      { value: "any", label: "Any compatible pool" },
+      ...pools.map((p) => ({
+        value: p.id,
+        label: `${p.name} (${p.os}/${p.arch})`,
+        description: p.slug,
+      })),
+    ],
+    [pools]
+  )
 
   const copyText = async (label: string, text: string) => {
     try {
@@ -330,7 +376,13 @@ function AgentsPage() {
               <span>Details</span>
             </Link>
             {a.status === "draining" || a.status === "drained" ? (
-              <Button type="button" size="xs" variant="outline" onClick={() => void handleResume(a)}>
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                disabled={resumeMutation.isPending}
+                onClick={() => resumeMutation.mutate(a)}
+              >
                 <HugeiconsIcon icon={PlayIcon} strokeWidth={2} />
                 <span>Resume</span>
               </Button>
@@ -339,14 +391,20 @@ function AgentsPage() {
                 type="button"
                 size="xs"
                 variant="outline"
-                disabled={a.status === "offline"}
-                onClick={() => void handleDrain(a)}
+                disabled={a.status === "offline" || drainMutation.isPending}
+                onClick={() => drainMutation.mutate(a)}
               >
                 <HugeiconsIcon icon={PauseCircleIcon} strokeWidth={2} />
                 <span>Drain</span>
               </Button>
             )}
-            <Button type="button" size="xs" variant="outline" onClick={() => void handleRotate(a)}>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={rotateMutation.isPending}
+              onClick={() => rotateMutation.mutate(a)}
+            >
               <HugeiconsIcon icon={Key01Icon} strokeWidth={2} />
               <span>Rotate</span>
             </Button>
@@ -363,8 +421,11 @@ function AgentsPage() {
         ),
       },
     ],
-    []
+    [drainMutation, resumeMutation, rotateMutation]
   )
+
+  const agents = agentsQuery.data?.items ?? []
+  const total = agentsQuery.data?.total ?? 0
 
   const origin = typeof window !== "undefined" ? window.location.origin : "https://runway.example.com"
   const unixInstallCmd = issued
@@ -388,11 +449,23 @@ function AgentsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={() => void load()}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => void agentsQuery.refetch()}
+          >
             <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
             <span>Refresh</span>
           </Button>
-          <Button type="button" size="sm" onClick={() => setCreateOpen(true)}>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => {
+              form.reset(INITIAL_FORM)
+              setCreateOpen(true)
+            }}
+          >
             <HugeiconsIcon icon={Add01Icon} strokeWidth={2} />
             <span>Register Agent</span>
           </Button>
@@ -405,7 +478,8 @@ function AgentsPage() {
         data={agents}
         columns={columns}
         getRowId={(a) => a.id}
-        loading={loading}
+        loading={agentsQuery.isLoading}
+        fetching={agentsQuery.isFetching}
         emptyMessage="No distributed agents match the current filters."
         searchValue={search}
         onSearchChange={(val) => {
@@ -418,6 +492,7 @@ function AgentsPage() {
             id: "status",
             label: "Status",
             value: statusFilter,
+            searchable: true,
             onChange: (v) => {
               setPage(1)
               setStatusFilter(v)
@@ -434,6 +509,7 @@ function AgentsPage() {
             id: "os",
             label: "OS",
             value: osFilter,
+            searchable: true,
             onChange: (v) => {
               setPage(1)
               setOsFilter(v)
@@ -449,6 +525,7 @@ function AgentsPage() {
             id: "runtime",
             label: "Runtime",
             value: runtimeFilter,
+            searchable: true,
             onChange: (v) => {
               setPage(1)
               setRuntimeFilter(v)
@@ -496,118 +573,164 @@ function AgentsPage() {
               <code className="font-mono">runway-agent</code>.
             </DialogDescription>
           </DialogHeader>
-          <form onSubmit={handleRegister} className="space-y-3">
-            <div className="space-y-1">
-              <Label htmlFor="agent-name">Agent Name</Label>
-              <Input
-                id="agent-name"
-                required
-                value={form.name}
-                onChange={(e) => setForm({ ...form, name: e.target.value })}
-                placeholder="build-mac-m3-01"
-                autoCorrect="off"
-                autoCapitalize="none"
-                spellCheck={false}
-              />
-            </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              void form.handleSubmit()
+            }}
+            className="space-y-3"
+          >
+            <form.Field
+              name="name"
+              validators={{
+                onBlur: ({ value }) => (!value.trim() ? "Agent name is required." : undefined),
+              }}
+            >
+              {(field) => {
+                const isInvalid =
+                  (field.state.meta.isTouched || form.state.submissionAttempts > 0) &&
+                  field.state.meta.errors.length > 0
+                return (
+                  <Field data-invalid={isInvalid || undefined}>
+                    <FieldLabel htmlFor="agent-name">Agent Name</FieldLabel>
+                    <Input
+                      id="agent-name"
+                      required
+                      value={field.state.value}
+                      onBlur={field.handleBlur}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                      placeholder="build-mac-m3-01"
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      aria-invalid={isInvalid ? "true" : "false"}
+                      aria-describedby={isInvalid ? "agent-name-err" : undefined}
+                    />
+                    <FieldError
+                      id="agent-name-err"
+                      errors={
+                        isInvalid
+                          ? field.state.meta.errors.map((err) =>
+                              typeof err === "string" ? { message: err } : err
+                            )
+                          : []
+                      }
+                    />
+                  </Field>
+                )
+              }}
+            </form.Field>
 
             <div className="grid gap-3 sm:grid-cols-3">
-              <div className="space-y-1">
-                <Label htmlFor="agent-os">OS</Label>
-                <Select value={form.os} onValueChange={(v) => setForm({ ...form, os: v || "linux" })}>
-                  <SelectTrigger id="agent-os" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="linux">Linux</SelectItem>
-                    <SelectItem value="macos">macOS</SelectItem>
-                    <SelectItem value="windows">Windows</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="agent-arch">Arch</Label>
-                <Select
-                  value={form.arch}
-                  onValueChange={(v) => setForm({ ...form, arch: v || "x64" })}
-                >
-                  <SelectTrigger id="agent-arch" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="x64">x64 (amd64)</SelectItem>
-                    <SelectItem value="arm64">arm64</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="agent-concurrency">Concurrency</Label>
-                <Input
-                  id="agent-concurrency"
-                  inputMode="numeric"
-                  value={form.max_concurrency}
-                  onChange={(e) => setForm({ ...form, max_concurrency: e.target.value })}
-                />
-              </div>
+              <form.Field name="os">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="agent-os">OS</FieldLabel>
+                    <SearchableCombobox
+                      id="agent-os"
+                      ariaLabel="Agent operating system"
+                      options={OS_OPTIONS}
+                      value={field.state.value}
+                      onValueChange={(v) => field.handleChange(v || "linux")}
+                      placeholder="Search OS..."
+                    />
+                  </Field>
+                )}
+              </form.Field>
+
+              <form.Field name="arch">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="agent-arch">Arch</FieldLabel>
+                    <SearchableCombobox
+                      id="agent-arch"
+                      ariaLabel="Agent CPU architecture"
+                      options={ARCH_OPTIONS}
+                      value={field.state.value}
+                      onValueChange={(v) => field.handleChange(v || "x64")}
+                      placeholder="Search arch..."
+                    />
+                  </Field>
+                )}
+              </form.Field>
+
+              <form.Field name="max_concurrency">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="agent-concurrency">Concurrency</FieldLabel>
+                    <Input
+                      id="agent-concurrency"
+                      inputMode="numeric"
+                      value={field.state.value}
+                      onBlur={field.handleBlur}
+                      onChange={(e) => field.handleChange(e.target.value)}
+                    />
+                  </Field>
+                )}
+              </form.Field>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <Label htmlFor="agent-runtime">Preferred Runtime</Label>
-                <Select
-                  value={form.runtime}
-                  onValueChange={(v) => setForm({ ...form, runtime: v || "auto" })}
-                >
-                  <SelectTrigger id="agent-runtime" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="auto">Auto (Docker or Native)</SelectItem>
-                    <SelectItem value="native">Native Host Runner</SelectItem>
-                    <SelectItem value="docker">Docker Containers</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="agent-pool">Bind to Pool (optional)</Label>
-                <Select
-                  value={form.pool_id}
-                  onValueChange={(v) => setForm({ ...form, pool_id: v || "any" })}
-                >
-                  <SelectTrigger id="agent-pool" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="any">Any compatible pool</SelectItem>
-                    {pools.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name} ({p.os}/{p.arch})
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              <form.Field name="runtime">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="agent-runtime">Preferred Runtime</FieldLabel>
+                    <SearchableCombobox
+                      id="agent-runtime"
+                      ariaLabel="Preferred runtime"
+                      options={RUNTIME_OPTIONS}
+                      value={field.state.value}
+                      onValueChange={(v) => field.handleChange(v || "auto")}
+                      placeholder="Search runtime..."
+                    />
+                  </Field>
+                )}
+              </form.Field>
+
+              <form.Field name="pool_id">
+                {(field) => (
+                  <Field>
+                    <FieldLabel htmlFor="agent-pool">Bind to Pool (optional)</FieldLabel>
+                    <SearchableCombobox
+                      id="agent-pool"
+                      ariaLabel="Bind agent to runner pool"
+                      options={poolOptions}
+                      value={field.state.value}
+                      onValueChange={(v) => field.handleChange(v || "any")}
+                      placeholder="Search runner pool..."
+                    />
+                  </Field>
+                )}
+              </form.Field>
             </div>
 
-            <div className="space-y-1">
-              <Label htmlFor="agent-labels">Extra Labels (comma-separated, optional)</Label>
-              <Input
-                id="agent-labels"
-                value={form.labelsText}
-                onChange={(e) => setForm({ ...form, labelsText: e.target.value })}
-                placeholder="runway-ubuntu-4vcpu, gpu"
-                autoCorrect="off"
-                autoCapitalize="none"
-                spellCheck={false}
-              />
-            </div>
+            <form.Field name="labelsText">
+              {(field) => (
+                <Field>
+                  <FieldLabel htmlFor="agent-labels">
+                    Extra Labels (comma-separated, optional)
+                  </FieldLabel>
+                  <Input
+                    id="agent-labels"
+                    value={field.state.value}
+                    onBlur={field.handleBlur}
+                    onChange={(e) => field.handleChange(e.target.value)}
+                    placeholder="runway-ubuntu-4vcpu, gpu"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                  />
+                </Field>
+              )}
+            </form.Field>
 
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)}>
                 Cancel
               </Button>
-              <Button type="submit" disabled={saving}>
-                {saving ? "Registering..." : "Create Agent Token"}
+              <Button type="submit" disabled={registerMutation.isPending}>
+                {registerMutation.isPending ? "Registering..." : "Create Agent Token"}
               </Button>
             </DialogFooter>
           </form>
@@ -715,7 +838,13 @@ function AgentsPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={() => void confirmDelete()}>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={deleteMutation.isPending}
+              onClick={() => {
+                if (deleteTarget) deleteMutation.mutate(deleteTarget)
+              }}
+            >
               Delete Agent
             </AlertDialogAction>
           </AlertDialogFooter>

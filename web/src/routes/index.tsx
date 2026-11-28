@@ -1,14 +1,22 @@
-import { useCallback, useEffect, useState } from "react"
+import { useEffect, useId, useMemo } from "react"
 import { createFileRoute, Link } from "@tanstack/react-router"
+import { useQuery } from "@tanstack/react-query"
 import { HugeiconsIcon } from "@hugeicons/react"
 import { RefreshIcon, ServerStack02Icon, WorkflowSquare06Icon, Shield01Icon } from "@hugeicons/core-free-icons"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
+import {
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { AreaLineMetricChart, CategoryBarChart } from "@/components/ui/chart"
 import { StatusBadge } from "@/components/status-badge"
-import { ResponsiveTable } from "@/components/responsive-table"
-import { api } from "@/lib/api"
-import type { DashboardOverview } from "@/lib/types"
+import { overviewQueryOptions } from "@/lib/query"
+import { useAppSelector } from "@/lib/store"
 import { toast } from "sonner"
 
 export const Route = createFileRoute("/")({
@@ -16,25 +24,50 @@ export const Route = createFileRoute("/")({
 })
 
 function OverviewPage() {
-  const [data, setData] = useState<DashboardOverview | null>(null)
-  const [loading, setLoading] = useState(true)
+  const livePolling = useAppSelector((s) => s.livePolling)
+  const jobsCaptionId = useId()
+  const hooksCaptionId = useId()
 
-  const load = useCallback(async () => {
-    try {
-      const ov = await api.overview()
-      setData(ov)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to load overview")
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const overviewQuery = useQuery({
+    ...overviewQueryOptions(),
+    refetchInterval: livePolling ? 15_000 : false,
+  })
 
   useEffect(() => {
-    void load()
-    const timer = window.setInterval(() => void load(), 15000)
-    return () => window.clearInterval(timer)
-  }, [load])
+    if (overviewQuery.error) {
+      toast.error(
+        overviewQuery.error instanceof Error
+          ? overviewQuery.error.message
+          : "Failed to load overview"
+      )
+    }
+  }, [overviewQuery.error])
+
+  const data = overviewQuery.data
+  const loading = overviewQuery.isPending
+
+  const poolChartData = useMemo(
+    () =>
+      (data?.pool_utilization ?? []).map((p) => ({
+        category: p.name.length > 16 ? `${p.name.slice(0, 14)}…` : p.name,
+        value: p.online_runners + p.busy_runners,
+      })),
+    [data?.pool_utilization]
+  )
+
+  const webhookLatencyData = useMemo(() => {
+    const items = [...(data?.recent_deliveries ?? [])].reverse()
+    return items.map((d, idx) => ({
+      label: d.received_at
+        ? new Date(d.received_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          })
+        : `#${idx + 1}`,
+      value: d.processing_ms,
+    }))
+  }, [data?.recent_deliveries])
 
   return (
     <div className="space-y-6">
@@ -45,9 +78,15 @@ function OverviewPage() {
             Real-time self-hosted runner capacity, moderation queue, and GitHub webhook throughput.
           </p>
         </div>
-        <Button type="button" variant="outline" size="sm" onClick={() => void load()}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={overviewQuery.isFetching}
+          onClick={() => void overviewQuery.refetch()}
+        >
           <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
-          <span>Refresh</span>
+          <span>{overviewQuery.isFetching ? "Refreshing..." : "Refresh"}</span>
         </Button>
       </div>
 
@@ -101,6 +140,41 @@ function OverviewPage() {
             </Card>
           </>
         )}
+      </div>
+
+      {/* TanStack Charts Telemetry Grid */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle>Active Runners by Pool</CardTitle>
+            <CardDescription>Concurrent online &amp; busy runners per profile</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <CategoryBarChart
+              data={poolChartData}
+              ariaLabel="Active runners by runner pool bar chart"
+              color="var(--chart-3)"
+              height={180}
+              emptyMessage="No runner pool utilization samples yet"
+            />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle>Webhook Dispatch Latency (ms)</CardTitle>
+            <CardDescription>Processing time across recent GitHub App deliveries</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <AreaLineMetricChart
+              data={webhookLatencyData}
+              ariaLabel="Webhook processing latency area chart"
+              color="var(--chart-2)"
+              height={180}
+              emptyMessage="Waiting for GitHub webhook deliveries"
+            />
+          </CardContent>
+        </Card>
       </div>
 
       {/* Pool Utilization */}
@@ -163,30 +237,50 @@ function OverviewPage() {
             </Link>
           </CardHeader>
           <CardContent>
-            <ResponsiveTable
-              id="overview-jobs-table"
-              caption="Recent moderated GitHub Actions workflow jobs"
-              headers={["Repository", "Job", "Decision", "Status"]}
-              empty={!data || data.recent_jobs.length === 0}
-              emptyMessage="No workflow_job webhooks received yet."
-            >
-              {data?.recent_jobs.map((job) => (
-                <tr key={job.id}>
-                  <th scope="row" className="max-w-44 truncate">
-                    {job.repo_full_name}
-                  </th>
-                  <td data-label="Job" className="max-w-36 truncate">
-                    {job.job_name}
-                  </td>
-                  <td data-label="Decision">
-                    <StatusBadge status={job.moderation_decision} />
-                  </td>
-                  <td data-label="Status">
-                    <StatusBadge status={job.status} />
-                  </td>
-                </tr>
-              ))}
-            </ResponsiveTable>
+            {!data || data.recent_jobs.length === 0 ? (
+              <div className="border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                No workflow_job webhooks received yet.
+              </div>
+            ) : (
+              <div
+                tabIndex={0}
+                role="region"
+                aria-labelledby={jobsCaptionId}
+                className="runway-table-region border border-border bg-card focus-visible:outline-2 focus-visible:outline-ring"
+              >
+                <table className="runway-table">
+                  <caption id={jobsCaptionId} className="sr-only">
+                    Recent moderated GitHub Actions workflow jobs
+                  </caption>
+                  <TableHeader className="[&_tr]:border-b-0">
+                    <TableRow className="border-b-0 hover:bg-transparent">
+                      <TableHead scope="col">Repository</TableHead>
+                      <TableHead scope="col">Job</TableHead>
+                      <TableHead scope="col">Decision</TableHead>
+                      <TableHead scope="col">Status</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data.recent_jobs.map((job) => (
+                      <TableRow key={job.id} className="border-b-0">
+                        <th scope="row" className="max-w-44 truncate">
+                          {job.repo_full_name}
+                        </th>
+                        <TableCell data-label="Job" className="max-w-36 truncate">
+                          {job.job_name}
+                        </TableCell>
+                        <TableCell data-label="Decision">
+                          <StatusBadge status={job.moderation_decision} />
+                        </TableCell>
+                        <TableCell data-label="Status">
+                          <StatusBadge status={job.status} />
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </table>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -201,31 +295,51 @@ function OverviewPage() {
             </Link>
           </CardHeader>
           <CardContent>
-            <ResponsiveTable
-              id="overview-webhooks-table"
-              caption="Recent GitHub App webhook deliveries"
-              headers={["Event", "Repository", "Status", "Latency"]}
-              empty={!data || data.recent_deliveries.length === 0}
-              emptyMessage="No webhook deliveries logged yet."
-            >
-              {data?.recent_deliveries.map((d) => (
-                <tr key={d.delivery_id}>
-                  <th scope="row">
-                    {d.event_name}
-                    {d.action ? `.${d.action}` : ""}
-                  </th>
-                  <td data-label="Repository" className="max-w-40 truncate">
-                    {d.repo_full_name || "—"}
-                  </td>
-                  <td data-label="Status">
-                    <StatusBadge status={d.status} />
-                  </td>
-                  <td data-label="Latency" className="text-muted-foreground">
-                    {d.processing_ms} ms
-                  </td>
-                </tr>
-              ))}
-            </ResponsiveTable>
+            {!data || data.recent_deliveries.length === 0 ? (
+              <div className="border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                No webhook deliveries logged yet.
+              </div>
+            ) : (
+              <div
+                tabIndex={0}
+                role="region"
+                aria-labelledby={hooksCaptionId}
+                className="runway-table-region border border-border bg-card focus-visible:outline-2 focus-visible:outline-ring"
+              >
+                <table className="runway-table">
+                  <caption id={hooksCaptionId} className="sr-only">
+                    Recent GitHub App webhook deliveries
+                  </caption>
+                  <TableHeader className="[&_tr]:border-b-0">
+                    <TableRow className="border-b-0 hover:bg-transparent">
+                      <TableHead scope="col">Event</TableHead>
+                      <TableHead scope="col">Repository</TableHead>
+                      <TableHead scope="col">Status</TableHead>
+                      <TableHead scope="col">Latency</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data.recent_deliveries.map((d) => (
+                      <TableRow key={d.delivery_id} className="border-b-0">
+                        <th scope="row">
+                          {d.event_name}
+                          {d.action ? `.${d.action}` : ""}
+                        </th>
+                        <TableCell data-label="Repository" className="max-w-40 truncate">
+                          {d.repo_full_name || "—"}
+                        </TableCell>
+                        <TableCell data-label="Status">
+                          <StatusBadge status={d.status} />
+                        </TableCell>
+                        <TableCell data-label="Latency" className="text-muted-foreground">
+                          {d.processing_ms} ms
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </table>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

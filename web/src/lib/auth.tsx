@@ -1,5 +1,7 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
+import React, { createContext, useCallback, useContext, useEffect, useMemo } from "react"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { api, setCsrfToken } from "./api"
+import { authMeQueryOptions, overviewQueryOptions, queryKeys } from "./query"
 import type { User } from "./types"
 
 interface AuthContextValue {
@@ -13,40 +15,56 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null)
-  const [loading, setLoading] = useState(true)
+  const queryClient = useQueryClient()
 
-  const refresh = useCallback(async () => {
-    try {
-      const res = await api.me()
-      setCsrfToken(res.csrf_token || "")
-      setUser(res.user)
-    } catch {
-      setCsrfToken("")
-      setUser(null)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const meQuery = useQuery(authMeQueryOptions())
 
   useEffect(() => {
-    void refresh()
-  }, [refresh])
+    if (meQuery.data) {
+      setCsrfToken(meQuery.data.csrf_token || "")
+    } else if (meQuery.isError) {
+      setCsrfToken("")
+    }
+  }, [meQuery.data, meQuery.isError])
 
-  const login = useCallback(async (email: string, password: string) => {
-    const res = await api.login(email, password)
-    setCsrfToken(res.csrf_token || "")
-    setUser(res.user)
-  }, [])
+  const loginMutation = useMutation({
+    mutationFn: ({ email, password }: { email: string; password: string }) =>
+      api.login(email, password),
+    onSuccess: (res) => {
+      setCsrfToken(res.csrf_token || "")
+      queryClient.setQueryData(queryKeys.authMe, {
+        user: res.user,
+        csrf_token: res.csrf_token || "",
+      })
+      void queryClient.prefetchQuery(overviewQueryOptions())
+    },
+  })
+
+  const logoutMutation = useMutation({
+    mutationFn: () => api.logout(),
+    onSettled: () => {
+      setCsrfToken("")
+      queryClient.clear()
+    },
+  })
+
+  const refresh = useCallback(async () => {
+    await queryClient.invalidateQueries({ queryKey: queryKeys.authMe })
+  }, [queryClient])
+
+  const login = useCallback(
+    async (email: string, password: string) => {
+      await loginMutation.mutateAsync({ email, password })
+    },
+    [loginMutation]
+  )
 
   const logout = useCallback(async () => {
-    try {
-      await api.logout()
-    } finally {
-      setCsrfToken("")
-      setUser(null)
-    }
-  }, [])
+    await logoutMutation.mutateAsync()
+  }, [logoutMutation])
+
+  const user = meQuery.isError ? null : (meQuery.data?.user ?? null)
+  const loading = meQuery.isPending
 
   const value = useMemo(
     () => ({ user, loading, refresh, login, logout }),
