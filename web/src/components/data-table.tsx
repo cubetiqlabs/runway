@@ -349,7 +349,11 @@ export function DataTable<T extends object>({
                     className="h-8 text-xs"
                   />
                 ) : (
-                  <Select value={f.value} onValueChange={(v) => f.onChange(v || "all")}>
+                  <Select
+                    items={Object.fromEntries(f.options.map((o) => [o.value, o.label]))}
+                    value={f.value}
+                    onValueChange={(v) => f.onChange(v || "all")}
+                  >
                     <SelectTrigger aria-label={f.label} className="h-8 text-xs w-full">
                       <SelectValue placeholder={f.label} />
                     </SelectTrigger>

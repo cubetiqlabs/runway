@@ -53,6 +53,13 @@ export const Route = createFileRoute("/agents_/$agentId")({
   component: AgentDetailPage,
 })
 
+const TELEMETRY_WINDOW_ITEMS: Record<string, string> = {
+  "15m": "Last 15m",
+  "1h": "Last 1h",
+  "6h": "Last 6h",
+  "24h": "Last 24h",
+}
+
 function formatDuration(sec?: number): string {
   if (!sec || sec <= 0) return "—"
   const d = Math.floor(sec / 86400)
@@ -168,7 +175,7 @@ function AgentDetailPage() {
     placeholderData: keepPreviousData,
     refetchInterval: (query) => {
       if (!livePolling) return false
-      return query.state.data?.agent.status === "draining" ? 4_000 : 10_000
+      return query.state.data?.agent.status === "draining" ? 4_000 : 5_000
     },
   })
 
@@ -430,7 +437,11 @@ function AgentDetailPage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <Select value={windowRange} onValueChange={(v) => setWindowRange(v || "1h")}>
+          <Select
+            items={TELEMETRY_WINDOW_ITEMS}
+            value={windowRange}
+            onValueChange={(v) => setWindowRange(v || "1h")}
+          >
             <SelectTrigger aria-label="Telemetry time window" className="h-8 w-28 text-xs">
               <SelectValue />
             </SelectTrigger>
@@ -496,6 +507,12 @@ function AgentDetailPage() {
       </div>
 
       {/* KPI Strip */}
+      {!m.collected_at && (
+        <div className="border border-dashed border-border bg-card/50 px-3 py-2 text-xs text-muted-foreground">
+          Waiting for initial telemetry heartbeat from <span className="font-mono">{agent.name}</span>.
+          Real-time CPU, RAM, Disk, and Load metrics appear automatically as heartbeats arrive.
+        </div>
+      )}
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Card>
           <CardHeader className="pb-1">

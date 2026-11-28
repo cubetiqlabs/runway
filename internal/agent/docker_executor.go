@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubetiqlabs/runway/internal/domain"
@@ -64,18 +66,91 @@ func (e *DockerExecutor) ExecuteWithLogs(ctx context.Context, task *TaskPayload,
 		return err
 	}
 
+	var streamedCount atomic.Int64
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	var streamWG sync.WaitGroup
+	var logCh chan domain.RunnerLogEntry
+	var shipDone chan struct{}
+
+	if logSink != nil {
+		logCh = make(chan domain.RunnerLogEntry, 256)
+		shipDone = make(chan struct{})
+		go func() {
+			defer close(shipDone)
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			batch := make([]domain.RunnerLogEntry, 0, 50)
+			flush := func() {
+				if len(batch) == 0 {
+					return
+				}
+				logSink(append([]domain.RunnerLogEntry(nil), batch...))
+				batch = batch[:0]
+			}
+			for {
+				select {
+				case entry, ok := <-logCh:
+					if !ok {
+						flush()
+						return
+					}
+					batch = append(batch, entry)
+					if len(batch) >= 50 {
+						flush()
+					}
+				case <-ticker.C:
+					flush()
+				}
+			}
+		}()
+
+		streamWG.Add(1)
+		go func() {
+			defer streamWG.Done()
+			_ = e.prov.StreamLogs(streamCtx, res.ProviderRef, func(entry domain.RunnerLogEntry) {
+				if task.EncodedJITConfig != "" {
+					entry.Line = strings.ReplaceAll(entry.Line, task.EncodedJITConfig, "[REDACTED]")
+				}
+				streamedCount.Add(1)
+				select {
+				case logCh <- entry:
+				default:
+				}
+			})
+		}()
+	}
+
 	defer func() {
 		if logSink != nil {
-			logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if entries, logErr := e.prov.FetchLogs(logCtx, res.ProviderRef, 500); logErr == nil && len(entries) > 0 {
-				for i := range entries {
-					if task.EncodedJITConfig != "" {
-						entries[i].Line = strings.ReplaceAll(entries[i].Line, task.EncodedJITConfig, "[REDACTED]")
-					}
-				}
-				logSink(entries)
+			streamDone := make(chan struct{})
+			go func() {
+				streamWG.Wait()
+				close(streamDone)
+			}()
+			select {
+			case <-streamDone:
+			case <-time.After(4 * time.Second):
+				cancelStream()
+				<-streamDone
 			}
-			logCancel()
+			cancelStream()
+			close(logCh)
+			<-shipDone
+
+			if streamedCount.Load() == 0 {
+				logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if entries, logErr := e.prov.FetchLogs(logCtx, res.ProviderRef, 500); logErr == nil && len(entries) > 0 {
+					for i := range entries {
+						if task.EncodedJITConfig != "" {
+							entries[i].Line = strings.ReplaceAll(entries[i].Line, task.EncodedJITConfig, "[REDACTED]")
+						}
+					}
+					logSink(entries)
+				}
+				logCancel()
+			}
+		} else {
+			cancelStream()
 		}
 		termCtx, termCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		_ = e.prov.Terminate(termCtx, res.ProviderRef)

@@ -53,7 +53,7 @@ func DefaultConfig(version string) Config {
 		LogDir:            DefaultLogDir(wd),
 		Concurrency:       2,
 		PollInterval:      2 * time.Second,
-		HeartbeatInterval: 15 * time.Second,
+		HeartbeatInterval: 10 * time.Second,
 		AutoUpdate:        true,
 		UpdateInterval:    15 * time.Minute,
 		UpdateRepo:        "cubetiqlabs/runway",
@@ -126,6 +126,11 @@ func (c *Config) ApplyEnvAndFile(configPath string) error {
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_POLL_INTERVAL")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= time.Second {
 			c.PollInterval = d
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_HEARTBEAT_INTERVAL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 5*time.Second {
+			c.HeartbeatInterval = d
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("RUNWAY_AGENT_AUTO_UPDATE")); v != "" {

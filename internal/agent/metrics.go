@@ -27,11 +27,13 @@ type cpuSample struct {
 }
 
 func NewMetricsCollector(workDir string) *MetricsCollector {
-	return &MetricsCollector{
+	m := &MetricsCollector{
 		workDir:   workDir,
 		cacheDir:  filepath.Join(workDir, "build-cache"),
 		startedAt: time.Now(),
 	}
+	m.initPlatformMetrics()
+	return m
 }
 
 func (m *MetricsCollector) Collect(sandboxRuntime string, isolatedDinD bool, cacheHits, cacheMisses, completed, failed, cancelled, avgDurMS int64) domain.AgentMetricsSnapshot {

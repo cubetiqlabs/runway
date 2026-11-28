@@ -1,6 +1,7 @@
 package http
 
 import (
+	"strings"
 	"time"
 
 	"github.com/cubetiqlabs/runway/internal/domain"
@@ -171,10 +172,12 @@ func (h *ModerationHandler) ListAuditLogs(c fiber.Ctx) error {
 func (h *ModerationHandler) ListEvents(c fiber.Ctx) error {
 	page := parsePage(c)
 	var since *time.Time
-	if rawSince := c.Query("window"); rawSince != "" {
-		t := time.Now().UTC().Add(-parseWindowDuration(rawSince, 24*time.Hour))
-		since = &t
-	} else if rawTS := c.Query("since"); rawTS != "" {
+	if rawWindow := strings.TrimSpace(c.Query("window")); rawWindow != "" {
+		if !strings.EqualFold(rawWindow, "all") {
+			t := time.Now().UTC().Add(-parseWindowDuration(rawWindow, 24*time.Hour))
+			since = &t
+		}
+	} else if rawTS := strings.TrimSpace(c.Query("since")); rawTS != "" {
 		if parsed, err := time.Parse(time.RFC3339, rawTS); err == nil {
 			u := parsed.UTC()
 			since = &u
@@ -208,8 +211,12 @@ func (h *ModerationHandler) ListEvents(c fiber.Ctx) error {
 }
 
 func (h *ModerationHandler) EventSummary(c fiber.Ctx) error {
-	window := parseWindowDuration(c.Query("window"), 24*time.Hour)
-	sum, err := h.dashboardSvc.GetEventSummary(c.Context(), time.Now().UTC().Add(-window))
+	rawWindow := strings.TrimSpace(c.Query("window"))
+	var since time.Time
+	if !strings.EqualFold(rawWindow, "all") {
+		since = time.Now().UTC().Add(-parseWindowDuration(rawWindow, 24*time.Hour))
+	}
+	sum, err := h.dashboardSvc.GetEventSummary(c.Context(), since)
 	if err != nil {
 		return err
 	}

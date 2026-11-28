@@ -139,7 +139,7 @@ func TestDockerProvisionerPullOn404AndClampResources(t *testing.T) {
 	if len(capturedCreate.Entrypoint) != 2 || capturedCreate.Entrypoint[0] != "/bin/sh" {
 		t.Fatalf("expected /bin/sh -c entrypoint, got %v", capturedCreate.Entrypoint)
 	}
-	if len(capturedCreate.Cmd) != 1 || !strings.Contains(capturedCreate.Cmd[0], "--jitconfig") || !strings.Contains(capturedCreate.Cmd[0], "unset ENCODED_JIT_CONFIG") || !strings.Contains(capturedCreate.Cmd[0], "/home/runner/.env") || !strings.Contains(capturedCreate.Cmd[0], "RUNNER_TOOL_CACHE") || !strings.Contains(capturedCreate.Cmd[0], "[ ! -w") {
+	if len(capturedCreate.Cmd) != 1 || !strings.Contains(capturedCreate.Cmd[0], "--jitconfig") || !strings.Contains(capturedCreate.Cmd[0], "unset ENCODED_JIT_CONFIG") || !strings.Contains(capturedCreate.Cmd[0], "/home/runner/.env") || !strings.Contains(capturedCreate.Cmd[0], "RUNNER_TOOL_CACHE") || !strings.Contains(capturedCreate.Cmd[0], "is_rw_exec_dir") {
 		t.Fatalf("unexpected runner cmd: %v", capturedCreate.Cmd)
 	}
 	if capturedCreate.HostConfig.NanoCpus != 2_000_000_000 {
@@ -449,6 +449,9 @@ func TestDockerProvisionerIsolatedDinDGVisorSandbox(t *testing.T) {
 			})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
 			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/wait"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"StatusCode":0}`))
 		case r.Method == http.MethodDelete:
 			deletes = append(deletes, r.URL.Path)
 			w.WriteHeader(http.StatusNoContent)
@@ -590,6 +593,9 @@ func TestDockerProvisionerUltraBuildCacheAndForkRO(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "id-" + name})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
 			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/wait"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"StatusCode":0}`))
 		case r.Method == http.MethodDelete:
 			deletedPaths = append(deletedPaths, r.URL.Path)
 			w.WriteHeader(http.StatusNoContent)
@@ -720,5 +726,70 @@ func TestDockerProvisionerFetchLogsDemux(t *testing.T) {
 	}
 	if len(entries) != 2 || entries[0].Stream != "stdout" || entries[0].Line != "hello stdout" || entries[1].Stream != "stderr" || entries[1].Level != "error" {
 		t.Fatalf("unexpected demuxed log entries: %+v", entries)
+	}
+
+	var streamed []domain.RunnerLogEntry
+	if err := prov.StreamLogs(context.Background(), "cid-1", func(e domain.RunnerLogEntry) {
+		streamed = append(streamed, e)
+	}); err != nil {
+		t.Fatalf("StreamLogs failed: %v", err)
+	}
+	if len(streamed) != 2 || streamed[0].Line != "hello stdout" || streamed[1].Stream != "stderr" {
+		t.Fatalf("unexpected streamed log entries: %+v", streamed)
+	}
+}
+
+func TestCacheManagerToolCacheSlotLeasing(t *testing.T) {
+	cm := NewCacheManager()
+	k1, d1 := cm.AcquireToolCacheSlot("r-abc")
+	k2, d2 := cm.AcquireToolCacheSlot("r-abc")
+	if d1 == d2 {
+		t.Fatalf("expected distinct toolcache dirs for concurrent jobs, both got %q", d1)
+	}
+	if k1 == k2 {
+		t.Fatalf("expected distinct lease keys")
+	}
+	cm.ReleaseToolCacheSlot(k1)
+	k3, d3 := cm.AcquireToolCacheSlot("r-abc")
+	if d3 != d1 || k3 != k1 {
+		t.Fatalf("expected released slot-0 to be reused, got %q (%q)", d3, k3)
+	}
+}
+
+func TestDockerProvisionerRunnerNotAutoRemoved(t *testing.T) {
+	var autoRemove bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{"NCPU": 2, "MemTotal": int64(4) * 1024 * 1024 * 1024})
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
+			var body struct {
+				HostConfig struct {
+					AutoRemove bool `json:"AutoRemove"`
+				} `json:"HostConfig"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			autoRemove = body.HostConfig.AutoRemove
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"cid-no-autorm"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/cid-no-autorm/start":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	prov := NewDockerProvisioner(ts.URL)
+	if _, err := prov.Provision(context.Background(), ProvisionRequest{
+		RunnerID:         uuid.New(),
+		RunnerName:       "runner-logs-preserved",
+		EncodedJITConfig: "jit",
+		Pool:             domain.RunnerPool{Slug: "test", VCPU: 2, MemoryMB: 1024},
+	}); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+	if autoRemove {
+		t.Fatal("expected AutoRemove=false on runner container so exit logs remain fetchable before Terminate")
 	}
 }

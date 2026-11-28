@@ -113,15 +113,24 @@ func sendPage[T any](c fiber.Ctx, items []T, total int, page domain.PageParams) 
 }
 
 func parseWindowDuration(raw string, fallback time.Duration) time.Duration {
-	if raw == "" {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return fallback
 	}
-	d, err := time.ParseDuration(strings.TrimSpace(raw))
-	if err != nil || d <= 0 {
+	var d time.Duration
+	if strings.HasSuffix(trimmed, "d") || strings.HasSuffix(trimmed, "D") {
+		numPart := strings.TrimSpace(trimmed[:len(trimmed)-1])
+		if days, err := strconv.Atoi(numPart); err == nil && days > 0 {
+			d = time.Duration(days) * 24 * time.Hour
+		}
+	} else if parsed, err := time.ParseDuration(trimmed); err == nil {
+		d = parsed
+	}
+	if d <= 0 {
 		return fallback
 	}
-	if d > 7*24*time.Hour {
-		return 7 * 24 * time.Hour
+	if d > 90*24*time.Hour {
+		return 90 * 24 * time.Hour
 	}
 	return d
 }

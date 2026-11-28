@@ -63,6 +63,7 @@ RUN set -eux; \
       nodejs; \
     mkdir -p /opt/hostedtoolcache /home/runner/_work /runway-cache; \
     chown -R runner:runner /opt/hostedtoolcache /home/runner/_work /runway-cache; \
+    chmod 0775 /opt/hostedtoolcache /home/runner/_work /runway-cache; \
     git lfs install --system; \
     make --version; \
     node --version; \

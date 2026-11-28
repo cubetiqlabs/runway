@@ -187,7 +187,7 @@ func (r *AgentRepo) UpdateHeartbeat(ctx context.Context, agent *domain.Agent) er
 		updates["labels"] = pq.StringArray(agent.Labels)
 	}
 	if len(agent.Metrics) > 0 {
-		updates["metrics"] = nonEmptyJSON(agent.Metrics)
+		updates["metrics"] = gorm.Expr("?::jsonb", string(nonEmptyJSON(agent.Metrics)))
 	}
 	// Preserve draining/drained status until resumed or drained complete; offline wakes back to online.
 	res := r.db.WithContext(ctx).Model(&AgentModel{}).

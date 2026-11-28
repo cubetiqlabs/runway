@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -62,13 +61,15 @@ type Orchestrator struct {
 	cache        cache.Store
 	provisioners map[string]Provisioner
 
-	queue           chan dispatchTask
-	wg              sync.WaitGroup
-	baseMu          sync.RWMutex
-	baseCtx         context.Context
-	hookMu          sync.RWMutex
-	onSlotFreed     func()
-	onRunnerCleanup func(context.Context, *domain.Runner)
+	queue              chan dispatchTask
+	wg                 sync.WaitGroup
+	baseMu             sync.RWMutex
+	baseCtx            context.Context
+	hookMu             sync.RWMutex
+	onSlotFreed        func()
+	onRunnerCleanup    func(context.Context, *domain.Runner)
+	activeLogStreams   sync.Map // runnerID -> struct{}
+	streamedLogRunners sync.Map // runnerID -> struct{}
 }
 
 func NewOrchestrator(
@@ -340,13 +341,6 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 		o.captureDockerLogs(capCtx, &runnerCopy)
 		capCancel()
 
-		checkCtx, cancelCheck := context.WithTimeout(baseCtx, 5*time.Second)
-		healthy, healthErr := prov.Healthy(checkCtx, ref)
-		cancelCheck()
-		if healthErr == nil && !healthy && !strings.HasPrefix(ref, "pod:") {
-			return
-		}
-
 		termCtx, cancelTerm := context.WithTimeout(baseCtx, 15*time.Second)
 		defer cancelTerm()
 		if err := prov.Terminate(termCtx, ref); err != nil {
@@ -356,8 +350,52 @@ func (o *Orchestrator) ReleaseCompletedRunner(ctx context.Context, runner *domai
 	return nil
 }
 
+func (o *Orchestrator) streamDockerLogs(baseCtx context.Context, runner *domain.Runner, providerRef string) {
+	if runner == nil || runner.Provider != "docker" || providerRef == "" {
+		return
+	}
+	if _, loaded := o.activeLogStreams.LoadOrStore(runner.ID, struct{}{}); loaded {
+		return
+	}
+	dp, ok := o.selectProvisioner("docker").(*DockerProvisioner)
+	if !ok {
+		o.activeLogStreams.Delete(runner.ID)
+		return
+	}
+
+	runnerCopy := *runner
+	o.wg.Add(1)
+	go func() {
+		defer func() {
+			o.activeLogStreams.Delete(runnerCopy.ID)
+			o.wg.Done()
+		}()
+		streamCtx, cancel := context.WithTimeout(baseCtx, o.cfg.ProvisionTimeout+2*time.Hour)
+		defer cancel()
+		_ = dp.StreamLogs(streamCtx, providerRef, func(entry domain.RunnerLogEntry) {
+			o.streamedLogRunners.Store(runnerCopy.ID, struct{}{})
+			o.emitEvent(domain.Event{
+				OccurredAt:   entry.Timestamp,
+				Category:     domain.EventCategoryRunnerLog,
+				EventType:    "runner.log." + entry.Stream,
+				Severity:     entry.Level,
+				Source:       "docker-provisioner",
+				ResourceType: "runner",
+				ResourceID:   runnerCopy.ID.String(),
+				RepoFullName: runnerCopy.PoolName,
+				Status:       string(runnerCopy.Status),
+				Message:      entry.Line,
+			})
+		})
+	}()
+}
+
 func (o *Orchestrator) captureDockerLogs(ctx context.Context, runner *domain.Runner) {
 	if runner == nil || runner.Provider != "docker" || runner.ProviderRef == "" {
+		return
+	}
+	if _, alreadyStreamed := o.streamedLogRunners.Load(runner.ID); alreadyStreamed {
+		o.streamedLogRunners.Delete(runner.ID)
 		return
 	}
 	dp, ok := o.selectProvisioner("docker").(*DockerProvisioner)
@@ -494,6 +532,12 @@ func (o *Orchestrator) handleTask(ctx context.Context, workerID int, task dispat
 	}
 	_ = o.runnerRepo.SetProvisioned(provCtx, rn.ID, initialStatus, task.githubRunnerID, res.ProviderRef, &task.job.GitHubJobID)
 	o.invalidateOverview(provCtx)
+	if prov.Name() == "docker" && res.ProviderRef != "" {
+		rn.Provider = "docker"
+		rn.ProviderRef = res.ProviderRef
+		rn.Status = initialStatus
+		o.streamDockerLogs(o.lifecycleCtx(), rn, res.ProviderRef)
+	}
 	o.emitEvent(domain.Event{
 		Category:      domain.EventCategoryRunnerLifecycle,
 		EventType:     "runner.provisioned",
@@ -634,6 +678,9 @@ func (o *Orchestrator) reconcileOnce(ctx context.Context) {
 				if healthErr != nil || healthy {
 					continue
 				}
+				capCtx, capCancel := context.WithTimeout(ctx, 5*time.Second)
+				o.captureDockerLogs(capCtx, &rn)
+				capCancel()
 				_ = dockerProv.Terminate(ctx, rn.ProviderRef)
 				_ = o.runnerRepo.UpdateStatus(ctx, rn.ID, domain.RunnerTerminated, nil, "", nil)
 				o.requeueLostRunnerJob(ctx, &rn, fmt.Sprintf("Runner %s exited before starting job; requeued", rn.Name))

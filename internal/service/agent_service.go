@@ -281,6 +281,22 @@ func (s *AgentService) GetAgentDetail(ctx context.Context, id uuid.UUID, window 
 		if history == nil {
 			history = []domain.AgentMetricPoint{}
 		}
+		if len(history) == 0 && len(ag.Metrics) > 0 {
+			var snap domain.AgentMetricsSnapshot
+			if mErr := json.Unmarshal(ag.Metrics, &snap); mErr == nil && !snap.CollectedAt.IsZero() {
+				history = append(history, domain.AgentMetricPoint{
+					Timestamp:          snap.CollectedAt.UTC(),
+					CPUUsagePercent:    snap.CPUUsagePercent,
+					MemoryUsagePercent: snap.MemoryUsagePercent,
+					DiskUsagePercent:   snap.DiskUsagePercent,
+					MemoryUsedMB:       snap.MemoryUsedMB,
+					ActiveJobs:         ag.ActiveJobs,
+					LoadAvg1:           snap.LoadAvg1,
+					CacheHitCount:      snap.CacheHitCount,
+					CacheMissCount:     snap.CacheMissCount,
+				})
+			}
+		}
 		return &domain.AgentDetail{
 			Agent:         *ag,
 			Stats:         *stats,
@@ -441,6 +457,9 @@ func (s *AgentService) Heartbeat(ctx context.Context, agent *domain.Agent, in Ag
 	wasOffline := agent.Status == domain.AgentOffline
 	if err := s.agentRepo.UpdateHeartbeat(ctx, &update); err != nil {
 		return nil, err
+	}
+	if c := s.getCache(); c != nil {
+		_ = c.DeletePrefix(ctx, "agent:detail:"+agent.ID.String()+":")
 	}
 	latest, err := s.agentRepo.GetByID(ctx, agent.ID)
 	status := agent.Status

@@ -21,6 +21,8 @@ type memoryStatusEx struct {
 	ullAvailExtendedVirtual uint64
 }
 
+func (m *MetricsCollector) initPlatformMetrics() {}
+
 func (m *MetricsCollector) fillPlatformMetrics(snap *domain.AgentMetricsSnapshot) {
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
 
