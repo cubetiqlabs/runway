@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubetiqlabs/runway/internal/domain"
 	"github.com/cubetiqlabs/runway/internal/logger"
+	"github.com/cubetiqlabs/runway/internal/orchestrator"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -233,5 +235,67 @@ func TestAgentDrainAndResumeViaHeartbeat(t *testing.T) {
 	ag.sendHeartbeat(context.Background())
 	if ag.draining.Load() {
 		t.Fatal("expected agent draining=false when server returns online")
+	}
+
+	snap := ag.metrics.Collect("auto", true, 1, 0, 2, 0, 0, 1200)
+	if snap.CollectedAt.IsZero() || snap.MemoryTotalMB <= 0 || snap.DiskTotalGB <= 0 {
+		t.Fatalf("expected real host metrics collected, got %+v", snap)
+	}
+}
+
+func TestDockerExecutorStreamsLogsBeforeTerminate(t *testing.T) {
+	var deleted atomic.Bool
+	var healthyCalls atomic.Int32
+	line := "2026-11-28T00:00:01Z runner live output secret-jit\n"
+	frame := append([]byte{1, 0, 0, 0, 0, 0, 0, byte(len(line))}, []byte(line)...)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{"NCPU": 2, "MemTotal": int64(4) * 1024 * 1024 * 1024})
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/create":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"cid-stream-1"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/containers/cid-stream-1/start":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/containers/cid-stream-1/logs":
+			if deleted.Load() {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(frame)
+		case r.Method == http.MethodGet && r.URL.Path == "/containers/cid-stream-1/json":
+			running := healthyCalls.Add(1) == 1
+			_ = json.NewEncoder(w).Encode(map[string]any{"State": map[string]any{"Running": running}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/containers/cid-stream-1":
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected docker request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	exec := NewDockerExecutor(ts.URL, orchestrator.DockerOptions{IsolatedDinD: false})
+	var collected []domain.RunnerLogEntry
+	err := exec.ExecuteWithLogs(context.Background(), &TaskPayload{
+		TaskID:           uuid.New(),
+		RunnerID:         uuid.New(),
+		RunnerName:       "runway-stream-test",
+		EncodedJITConfig: "secret-jit",
+		VCPU:             2,
+		MemoryMB:         1024,
+	}, func(entries []domain.RunnerLogEntry) {
+		collected = append(collected, entries...)
+	})
+	if err != nil {
+		t.Fatalf("ExecuteWithLogs failed: %v", err)
+	}
+	if !deleted.Load() {
+		t.Fatal("expected container Terminate after execution")
+	}
+	if len(collected) == 0 || !strings.Contains(collected[0].Line, "runner live output") || strings.Contains(collected[0].Line, "secret-jit") {
+		t.Fatalf("expected redacted live log entry, got %+v", collected)
 	}
 }

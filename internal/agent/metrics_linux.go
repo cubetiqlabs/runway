@@ -11,37 +11,56 @@ import (
 	"github.com/cubetiqlabs/runway/internal/domain"
 )
 
+func (m *MetricsCollector) initPlatformMetrics() {
+	if raw, err := os.ReadFile("/proc/stat"); err == nil {
+		if sample, ok := parseLinuxCPUStat(string(raw)); ok {
+			m.mu.Lock()
+			m.prevCPU = sample
+			m.hasPrev = true
+			m.mu.Unlock()
+		}
+	}
+}
+
+func parseLinuxCPUStat(raw string) (cpuSample, bool) {
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(line, "cpu ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 5 {
+				var total, idle uint64
+				for i := 1; i < len(fields); i++ {
+					v, _ := strconv.ParseUint(fields[i], 10, 64)
+					total += v
+					if i == 4 || i == 5 { // idle + iowait
+						idle += v
+					}
+				}
+				return cpuSample{total: total, idle: idle}, true
+			}
+			break
+		}
+	}
+	return cpuSample{}, false
+}
+
 func (m *MetricsCollector) fillPlatformMetrics(snap *domain.AgentMetricsSnapshot) {
 	if raw, err := os.ReadFile("/proc/stat"); err == nil {
-		for _, line := range strings.Split(string(raw), "\n") {
-			if strings.HasPrefix(line, "cpu ") {
-				fields := strings.Fields(line)
-				if len(fields) >= 5 {
-					var total, idle uint64
-					for i := 1; i < len(fields); i++ {
-						v, _ := strconv.ParseUint(fields[i], 10, 64)
-						total += v
-						if i == 4 || i == 5 { // idle + iowait
-							idle += v
-						}
-					}
-					m.mu.Lock()
-					if m.hasPrev && total > m.prevCPU.total {
-						dt := float64(total - m.prevCPU.total)
-						di := float64(idle - m.prevCPU.idle)
-						snap.CPUUsagePercent = round1((1.0 - di/dt) * 100.0)
-					}
-					m.prevCPU = cpuSample{total: total, idle: idle}
-					m.hasPrev = true
-					m.mu.Unlock()
-				}
-				break
+		if cur, ok := parseLinuxCPUStat(string(raw)); ok {
+			m.mu.Lock()
+			if m.hasPrev && cur.total > m.prevCPU.total {
+				dt := float64(cur.total - m.prevCPU.total)
+				di := float64(cur.idle - m.prevCPU.idle)
+				snap.CPUUsagePercent = round1((1.0 - di/dt) * 100.0)
 			}
+			m.prevCPU = cur
+			m.hasPrev = true
+			m.mu.Unlock()
 		}
 	}
 
 	if raw, err := os.ReadFile("/proc/meminfo"); err == nil {
-		var memTotalKB, memAvailKB uint64
+		var memTotalKB, memAvailKB, memFreeKB, buffersKB, cachedKB uint64
+		var hasAvail bool
 		for _, line := range strings.Split(string(raw), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) < 2 {
@@ -52,7 +71,17 @@ func (m *MetricsCollector) fillPlatformMetrics(snap *domain.AgentMetricsSnapshot
 				memTotalKB, _ = strconv.ParseUint(fields[1], 10, 64)
 			case "MemAvailable:":
 				memAvailKB, _ = strconv.ParseUint(fields[1], 10, 64)
+				hasAvail = true
+			case "MemFree:":
+				memFreeKB, _ = strconv.ParseUint(fields[1], 10, 64)
+			case "Buffers:":
+				buffersKB, _ = strconv.ParseUint(fields[1], 10, 64)
+			case "Cached:":
+				cachedKB, _ = strconv.ParseUint(fields[1], 10, 64)
 			}
+		}
+		if !hasAvail {
+			memAvailKB = memFreeKB + buffersKB + cachedKB
 		}
 		if memTotalKB > 0 {
 			snap.MemoryTotalMB = int(memTotalKB / 1024)

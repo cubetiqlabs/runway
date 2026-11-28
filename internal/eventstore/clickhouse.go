@@ -336,7 +336,7 @@ func (b *ClickHouseBackend) QueryAgentMetrics(ctx context.Context, agentID uuid.
 		FROM %s.events
 		WHERE category = 'agent_metric' AND resource_type = 'agent' AND resource_id = {agent_id:String}
 			AND occurred_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC')
-		ORDER BY occurred_at ASC
+		ORDER BY occurred_at DESC
 		LIMIT {limit:UInt32}
 		FORMAT JSON`, b.database)
 
@@ -357,6 +357,7 @@ func (b *ClickHouseBackend) QueryAgentMetrics(ctx context.Context, agentID uuid.
 	for _, r := range resp.Data {
 		points = append(points, parseMetricPoint(parseCHTime(r.OccurredAt), []byte(r.Payload)))
 	}
+	reverseMetricPoints(points)
 	return points, nil
 }
 
@@ -366,10 +367,13 @@ func (b *ClickHouseBackend) GetSummary(ctx context.Context, since time.Time) (*d
 		ByCategory: map[string]int64{},
 		BySeverity: map[string]int64{},
 	}
-	params := map[string]string{
-		"param_since": since.UTC().Format("2006-01-02 15:04:05.000"),
+	params := map[string]string{}
+	whereClause := ""
+	if !since.IsZero() {
+		params["param_since"] = since.UTC().Format("2006-01-02 15:04:05.000")
+		whereClause = " WHERE occurred_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC')"
 	}
-	catRaw, err := b.execQuery(ctx, fmt.Sprintf(`SELECT category, count() AS cnt FROM %s.events WHERE occurred_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC') GROUP BY category FORMAT JSON`, b.database), params, false)
+	catRaw, err := b.execQuery(ctx, fmt.Sprintf(`SELECT category, count() AS cnt FROM %s.events%s GROUP BY category FORMAT JSON`, b.database, whereClause), params, false)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +392,7 @@ func (b *ClickHouseBackend) GetSummary(ctx context.Context, since time.Time) (*d
 		}
 	}
 
-	sevRaw, err := b.execQuery(ctx, fmt.Sprintf(`SELECT severity, count() AS cnt FROM %s.events WHERE occurred_at >= parseDateTime64BestEffort({since:String}, 3, 'UTC') GROUP BY severity FORMAT JSON`, b.database), params, false)
+	sevRaw, err := b.execQuery(ctx, fmt.Sprintf(`SELECT severity, count() AS cnt FROM %s.events%s GROUP BY severity FORMAT JSON`, b.database, whereClause), params, false)
 	if err != nil {
 		return nil, err
 	}

@@ -12,14 +12,31 @@ import (
 	"github.com/cubetiqlabs/runway/internal/domain"
 )
 
+func (m *MetricsCollector) initPlatformMetrics() {}
+
+func runFirstCommandOutput(candidates []string, args ...string) ([]byte, error) {
+	var lastErr error
+	for _, bin := range candidates {
+		out, err := exec.Command(bin, args...).Output()
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func (m *MetricsCollector) fillPlatformMetrics(snap *domain.AgentMetricsSnapshot) {
-	if out, err := exec.Command("sysctl", "-n", "hw.memsize").Output(); err == nil {
+	sysctlBins := []string{"/usr/sbin/sysctl", "sysctl"}
+	vmStatBins := []string{"/usr/bin/vm_stat", "vm_stat"}
+
+	if out, err := runFirstCommandOutput(sysctlBins, "-n", "hw.memsize"); err == nil {
 		if totalBytes, parseErr := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); parseErr == nil && totalBytes > 0 {
 			snap.MemoryTotalMB = int(totalBytes / (1024 * 1024))
 		}
 	}
 
-	if out, err := exec.Command("vm_stat").Output(); err == nil {
+	if out, err := runFirstCommandOutput(vmStatBins); err == nil {
 		pageSize := uint64(4096)
 		var active, wired, compressed uint64
 		for _, line := range strings.Split(string(out), "\n") {
@@ -52,7 +69,7 @@ func (m *MetricsCollector) fillPlatformMetrics(snap *domain.AgentMetricsSnapshot
 		snap.MemoryUsedMB = int(usedBytes / (1024 * 1024))
 	}
 
-	if out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output(); err == nil {
+	if out, err := runFirstCommandOutput(sysctlBins, "-n", "vm.loadavg"); err == nil {
 		cleaned := strings.Trim(strings.TrimSpace(string(out)), "{}")
 		fields := strings.Fields(cleaned)
 		if len(fields) >= 3 {
@@ -63,7 +80,7 @@ func (m *MetricsCollector) fillPlatformMetrics(snap *domain.AgentMetricsSnapshot
 		}
 	}
 
-	if out, err := exec.Command("sysctl", "-n", "kern.boottime").Output(); err == nil {
+	if out, err := runFirstCommandOutput(sysctlBins, "-n", "kern.boottime"); err == nil {
 		// Format: { sec = 1732700000, usec = 0 } ...
 		if idx := strings.Index(string(out), "sec = "); idx >= 0 {
 			rest := string(out)[idx+6:]

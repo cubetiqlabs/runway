@@ -217,4 +217,14 @@ func TestPostgresWhereBuilderAndMonthlyPartitionDDL(t *testing.T) {
 	if len(args) != 3 || args[2] != `%100\%\_fail%` {
 		t.Fatalf("unexpected escaped args: %v", args)
 	}
+
+	pts := []domain.AgentMetricPoint{
+		{CPUUsagePercent: 30},
+		{CPUUsagePercent: 20},
+		{CPUUsagePercent: 10},
+	}
+	reverseMetricPoints(pts)
+	if pts[0].CPUUsagePercent != 10 || pts[2].CPUUsagePercent != 30 {
+		t.Fatalf("expected ascending chronological order after reverse, got %+v", pts)
+	}
 }

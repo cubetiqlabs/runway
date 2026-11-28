@@ -319,7 +319,7 @@ func (b *PostgresBackend) QueryAgentMetrics(ctx context.Context, agentID uuid.UU
 		SELECT occurred_at, payload::text
 		FROM events
 		WHERE category = 'agent_metric' AND resource_type = 'agent' AND resource_id = $1 AND occurred_at >= $2
-		ORDER BY occurred_at ASC
+		ORDER BY occurred_at DESC
 		LIMIT $3`,
 		agentID.String(), since.UTC(), limit,
 	)
@@ -338,7 +338,11 @@ func (b *PostgresBackend) QueryAgentMetrics(ctx context.Context, agentID uuid.UU
 		pt := parseMetricPoint(ts, []byte(raw))
 		points = append(points, pt)
 	}
-	return points, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	reverseMetricPoints(points)
+	return points, nil
 }
 
 func (b *PostgresBackend) GetSummary(ctx context.Context, since time.Time) (*domain.EventSummary, error) {
@@ -348,7 +352,15 @@ func (b *PostgresBackend) GetSummary(ctx context.Context, since time.Time) (*dom
 		BySeverity: map[string]int64{},
 	}
 
-	rows, err := b.db.QueryContext(ctx, `SELECT category, COUNT(*) FROM events WHERE occurred_at >= $1 GROUP BY category`, since.UTC())
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if since.IsZero() {
+		rows, err = b.db.QueryContext(ctx, `SELECT category, COUNT(*) FROM events GROUP BY category`)
+	} else {
+		rows, err = b.db.QueryContext(ctx, `SELECT category, COUNT(*) FROM events WHERE occurred_at >= $1 GROUP BY category`, since.UTC())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres event summary by category: %w", err)
 	}
@@ -362,7 +374,12 @@ func (b *PostgresBackend) GetSummary(ctx context.Context, since time.Time) (*dom
 	}
 	rows.Close()
 
-	sevRows, err := b.db.QueryContext(ctx, `SELECT severity, COUNT(*) FROM events WHERE occurred_at >= $1 GROUP BY severity`, since.UTC())
+	var sevRows *sql.Rows
+	if since.IsZero() {
+		sevRows, err = b.db.QueryContext(ctx, `SELECT severity, COUNT(*) FROM events GROUP BY severity`)
+	} else {
+		sevRows, err = b.db.QueryContext(ctx, `SELECT severity, COUNT(*) FROM events WHERE occurred_at >= $1 GROUP BY severity`, since.UTC())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres event summary by severity: %w", err)
 	}

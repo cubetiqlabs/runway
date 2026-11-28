@@ -90,7 +90,7 @@ function RunnersPage() {
   const logsQuery = useQuery({
     ...runnerLogsQueryOptions(logsTarget?.id ?? "", { limit: 200 }),
     enabled: Boolean(logsTarget?.id),
-    refetchInterval: logsTarget && livePolling ? 4_000 : false,
+    refetchInterval: logsTarget && livePolling ? 2_500 : false,
   })
 
   const drainMutation = useMutation({
@@ -346,6 +346,16 @@ function RunnersPage() {
             )}
           </div>
           <DialogFooter className="gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={logsQuery.isFetching}
+              onClick={() => void logsQuery.refetch()}
+            >
+              <HugeiconsIcon icon={RefreshIcon} strokeWidth={2} />
+              <span>{logsQuery.isFetching ? "Refreshing..." : "Refresh Logs"}</span>
+            </Button>
             {logs.length > 0 && (
               <Button
                 type="button"
